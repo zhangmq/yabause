@@ -96,10 +96,11 @@ else ifeq ($(platform), arm64)
 	TARGET := $(TARGET_NAME)_libretro.so
 	fpic := -fPIC
 	SHARED := -shared -Wl,--no-undefined -Wl,--version-script=link.T
-	LDFLAGS += -lpthread -lGL
-	FLAGS +=  -DAARCH64
+	LDFLAGS += -lpthread
+	FLAGS += -DAARCH64 -march=armv8-a+crc+fp+simd -mcpu=cortex-a53 -mtune=cortex-a53
 	ARCH_IS_LINUX = 1
 	HAVE_SSE = 0
+	FORCE_GLES = 1
 	USE_AARCH64_DRC = 1
 	DYNAREC_DEVMIYAX = 1
 	ALLOW_POLYGON_MODE = 0

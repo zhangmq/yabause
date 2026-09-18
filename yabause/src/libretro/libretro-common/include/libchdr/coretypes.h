@@ -1,3 +1,7 @@
+#include <stdio.h>
+#ifndef core_file
+#define core_file FILE
+#endif
 #ifndef __CORETYPES_H__
 #define __CORETYPES_H__
 

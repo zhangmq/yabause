@@ -564,7 +564,8 @@ void retro_set_resolution()
    }
    current_width = game_width * resolution_mode;
    current_height = game_height * resolution_mode;
-   VIDCore->Resize(0, 0, current_width, current_height, 0);
+   /* this tree's Resize() takes the aspect-rate mode as a 6th argument */
+   VIDCore->Resize(0, 0, current_width, current_height, 0, FULL);
    retro_reinit_av_info();
    VIDCore->SetSettingValue(VDP_SETTING_RESOLUTION_MODE, g_resolution_mode);
 }

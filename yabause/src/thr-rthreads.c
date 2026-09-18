@@ -29,6 +29,7 @@
 #include "threads.h"
 #include "rthreads/rthreads.h"
 #include <stdlib.h>
+#include <time.h>
 
 struct thd_s {
 	int running;
@@ -297,3 +298,13 @@ YabMutex * YabThreadCreateMutex()
 }
 
 //////////////////////////////////////////////////////////////////////////////
+
+/* The libretro thread layer needs this too (vdp2.cpp): the newer fork has it
+ * in thr-rthreads.c; this older tree only had it in thr-linux.cpp. */
+int YabNanosleep(u64 ns) {
+  struct timespec ts;
+  ts.tv_sec = 0;
+  ts.tv_nsec = ns*1000;   
+  nanosleep(&ts,NULL);
+  return 0;
+}
