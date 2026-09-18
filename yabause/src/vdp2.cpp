@@ -373,14 +373,22 @@ int Vdp2Init(void) {
 
 //////////////////////////////////////////////////////////////////////////////
 
-void Vdp2DeInit(void) {
+/* Stop the VDP render thread.  Idempotent (second call is a no-op).
+ * The standalone order is YabauseDeInit() (join) and only then
+ * VIDCore->DeInit(); a libretro frontend calls the core's context_destroy
+ * BEFORE retro_unload_game, so the port must be able to stop it first. */
+void Vdp2StopRenderThread(void) {
 #if defined(YAB_ASYNC_RENDERING)
    if (vdp_proc_running == 1) {
    	YabAddEventQueue(evqueue,VDPEV_FINSH);
-   	//vdp_proc_running = 0;
    	YabThreadWait(YAB_THREAD_VDP);
+   	vdp_proc_running = 0;
    }
 #endif
+}
+
+void Vdp2DeInit(void) {
+   Vdp2StopRenderThread();
    if (Vdp2Regs)
       free(Vdp2Regs);
    Vdp2Regs = NULL;

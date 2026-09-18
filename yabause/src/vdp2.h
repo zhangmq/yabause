@@ -475,6 +475,7 @@ void YglOnUpdateColorRamWord(u32 addr);
 void YglUpdateColorRam();
 void VdpResume( void );
 void VdpRevoke( void );
+void Vdp2StopRenderThread( void );
 
 #ifdef __cplusplus
 }

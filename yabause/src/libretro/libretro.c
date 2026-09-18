@@ -508,24 +508,279 @@ void YuiErrorMsg(const char *string)
       log_cb(RETRO_LOG_ERROR, "Yabause: %s\n", string);
 }
 
+#if defined(YAB_CORE_SHARED_CONTEXT)
+/* ============ core-side shared GL context for the async VDP thread ==========
+ * The async VDP thread issues real GL calls, so it needs a current context.
+ * The frontend's context belongs to the frontend's thread and cannot be handed
+ * over (a libretro frontend also draws with it: minarch-gl's menu captures the
+ * frame from its own FBO -- stealing the context makes that fail with
+ * "capture FBO incomplete" and then SIGSEGV).  Device-verified on this libmali:
+ *   - a third party inside the frontend process can read the frontend's
+ *     EGLDisplay/EGLContext and create a context SHARING with it (pbuffer),
+ *   - textures are shared between the two contexts, FBOs are NOT,
+ *   - so the renderer targets a core-created "mirror" FBO that attaches the
+ *     FRONTEND's colour texture: what the VDP thread draws lands in the texture
+ *     the frontend presents (zero copy, hw-render contract unchanged).
+ * The shared context is made current on the emulation thread BEFORE
+ * YabauseInit(), so every GL object the engine creates (its internal FBOs
+ * included) lives in the context the VDP thread later uses.
+ * Frame delivery: YuiSwapBuffers() runs on the VDP thread, but the frontend's
+ * video_refresh does GL (shader chain + swap) and must run on the frontend's
+ * thread, so the port only marks the frame there and retro_run() issues
+ * video_cb().
+ * ========================================================================== */
+#include <dlfcn.h>
+
+typedef void *YK_Display; typedef void *YK_Context; typedef void *YK_Surface;
+typedef void *YK_Config;  typedef unsigned int YK_Uint; typedef int YK_Int;
+typedef unsigned int YK_Enum; typedef unsigned int YK_Bool;
+
+static struct {
+   void *lib;
+   YK_Display dpy; YK_Context ctx_front; YK_Context ctx_sub; YK_Surface pb;
+   YK_Surface draw, read;
+   YK_Config cfg; YK_Int cfgid;
+   YK_Uint front_fbo, front_tex, mirror_fbo;
+   int state;                    /* 0 = untried, -1 = failed, 1 = ready */
+   volatile int frame_pending, res_pending;
+   int worker_valid; pthread_t worker; pthread_t main_thread;
+   YK_Display (*GetCurrentDisplay)(void);
+   YK_Context (*GetCurrentContext)(void);
+   YK_Surface (*GetCurrentSurface)(int);
+   YK_Bool (*QueryContext)(YK_Display, YK_Context, YK_Int, YK_Int *);
+   YK_Bool (*GetConfigs)(YK_Display, YK_Config *, YK_Int, YK_Int *);
+   YK_Bool (*GetConfigAttrib)(YK_Display, YK_Config, YK_Int, YK_Int *);
+   YK_Surface (*CreatePbufferSurface)(YK_Display, YK_Config, const YK_Int *);
+   YK_Context (*CreateContext)(YK_Display, YK_Config, YK_Context, const YK_Int *);
+   YK_Bool (*MakeCurrent)(YK_Display, YK_Surface, YK_Surface, YK_Context);
+   void *(*GetProcAddress)(const char *);
+   void (*GenFramebuffers)(YK_Int, YK_Uint *);
+   void (*BindFramebuffer)(YK_Enum, YK_Uint);
+   void (*FramebufferTexture2D)(YK_Enum, YK_Enum, YK_Enum, YK_Uint, YK_Int);
+   YK_Enum (*CheckFramebufferStatus)(YK_Enum);
+   void (*GetFramebufferAttachmentParameteriv)(YK_Enum, YK_Enum, YK_Enum, YK_Int *);
+   void (*GetIntegerv)(YK_Enum, YK_Int *);
+   void (*Finish)(void);
+} yk;
+
+#define YK_EGL_NONE              0x3038
+#define YK_EGL_CONFIG_ID         0x3028
+#define YK_EGL_WIDTH             0x3057
+#define YK_EGL_HEIGHT            0x3056
+#define YK_EGL_CONTEXT_CLIENT_VERSION 0x3098
+#define YK_EGL_DRAW              0x3059
+#define YK_EGL_READ              0x305A
+#define YK_GL_FRAMEBUFFER        0x8D40
+#define YK_GL_COLOR_ATTACHMENT0  0x8CE0
+#define YK_GL_FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE 0x8CD0
+#define YK_GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME 0x8CD1
+#define YK_GL_TEXTURE            0x1702
+#define YK_GL_TEXTURE_2D         0x0DE1
+#define YK_GL_FRAMEBUFFER_BINDING 0x8CA6
+#define YK_GL_FRAMEBUFFER_COMPLETE 0x8CD5
+
+static void yk_log(const char *fmt, ...)
+{
+   char buf[512];
+   va_list ap;
+   va_start(ap, fmt);
+   vsnprintf(buf, sizeof(buf), fmt, ap);
+   va_end(ap);
+   if (log_cb)
+      log_cb(RETRO_LOG_INFO, "[YK] %s\n", buf);
+   else
+      printf("[YK] %s\n", buf);
+   fflush(stdout);
+}
+
+/* Emulation thread, frontend context current (called from context_reset, i.e.
+ * after the frontend created its FBO).  Creates the shared context, the mirror
+ * FBO, and leaves the SHARED context current on this thread so that
+ * YabauseInit()/VIDOGLInit() create the engine's GL objects here. */
+static void yk_load(void)
+{
+   YK_Config cfgs[64];
+   YK_Int ncfg = 0, i, prev_fbo = 0, type = -1, name = 0;
+   YK_Int pbattr[5], ctxattr[5];
+   YK_Enum st;
+
+   if (yk.state)
+      return;
+   yk.state = -1;
+   yk.main_thread = pthread_self();
+
+   yk.lib = dlopen("libEGL.so.1", RTLD_NOW | RTLD_LOCAL);
+   if (!yk.lib)
+      yk.lib = dlopen("libmali.so.0", RTLD_NOW | RTLD_LOCAL);
+   if (!yk.lib) { yk_log("no EGL library"); return; }
+
+   yk.GetCurrentDisplay = dlsym(yk.lib, "eglGetCurrentDisplay");
+   yk.GetCurrentContext = dlsym(yk.lib, "eglGetCurrentContext");
+   yk.GetCurrentSurface = dlsym(yk.lib, "eglGetCurrentSurface");
+   yk.QueryContext      = dlsym(yk.lib, "eglQueryContext");
+   yk.GetConfigs        = dlsym(yk.lib, "eglGetConfigs");
+   yk.GetConfigAttrib   = dlsym(yk.lib, "eglGetConfigAttrib");
+   yk.CreatePbufferSurface = dlsym(yk.lib, "eglCreatePbufferSurface");
+   yk.CreateContext     = dlsym(yk.lib, "eglCreateContext");
+   yk.MakeCurrent       = dlsym(yk.lib, "eglMakeCurrent");
+   yk.GetProcAddress    = dlsym(yk.lib, "eglGetProcAddress");
+   if (!yk.GetCurrentDisplay || !yk.GetCurrentContext || !yk.GetCurrentSurface ||
+       !yk.QueryContext || !yk.GetConfigs || !yk.GetConfigAttrib ||
+       !yk.CreatePbufferSurface || !yk.CreateContext || !yk.MakeCurrent ||
+       !yk.GetProcAddress)
+   { yk_log("missing EGL entry points"); return; }
+
+   yk.dpy       = yk.GetCurrentDisplay();
+   yk.ctx_front = yk.GetCurrentContext();
+   yk.draw      = yk.GetCurrentSurface(YK_EGL_DRAW);
+   yk.read      = yk.GetCurrentSurface(YK_EGL_READ);
+   if (!yk.dpy || !yk.ctx_front)
+   { yk_log("frontend has no current EGL context"); return; }
+
+   if (!yk.QueryContext(yk.dpy, yk.ctx_front, YK_EGL_CONFIG_ID, &yk.cfgid))
+   { yk_log("eglQueryContext(CONFIG_ID) failed"); return; }
+   if (yk.GetConfigs(yk.dpy, cfgs, 64, &ncfg))
+   {
+      for (i = 0; i < ncfg; i++)
+      {
+         YK_Int id = -1;
+         if (yk.GetConfigAttrib(yk.dpy, cfgs[i], YK_EGL_CONFIG_ID, &id) && id == yk.cfgid)
+            yk.cfg = cfgs[i];
+      }
+   }
+   if (!yk.cfg) { yk_log("frontend EGLConfig not found"); return; }
+
+   /* The frontend's colour texture: query it while ITS context is current. */
+   yk.GenFramebuffers     = yk.GetProcAddress("glGenFramebuffers");
+   yk.BindFramebuffer     = yk.GetProcAddress("glBindFramebuffer");
+   yk.FramebufferTexture2D = yk.GetProcAddress("glFramebufferTexture2D");
+   yk.CheckFramebufferStatus = yk.GetProcAddress("glCheckFramebufferStatus");
+   yk.GetFramebufferAttachmentParameteriv =
+         yk.GetProcAddress("glGetFramebufferAttachmentParameteriv");
+   yk.GetIntegerv         = yk.GetProcAddress("glGetIntegerv");
+   yk.Finish              = yk.GetProcAddress("glFinish");
+
+   yk.front_fbo = (YK_Uint)(uintptr_t)hw_render.get_current_framebuffer();
+   if (yk.GetIntegerv)
+      yk.GetIntegerv(YK_GL_FRAMEBUFFER_BINDING, &prev_fbo);
+   if (yk.front_fbo && yk.BindFramebuffer && yk.GetFramebufferAttachmentParameteriv)
+   {
+      yk.BindFramebuffer(YK_GL_FRAMEBUFFER, yk.front_fbo);
+      yk.GetFramebufferAttachmentParameteriv(YK_GL_FRAMEBUFFER, YK_GL_COLOR_ATTACHMENT0,
+            YK_GL_FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE, &type);
+      if (type == YK_GL_TEXTURE)
+         yk.GetFramebufferAttachmentParameteriv(YK_GL_FRAMEBUFFER, YK_GL_COLOR_ATTACHMENT0,
+               YK_GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME, &name);
+      yk.BindFramebuffer(YK_GL_FRAMEBUFFER, (YK_Uint)prev_fbo);
+      yk.front_tex = (YK_Uint)name;
+   }
+   if (!yk.front_tex)
+   { yk_log("frontend FBO has no colour texture -> async rendering disabled"); return; }
+
+   pbattr[0] = YK_EGL_WIDTH;  pbattr[1] = 16;
+   pbattr[2] = YK_EGL_HEIGHT; pbattr[3] = 16;
+   pbattr[4] = YK_EGL_NONE;
+   yk.pb = yk.CreatePbufferSurface(yk.dpy, yk.cfg, pbattr);
+   if (!yk.pb) { yk_log("eglCreatePbufferSurface failed"); return; }
+
+   ctxattr[0] = YK_EGL_CONTEXT_CLIENT_VERSION; ctxattr[1] = 3;
+   ctxattr[2] = YK_EGL_NONE;
+   yk.ctx_sub = yk.CreateContext(yk.dpy, yk.cfg, yk.ctx_front, ctxattr);
+   if (!yk.ctx_sub)
+   {
+      ctxattr[1] = 2;
+      yk.ctx_sub = yk.CreateContext(yk.dpy, yk.cfg, yk.ctx_front, ctxattr);
+   }
+   if (!yk.ctx_sub) { yk_log("eglCreateContext(share) failed"); return; }
+
+   /* KEY: the engine (YabauseInit -> VIDOGLInit -> YglInit) must create its GL
+    * objects in THIS context -- FBOs are not shared across contexts, so objects
+    * built in the frontend's context are invalid names for the VDP thread. */
+   if (!yk.MakeCurrent(yk.dpy, yk.pb, yk.pb, yk.ctx_sub))
+   { yk_log("eglMakeCurrent(share) on emulation thread failed"); return; }
+
+   yk.GenFramebuffers(1, &yk.mirror_fbo);
+   yk.BindFramebuffer(YK_GL_FRAMEBUFFER, yk.mirror_fbo);
+   yk.FramebufferTexture2D(YK_GL_FRAMEBUFFER, YK_GL_COLOR_ATTACHMENT0,
+         YK_GL_TEXTURE_2D, yk.front_tex, 0);
+   st = yk.CheckFramebufferStatus ? yk.CheckFramebufferStatus(YK_GL_FRAMEBUFFER) : 0;
+   yk_log("share ctx=%p pbuffer=%p front_ctx=%p cfgid=%d front_fbo=%u front_tex=%u "
+          "mirror_fbo=%u status=0x%x",
+          yk.ctx_sub, yk.pb, yk.ctx_front, (int)yk.cfgid, yk.front_fbo, yk.front_tex,
+          yk.mirror_fbo, (unsigned)st);
+   if (yk.CheckFramebufferStatus && st != YK_GL_FRAMEBUFFER_COMPLETE)
+   { yk_log("mirror FBO incomplete -> async rendering disabled"); return; }
+
+   yk.state = 1;
+}
+
+/* Make the shared context current on the calling thread (VDP thread: for its
+ * lifetime; emulation thread: only while it borrows the context for engine GL
+ * work, e.g. a resolution/option change). */
+static int yk_attach(void)
+{
+   if (yk.state != 1)
+      return 0;
+   /* NB: do NOT use pthread_equal() here.  In this cross toolchain/glibc combo
+    * it returns 0 for two identical pthread_t values (observed: eq=0 with
+    * me==worker), which silently disables the frame-delivery path.  Compare the
+    * values directly (glibc's pthread_equal is exactly this comparison). */
+   if (!yk.worker_valid && (pthread_self() != yk.main_thread))
+   {
+      yk.worker = pthread_self();
+      yk.worker_valid = 1;
+   }
+   if (yk.GetCurrentContext && yk.GetCurrentContext() == yk.ctx_sub)
+      return 0;                 /* already ours on this thread */
+   return yk.MakeCurrent(yk.dpy, yk.pb, yk.pb, yk.ctx_sub) ? 0 : -1;
+}
+
+static void yk_detach(void)
+{
+   if (yk.state != 1)
+      return;
+   if (yk.GetCurrentContext && yk.GetCurrentContext() != yk.ctx_sub)
+      return;                   /* not ours on this thread */
+   yk.MakeCurrent(yk.dpy, NULL, NULL, NULL);
+}
+
+/* Does the calling thread currently hold the shared context? */
+static int yk_held(void)
+{
+   return yk.state == 1 && yk.GetCurrentContext && yk.GetCurrentContext() == yk.ctx_sub;
+}
+#endif /* YAB_CORE_SHARED_CONTEXT */
+
+
 static int first_ctx_reset = 1;
 
 int YuiUseOGLOnThisThread()
 {
-#if !defined(_USEGLEW_)
+#if defined(YAB_CORE_SHARED_CONTEXT)
+  return yk_attach();
+#elif !defined(_USEGLEW_)
   return glsm_ctl(GLSM_CTL_STATE_BIND, NULL);
 #endif
 }
 
 int YuiRevokeOGLOnThisThread()
 {
-#if !defined(_USEGLEW_)
+#if defined(YAB_CORE_SHARED_CONTEXT)
+  yk_detach();
+  return 0;
+#elif !defined(_USEGLEW_)
   return glsm_ctl(GLSM_CTL_STATE_UNBIND, NULL);
 #endif
 }
 
 int YuiGetFB(void)
 {
+#if defined(YAB_CORE_SHARED_CONTEXT)
+  /* the engine renders into the core's mirror FBO, which attaches the
+   * frontend's colour texture */
+  if (yk.mirror_fbo)
+     return (int)yk.mirror_fbo;
+#endif
   return hw_render.get_current_framebuffer();
 }
 
@@ -576,14 +831,46 @@ void YuiSwapBuffers(void)
    int prev_game_height = game_height;
    VIDCore->GetNativeResolution(&game_width, &game_height, &game_interlace);
    if ((prev_game_width != game_width) || (prev_game_height != game_height))
-      retro_set_resolution();
+   {
+#if defined(YAB_CORE_SHARED_CONTEXT)
+      if (yk.state == 1 && yk.worker_valid && (pthread_self() == yk.worker))
+      {
+         /* VIDCore->Resize() + the AV-info env callback must run on the
+          * frontend's thread (retro_run); block hashing/GL here would also
+          * fight the VDP thread for the shared context.  Defer it. */
+         yk.res_pending = 1;
+      }
+      else
+#endif
+         retro_set_resolution();
+   }
    audio_size = soundlen;
+#if defined(YAB_CORE_SHARED_CONTEXT)
+   if (yk.state == 1 && yk.worker_valid && (pthread_self() == yk.worker))
+   {
+      /* video_cb -> frontend video_refresh -> shader chain + swap: those run
+       * with the FRONTEND's context on the FRONTEND's thread, so only mark
+       * the frame here and let retro_run() deliver it.  Finish first: the
+       * frontend samples the texture this thread just rendered into. */
+      if (yk.Finish)
+         yk.Finish();
+      yk.frame_pending = 1;
+      one_frame_rendered = true;
+      return;
+   }
+#endif
    video_cb(RETRO_HW_FRAME_BUFFER_VALID, current_width, current_height, 0);
    one_frame_rendered = true;
 }
 
 static void context_reset(void)
 {
+#if defined(YAB_CORE_SHARED_CONTEXT)
+   /* Create the core's own (shared) context and leave it current on this
+    * thread, so YabauseInit()'s GL objects live in the context the VDP
+    * thread uses.  Must happen before YabauseInit() starts that thread. */
+   yk_load();
+#endif
 #if !defined(_USEGLEW_)
    glsm_ctl(GLSM_CTL_STATE_CONTEXT_RESET, NULL);
    glsm_ctl(GLSM_CTL_STATE_SETUP, NULL);
@@ -607,6 +894,13 @@ static void context_reset(void)
 
 static void context_destroy(void)
 {
+#if defined(YAB_CORE_SHARED_CONTEXT)
+   /* The frontend calls context_destroy before retro_unload_game, so the
+    * VDP thread has not been joined yet: stop it, then hold the shared
+    * context on this thread for the engine's GL teardown. */
+   Vdp2StopRenderThread();
+   yk_attach();
+#endif
    if (renderer_running)
       VIDCore->DeInit();
    renderer_running = false;
@@ -1328,6 +1622,14 @@ void retro_run(void)
 
    if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE_UPDATE, &updated) && updated)
    {
+#if defined(YAB_CORE_SHARED_CONTEXT)
+      /* Resolution/filter changes touch GL: borrow the shared context from
+       * the VDP thread for the duration (standalone pattern:
+       * retro_arena/main.cpp VdpRevoke() -> MakeCurrent(main) -> ... ->
+       * MakeCurrent(NULL) -> VdpResume()). */
+      VdpRevoke();
+      yk_attach();
+#endif
       int prev_resolution_mode = resolution_mode;
       int prev_multitap[2] = {multitap[0],multitap[1]};
       check_variables();
@@ -1343,17 +1645,44 @@ void retro_run(void)
          EnableAutoFrameSkip();
       else
          DisableAutoFrameSkip();
+#if defined(YAB_CORE_SHARED_CONTEXT)
+      yk_detach();
+      VdpResume();
+#endif
    }
 
    //YabauseExec(); runs from handle events
    if(PERCore)
       PERCore->HandleEvents();
 
+#if defined(YAB_CORE_SHARED_CONTEXT)
+   /* The async VDP thread only marks frames: the libretro contract wants
+    * video_cb (and the frontend's shader chain + swap it triggers) on the
+    * thread that drives retro_run. */
+   if (yk.res_pending)
+   {
+      yk.res_pending = 0;
+      VdpRevoke();
+      yk_attach();
+      retro_set_resolution();
+      yk_detach();
+      VdpResume();
+   }
+   if (yk.frame_pending)
+   {
+      yk.frame_pending = 0;
+      video_cb(RETRO_HW_FRAME_BUFFER_VALID, current_width, current_height, 0);
+      one_frame_rendered = true;
+   }
+   if (!one_frame_rendered)
+      video_cb(NULL, current_width, current_height, 0);
+#else
    // If no frame rendered, dupe
    if(!one_frame_rendered)
       video_cb(NULL, current_width, current_height, 0);
 
    reset_global_gl_state();
+#endif
 }
 
 #ifdef ANDROID
