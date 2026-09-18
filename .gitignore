@@ -17,3 +17,6 @@ yabause/src/android/app/.settings/*
 
 
 *.o
+
+# 维护者笔记（不追踪）
+AGENTS.md
