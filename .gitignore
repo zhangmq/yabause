@@ -15,3 +15,5 @@ yabause/src/qt/firebase_cpp_sdk/*
 yabause/src/android/.settings/*
 yabause/src/android/app/.settings/*
 
+
+*.o
