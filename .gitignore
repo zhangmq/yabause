@@ -20,3 +20,4 @@ yabause/src/android/app/.settings/*
 
 # 维护者笔记（不追踪）
 AGENTS.md
+.notes/
