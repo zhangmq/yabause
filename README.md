@@ -21,7 +21,7 @@ frontend — and is loaded as `yabasanshiro_libretro.so`.
   colour attachment is the frontend's texture. VDP rendering moves to a worker thread while
   `video_cb()` stays on the frontend's thread. Without it the port is synchronous and pinned to
   one CPU core; with it the emulation thread drops from ~1.0 to ~0.7 cores and the frame rate
-  gains 9–28 % depending on the game (see *Measured*).
+  gains 3–9 % depending on the game (see *Measured*).
 * `b2bb246e` — hand the frontend's GL context back after borrowing the shared one (SDL tracks
   "which context is current" per thread in TLS; bypassing it left the frontend without a context).
 
@@ -130,16 +130,9 @@ per-core configuration directory from the part before the first `_` (and segfaul
 
 ## Measured
 
-Anbernic RGSP, CPU governor pinned to `performance` (1512 MHz on all four cores), 120 s windows.
-
-Offscreen harness (`noreadback`, no presentation cost), median fps:
-
-| Build | Golden Axe | Daytona USA |
-|---|---|---|
-| synchronous | 45.7 | 33.7 |
-| async + shared context | **58.6** (+28 %) | **37.8** (+12 %) |
-
-On screen (minarch-gl, hardware render, frameskip disabled, debug HUD off), fps at frame 3600:
+Anbernic RGSP (Allwinner H700, Mali-G31), minarch-gl hardware render, CPU governor pinned to
+`performance` (1512 MHz on all four cores), 120 s windows, frameskip disabled, debug HUD off,
+fps at frame 3600:
 
 | Build | Golden Axe | Daytona USA |
 |---|---|---|
