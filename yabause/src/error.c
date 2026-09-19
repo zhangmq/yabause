@@ -133,14 +133,18 @@ void YabErrorMsg(const char * format, ...) {
     n = vsnprintf(NULL, 0, format, l);
     va_end(l);
 
-    buffer = malloc(n + 1);
+    /* calloc + NULL check, aligned with the reference core -- note that the
+     * reference passes calloc(n + 1, 0), a zero-byte allocation; use a real
+     * element size here. */
+    buffer = calloc(n + 1, 1);
+    if (buffer != NULL) {
+       va_start(l, format);
+       vsprintf(buffer, format, l);
+       va_end(l);
 
-    va_start(l, format);
-    vsprintf(buffer, format, l);
-    va_end(l);
-
-    YuiErrorMsg(buffer);
-    free(buffer);
+       YuiErrorMsg(buffer);
+       free(buffer);
+    }
 }
 
 //////////////////////////////////////////////////////////////////////////////

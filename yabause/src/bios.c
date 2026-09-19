@@ -162,6 +162,12 @@ void BiosInit(void)
    MappedMemoryWriteLong(0x06000354, 0x00000000,&cycle);
    MappedMemoryWriteLong(0x06000358, 0x00000358,&cycle);
 
+   // Default Slave CPU proc (same block as the reference core's bios.c)
+   MappedMemoryWriteLong(0x06000250, 0x06000646, &cycle);
+   MappedMemoryWriteLong(0x06000640, 0x400e472b, &cycle);
+   MappedMemoryWriteLong(0x06000644, 0x277aaffe, &cycle);
+   MappedMemoryWriteLong(0x06000648, 0x00090009, &cycle);
+   MappedMemoryWriteLong(0x0600064c, 0x06000400, &cycle);
 
 }
 
