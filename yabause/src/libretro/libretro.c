@@ -32,6 +32,10 @@
 #include "vidsoft.h"
 #include "ygl.h"
 
+/* Core options v2 table ported from the reference libretro core
+ * (lr-yabasanshiro) -- same keys, defaults, categories and descriptions. */
+#include "libretro_core_options.h"
+
 yabauseinit_struct yinit;
 
 static char slash = path_default_slash_c();
@@ -97,28 +101,6 @@ extern struct retro_hw_render_callback hw_render;
 
 void retro_set_environment(retro_environment_t cb)
 {
-   static const struct retro_variable vars[] = {
-      { "yabasanshiro_force_hle_bios", "Force HLE BIOS (restart, deprecated, debug only); disabled|enabled" },
-      { "yabasanshiro_frameskip", "Auto-frameskip (prevent fast-forwarding); enabled|disabled" },
-      { "yabasanshiro_addon_cart", "Addon Cartridge (restart); 4M_extended_ram|1M_extended_ram" },
-      { "yabasanshiro_multitap_port1", "6Player Adaptor on Port 1; disabled|enabled" },
-      { "yabasanshiro_multitap_port2", "6Player Adaptor on Port 2; disabled|enabled" },
-#ifdef DYNAREC_DEVMIYAX
-      { "yabasanshiro_sh2coretype", "SH2 Core (restart); dynarec|interpreter" },
-#endif
-#ifdef ALLOW_POLYGON_MODE
-      { "yabasanshiro_polygon_mode", "Polygon Mode; perspective_correction|gpu_tesselation|cpu_tesselation" },
-#endif
-#ifndef LOW_END
-      { "yabasanshiro_resolution_mode", "Resolution Mode; original|2x|4x" },
-#else
-      { "yabasanshiro_resolution_mode", "Resolution Mode; original|2x" },
-#endif
-      { "yabasanshiro_rbg_resolution_mode", "RGB resolution mode; original|2x|720p|1080p" },
-      { "yabasanshiro_rbg_use_compute_shader", "RGB use compute shader for RGB; enabled|disabled" },
-      { NULL, NULL },
-   };
-
    static const struct retro_controller_description peripherals[] = {
        { "Saturn Pad", RETRO_DEVICE_JOYPAD },
        { "Saturn 3D Pad", RETRO_DEVICE_ANALOG },
@@ -143,8 +125,23 @@ void retro_set_environment(retro_environment_t cb)
 
    environ_cb = cb;
 
-   cb(RETRO_ENVIRONMENT_SET_VARIABLES, (void*)vars);
+   /* Options come from libretro_core_options.h (v2 with categories; the setter
+    * falls back to v1/SET_VARIABLES on older frontends). */
+   {
+      bool option_cats_supported = false;
+      libretro_set_core_options(cb, &option_cats_supported);
+   }
+
    environ_cb(RETRO_ENVIRONMENT_SET_CONTROLLER_INFO, (void*)ports);
+
+   /* RetroAchievements: the Saturn work RAM published through set_memory_maps()
+    * (HWRAM @0x06000000, LWRAM @0x00200000) is stored byte-swapped the same way
+    * Beetle Saturn/Yabause store it, which is what the RA sets were authored
+    * against (same statement as the reference core). */
+   {
+      bool support_achievements = true;
+      environ_cb(RETRO_ENVIRONMENT_SET_SUPPORT_ACHIEVEMENTS, &support_achievements);
+   }
 }
 void retro_set_video_refresh(retro_video_refresh_t cb) { video_cb = cb; }
 void retro_set_audio_sample(retro_audio_sample_t cb) { (void)cb; }

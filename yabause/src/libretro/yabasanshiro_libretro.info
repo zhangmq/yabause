@@ -1,0 +1,30 @@
+# Software Information
+display_name = "Sega - Saturn (YabaSanshiro)"
+authors = "Guillaume Duhamel|Theo Berkau|Anders Montonen|devmiyax"
+supported_extensions = "bin|ccd|chd|cue|iso|mds|zip"
+corename = "YabaSanshiro"
+license = "GPLv2"
+permissions = ""
+display_version = "v2.5.1"
+categories = "Emulator"
+
+# Hardware Information
+manufacturer = "Sega"
+systemname = "Saturn"
+systemid = "sega_saturn"
+
+# Libretro Features
+supports_no_game = "false"
+hw_render = "true"
+required_hw_api = "OpenGL >= 3.3 | OpenGL ES >= 3.0"
+database = "Sega - Saturn"
+savestate = "true"
+savestate_features = "basic"
+cheats = "true"
+input_descriptors = "true"
+memory_descriptors = "true"
+libretro_saves = "true"
+core_options = "true"
+load_subsystem = "false"
+needs_fullpath = "true"
+disk_control = "false"
