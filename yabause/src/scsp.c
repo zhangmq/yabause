@@ -5573,12 +5573,38 @@ void ScspAsynMainRealtime(void * p) {
 
 #if defined(ARCH_IS_LINUX)
   struct timespec tm;
+/* Optional realtime priority for the SCSP thread, matching the reference
+   implementation (lr-yabasanshiro src/scsp.cpp:5617-5622 enables
+   SCHED_FIFO(priority 15) + setpriority(-10) unconditionally).
+
+   Off by default here: with the timed wait fixed the thread now really blocks
+   on sync_cnd, and an on-screen A/B on the RGSP measured no gain from the
+   priority bump (GAXE, 3+3 interleaved runs at 120 s, governor verified at
+   performance/1512000 throughout, fixed-frame metric):
+       no RT : 6518/6518/6521 frames, 1.88 cores, 0 ALSA xruns
+       RT    : 6445/6530/6469 frames, 1.90 cores, 0 ALSA xruns
+   i.e. -0.8% frames and +1.1% CPU, with visibly more run-to-run spread.
+   Build with -DYAB_SCSP_RT_PRIO=15 -DYAB_SCSP_RT_NICE=-10 to match the
+   reference if a heavier workload ever shows a benefit.
+
+   The reference's guard is "if (pthread_setschedparam(...) < -1)", which can
+   never be true, so a failure there is silent; check the return values here and
+   report once (LOG() is a no-op outside DEBUG builds). */
+#if defined(YAB_SCSP_RT_PRIO)
   struct sched_param thread_param;
-  //thread_param.sched_priority = 15; //sched_get_priority_max(SCHED_FIFO);
-  //if ( pthread_setschedparam(pthread_self(), SCHED_FIFO, &thread_param) < -1 ) {
-  //  LOG("sched_setscheduler");
-  //}
-  //setpriority( PRIO_PROCESS, 0, -10);
+  thread_param.sched_priority = YAB_SCSP_RT_PRIO;
+  {
+    int rv = pthread_setschedparam(pthread_self(), SCHED_FIFO, &thread_param);
+    if (rv != 0)
+      printf("SCSP: pthread_setschedparam(SCHED_FIFO, prio=%d) failed: %s\n",
+             (int)YAB_SCSP_RT_PRIO, strerror(rv));
+  }
+#endif
+#if defined(YAB_SCSP_RT_NICE)
+  if (setpriority(PRIO_PROCESS, 0, YAB_SCSP_RT_NICE) != 0)
+    printf("SCSP: setpriority(PRIO_PROCESS, 0, %d) failed: %s\n",
+           (int)YAB_SCSP_RT_NICE, strerror(errno));
+#endif
 #endif
 
   // Special for Thunder Force V
