@@ -99,6 +99,9 @@ static struct retro_hw_render_callback hw_render;
 extern struct retro_hw_render_callback hw_render;
 #endif
 
+/* defined with the disk-control block further down */
+static void disk_register(void);
+
 void retro_set_environment(retro_environment_t cb)
 {
    static const struct retro_controller_description peripherals[] = {
@@ -133,6 +136,9 @@ void retro_set_environment(retro_environment_t cb)
    }
 
    environ_cb(RETRO_ENVIRONMENT_SET_CONTROLLER_INFO, (void*)ports);
+
+   /* Multi-disc swap / .m3u playlists (same interface set as the reference core). */
+   disk_register();
 
    /* RetroAchievements: the Saturn work RAM published through set_memory_maps()
     * (HWRAM @0x06000000, LWRAM @0x00200000) is stored byte-swapped the same way
@@ -1047,7 +1053,7 @@ void retro_get_system_info(struct retro_system_info *info)
    info->library_version  = "v" VERSION GIT_VERSION;
    info->need_fullpath    = true;
    info->block_extract    = false;
-   info->valid_extensions = "cue|iso|mds|ccd";
+   info->valid_extensions = "bin|ccd|chd|cue|iso|mds|m3u|zip";
 }
 
 void check_variables(void)
@@ -1400,6 +1406,244 @@ void retro_init(void)
    environ_cb(RETRO_ENVIRONMENT_SET_SERIALIZATION_QUIRKS, &serialization_quirks);
 }
 
+
+/* ---- Disk control (multi-disc swap / .m3u playlists) ----------------------
+ * Ported from the reference libretro core (lr-yabasanshiro).  Saturn games like
+ * Panzer Dragoon Saga, Shining Force III and Grandia ship on several CDs; the
+ * frontend drives the virtual tray through this interface and the media change
+ * is delegated to cs2.c (Cs2ForceOpenTray / Cs2ForceCloseTray reopen the ISO CD
+ * core on a new image). */
+
+#define YABA_MAX_DISKS 16
+
+static char     disk_paths[YABA_MAX_DISKS][PATH_MAX];
+static char     disk_labels[YABA_MAX_DISKS][PATH_MAX];
+static unsigned disk_count        = 0;
+static unsigned disk_index        = 0;
+static unsigned disk_initial_idx  = 0;
+static char     disk_initial_path[PATH_MAX];
+static bool     disk_tray_open    = false;
+
+static int ext_is_m3u(const char *path)
+{
+   const char *e = path_get_extension(path);
+   return e && (e[0] == 'm' || e[0] == 'M')
+            && (e[1] == '3')
+            && (e[2] == 'u' || e[2] == 'U')
+            &&  e[3] == '\0';
+}
+
+static void disk_set_label_from_path(unsigned idx)
+{
+   char base[PATH_MAX];
+   if (idx >= YABA_MAX_DISKS || disk_paths[idx][0] == '\0')
+      return;
+   strncpy(base, path_basename(disk_paths[idx]), sizeof(base) - 1);
+   base[sizeof(base) - 1] = '\0';
+   path_remove_extension(base);
+   strncpy(disk_labels[idx], base, sizeof(disk_labels[idx]) - 1);
+   disk_labels[idx][sizeof(disk_labels[idx]) - 1] = '\0';
+}
+
+static bool disk_set_eject_state(bool ejected)
+{
+   if (ejected)
+      Cs2ForceOpenTray();
+   else
+   {
+      if (disk_index >= disk_count || disk_paths[disk_index][0] == '\0')
+         return false;
+      if (Cs2ForceCloseTray(CDCORE_ISO, disk_paths[disk_index]) != 0)
+         return false;
+      /* keep yabause's notion of the loaded image in sync */
+      snprintf(full_path, sizeof(full_path), "%s", disk_paths[disk_index]);
+   }
+   disk_tray_open = ejected;
+   return true;
+}
+
+static bool     disk_get_eject_state(void) { return disk_tray_open; }
+static unsigned disk_get_image_index(void) { return disk_index; }
+static unsigned disk_get_num_images(void)  { return disk_count; }
+
+static bool disk_set_image_index(unsigned index)
+{
+   /* The media is only swapped when the tray is closed (set_eject_state(false));
+    * here we just record which image will be inserted. index == disk_count is the
+    * frontend's "no disk" sentinel. */
+   if (index == disk_count)
+   {
+      disk_index = index;
+      return true;
+   }
+   if (index >= disk_count)
+      return false;
+   disk_index = index;
+   return true;
+}
+
+static bool disk_replace_image_index(unsigned index,
+      const struct retro_game_info *info)
+{
+   if (index >= YABA_MAX_DISKS)
+      return false;
+
+   if (!info || !info->path) /* remove this image */
+   {
+      unsigned i;
+      if (index >= disk_count)
+         return false;
+      for (i = index; i + 1 < disk_count; i++)
+      {
+         snprintf(disk_paths[i], PATH_MAX, "%s", disk_paths[i + 1]);
+         disk_set_label_from_path(i);
+      }
+      if (disk_count > 0)
+         disk_count--;
+      if (disk_count > 0 && disk_index >= disk_count)
+         disk_index = disk_count - 1;
+      return true;
+   }
+
+   snprintf(disk_paths[index], PATH_MAX, "%s", info->path);
+   disk_set_label_from_path(index);
+   if (index >= disk_count)
+      disk_count = index + 1;
+   return true;
+}
+
+static bool disk_add_image_index(void)
+{
+   if (disk_count >= YABA_MAX_DISKS)
+      return false;
+   disk_paths[disk_count][0]  = '\0';
+   disk_labels[disk_count][0] = '\0';
+   disk_count++;
+   return true;
+}
+
+static bool disk_set_initial_image(unsigned index, const char *path)
+{
+   disk_initial_idx = index;
+   if (path)
+      snprintf(disk_initial_path, sizeof(disk_initial_path), "%s", path);
+   else
+      disk_initial_path[0] = '\0';
+   return true;
+}
+
+static bool disk_get_image_path(unsigned index, char *path, size_t len)
+{
+   if (index >= disk_count || !path || len == 0 || disk_paths[index][0] == '\0')
+      return false;
+   strncpy(path, disk_paths[index], len - 1);
+   path[len - 1] = '\0';
+   return true;
+}
+
+static bool disk_get_image_label(unsigned index, char *label, size_t len)
+{
+   if (index >= disk_count || !label || len == 0 || disk_labels[index][0] == '\0')
+      return false;
+   strncpy(label, disk_labels[index], len - 1);
+   label[len - 1] = '\0';
+   return true;
+}
+
+static const struct retro_disk_control_ext_callback disk_ext_cb = {
+   disk_set_eject_state,
+   disk_get_eject_state,
+   disk_get_image_index,
+   disk_set_image_index,
+   disk_get_num_images,
+   disk_replace_image_index,
+   disk_add_image_index,
+   disk_set_initial_image,
+   disk_get_image_path,
+   disk_get_image_label,
+};
+
+static const struct retro_disk_control_callback disk_cb = {
+   disk_set_eject_state,
+   disk_get_eject_state,
+   disk_get_image_index,
+   disk_set_image_index,
+   disk_get_num_images,
+   disk_replace_image_index,
+   disk_add_image_index,
+};
+
+/* Build the disk list from the content path: either an .m3u playlist (one disc
+ * per line, '#' comments, paths absolute or relative to the playlist dir) or a
+ * single disc image. */
+static void disk_init_from_content(const char *content_path)
+{
+   disk_count     = 0;
+   disk_index     = 0;
+   disk_tray_open = false;
+
+   if (ext_is_m3u(content_path))
+   {
+      char basedir[PATH_MAX];
+      char line[PATH_MAX];
+      FILE *fp;
+      fill_pathname_basedir(basedir, content_path, sizeof(basedir));
+      fp = fopen(content_path, "r");
+      if (fp)
+      {
+         while (fgets(line, sizeof(line), fp) && disk_count < YABA_MAX_DISKS)
+         {
+            char *nl;
+            char *p = line;
+            while (*p == ' ' || *p == '\t')
+               p++;
+            if (*p == '#' || *p == '\0' || *p == '\r' || *p == '\n')
+               continue;
+            nl = strpbrk(p, "\r\n");
+            if (nl)
+               *nl = '\0';
+            if (*p == '\0')
+               continue;
+            if (path_is_absolute(p))
+               snprintf(disk_paths[disk_count], PATH_MAX, "%s", p);
+            else
+               fill_pathname_join(disk_paths[disk_count], basedir, p, PATH_MAX);
+            disk_set_label_from_path(disk_count);
+            disk_count++;
+         }
+         fclose(fp);
+      }
+   }
+
+   if (disk_count == 0) /* single image, or empty/unreadable playlist */
+   {
+      snprintf(disk_paths[0], PATH_MAX, "%s", content_path);
+      disk_set_label_from_path(0);
+      disk_count = 1;
+   }
+
+   /* honour a frontend-requested initial image (last-used disc restore) */
+   if (disk_initial_idx < disk_count &&
+       (disk_initial_path[0] == '\0' ||
+        strcmp(disk_initial_path, disk_paths[disk_initial_idx]) == 0))
+      disk_index = disk_initial_idx;
+
+   disk_initial_idx     = 0;
+   disk_initial_path[0] = '\0';
+}
+
+static void disk_register(void)
+{
+   unsigned version = 0;
+   if (environ_cb(RETRO_ENVIRONMENT_GET_DISK_CONTROL_INTERFACE_VERSION, &version)
+         && version >= 1)
+      environ_cb(RETRO_ENVIRONMENT_SET_DISK_CONTROL_EXT_INTERFACE,
+            (void *)&disk_ext_cb);
+   else
+      environ_cb(RETRO_ENVIRONMENT_SET_DISK_CONTROL_INTERFACE,
+            (void *)&disk_cb);
+}
+
 bool retro_load_game_common()
 {
    enum retro_pixel_format fmt = RETRO_PIXEL_FORMAT_XRGB8888;
@@ -1445,7 +1689,10 @@ bool retro_load_game(const struct retro_game_info *info)
 
    check_variables();
 
-   snprintf(full_path, sizeof(full_path), "%s", info->path);
+   /* Resolve the disc to boot: a single image, or the first entry of an .m3u
+    * playlist (disk control can swap to the other entries later). */
+   disk_init_from_content(info->path);
+   snprintf(full_path, sizeof(full_path), "%s", disk_paths[disk_index]);
    snprintf(bios_path, sizeof(bios_path), "%s%csaturn_bios.bin", g_system_dir, slash);
    if (does_file_exist(bios_path) != 1)
    {
