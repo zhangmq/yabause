@@ -616,6 +616,10 @@ static struct {
  * queried (see yk_query_front_size); every frontend we target hands out a
  * power-of-two FBO of at least this size for a 320x224..704x448 core. */
 #define YK_MIRROR_FALLBACK_DIM   1024
+/* Slack added to the engine's render area before sizing the depth/stencil
+ * attachment: aspect/offset modes can shift the viewport by a few pixels, and
+ * the attachment must never clip a draw. */
+#define YK_MIRROR_MARGIN         32
 
 /* Context-handoff trace: build with -DYAB_CTX_TRACE to see, on every borrow /
  * hand-back, which EGL context really ends up current on which thread.  The
@@ -681,13 +685,46 @@ static void yk_query_front_size(YK_Uint tex)
  * mirror FBO needs its own -- FBOs are not shared between the two contexts. */
 static void yk_mirror_depth(void)
 {
-   int w = yk.front_tex_w, h = yk.front_tex_h;
+   /* Size the depth/stencil to the area the engine actually renders, not to
+    * the frontend's power-of-two colour texture.
+    *
+    * A framebuffer's dimensions are the INTERSECTION of its attachments', and
+    * the engine's per-frame clear is not scissored (ygles.c YglRender():
+    * glDisable(GL_SCISSOR_TEST); glClear(COLOR|DEPTH|STENCIL)), so with a
+    * frontend-sized (1024x1024) depth/stencil the engine clears
+    * 1024*1024*4 = 4 MB of depth+stencil every frame on top of the colour
+    * clear -- and every layer fragment does a depth read-modify-write against
+    * it.  In RES_NATIVE (the mode this port uses) the engine draws only
+    * current_width x current_height at the origin, so a render-area-sized
+    * attachment makes both clears (and the attachment traffic) 10x+ smaller at
+    * 320x224 while every draw stays inside the area.  Clamped to the
+    * frontend's texture: never larger than before. */
+   int w, h;
+   int fw = yk.front_tex_w, fh = yk.front_tex_h;
+
+   if (current_width > 0 && current_height > 0)
+   {
+      w = current_width  + YK_MIRROR_MARGIN;
+      h = current_height + YK_MIRROR_MARGIN;
+   }
+   else
+   {
+      /* resolution not known yet (context_reset runs before the first
+       * retro_set_resolution): stay frontend-sized, shrink on the first frame */
+      w = fw;
+      h = fh;
+   }
 
    if (!yk.FramebufferRenderbuffer || !yk.GenRenderbuffers ||
        !yk.RenderbufferStorage || !yk.BindRenderbuffer)
       return;
+   if (fw > 0 && w > fw) w = fw;
+   if (fh > 0 && h > fh) h = fh;
    if (w <= 0 || h <= 0)
-      w = h = YK_MIRROR_FALLBACK_DIM;
+   {
+      w = fw > 0 ? fw : YK_MIRROR_FALLBACK_DIM;
+      h = fh > 0 ? fh : YK_MIRROR_FALLBACK_DIM;
+   }
    if (yk.mirror_rb && (yk.mirror_rb_w != w || yk.mirror_rb_h != h))
    {
       if (yk.DeleteRenderbuffers)
@@ -2451,6 +2488,10 @@ void retro_run(void)
       YK_TRACE("res_pending engine-GL start now=%p (sub=%p)", 
             (void *)(yk.GetCurrentContext ? yk.GetCurrentContext() : NULL), (void *)yk.ctx_sub);
       retro_set_resolution();
+      /* the render area may have changed: resize the mirror's depth/stencil
+       * with the engine's context current (a stale, smaller attachment would
+       * clip the first hi-res frame) */
+      yk_mirror_depth();
       YK_TRACE("res_pending engine-GL done now=%p", 
             (void *)(yk.GetCurrentContext ? yk.GetCurrentContext() : NULL));
       yk_detach();
