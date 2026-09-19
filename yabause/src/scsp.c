@@ -1755,7 +1755,15 @@ typedef struct scsp_t
   u32 scilv2;           // IL2 M68000 interrupt pin state
 
   u32 mcieb;            // allow main cpu interrupt
-  u32 mcipd;            // pending main cpu interrupt
+  /* Written by the SH2 thread (ScspMainContinue -> |=) and cleared by the SCSP
+     thread (scsp_set_b / scsp_update_timer -> &= ~).  Plain u32 loses updates;
+     C11 makes compound assignment on an _Atomic object a seq_cst
+     read-modify-write, so `scsp.mcipd |= id` / `&= ~x` below become atomic
+     without touching the call sites.  Same race the reference implementation
+     fixes with a compare_exchange loop (lr-yabasanshiro src/scsp.cpp:1929-1934,
+     2868-2878).  Size/alignment are unchanged (4/4), so savestates and
+     WRITE_THROUGH() are unaffected. */
+  _Atomic u32 mcipd;    // pending main cpu interrupt
 
   u8 *scsp_ram;         // scsp ram pointer
   void (*mintf)(void);  // main cpu interupt function pointer
