@@ -547,6 +547,10 @@ static struct {
    int state;                    /* 0 = untried, -1 = failed, 1 = ready */
    volatile int frame_pending, res_pending;
    int worker_valid; pthread_t worker; pthread_t main_thread;
+   /* What the frontend's thread had current before the core borrowed ctx_sub
+    * (see yk_remember_front/yk_restore_front). Only ever touched on the
+    * frontend's thread; the VDP thread owns ctx_sub for its lifetime. */
+   YK_Context prev_ctx; YK_Surface prev_draw, prev_read;
    YK_Display (*GetCurrentDisplay)(void);
    YK_Context (*GetCurrentContext)(void);
    YK_Surface (*GetCurrentSurface)(int);
@@ -637,6 +641,13 @@ static void yk_load(void)
    yk.ctx_front = yk.GetCurrentContext();
    yk.draw      = yk.GetCurrentSurface(YK_EGL_DRAW);
    yk.read      = yk.GetCurrentSurface(YK_EGL_READ);
+   /* The frontend's context is the one current here (yk_load() is called from
+    * context_reset with the frontend's context current): seed the hand-back
+    * record from it, since yk_remember_front() cannot run before the entry
+    * points above exist. */
+   yk.prev_ctx  = yk.ctx_front;
+   yk.prev_draw = yk.draw;
+   yk.prev_read = yk.read;
    if (!yk.dpy || !yk.ctx_front)
    { yk_log("frontend has no current EGL context"); return; }
 
@@ -720,6 +731,9 @@ static void yk_load(void)
 /* Make the shared context current on the calling thread (VDP thread: for its
  * lifetime; emulation thread: only while it borrows the context for engine GL
  * work, e.g. a resolution/option change). */
+static void yk_remember_front(void);
+static void yk_restore_front(void);
+
 static int yk_attach(void)
 {
    if (yk.state != 1)
@@ -733,18 +747,85 @@ static int yk_attach(void)
       yk.worker = pthread_self();
       yk.worker_valid = 1;
    }
+   /* A borrower that is not the VDP thread (i.e. the frontend's thread) must
+    * remember what it is taking the thread away from, so yk_detach() can hand
+    * it back instead of leaving the thread context-less. */
+   if (!(yk.worker_valid && pthread_self() == yk.worker))
+      yk_remember_front();
    if (yk.GetCurrentContext && yk.GetCurrentContext() == yk.ctx_sub)
       return 0;                 /* already ours on this thread */
    return yk.MakeCurrent(yk.dpy, yk.pb, yk.pb, yk.ctx_sub) ? 0 : -1;
+}
+
+/* Remember the frontend's context (and the surfaces it has current) so it can
+ * be handed back later.  Called whenever the frontend's context is the one
+ * current on this thread; a no-op while the core's own context is current or
+ * before yk_load() has resolved the EGL entry points. */
+static void yk_remember_front(void)
+{
+   YK_Context cur;
+   if (!yk.GetCurrentContext)
+      return;
+   cur = yk.GetCurrentContext();
+   if (!cur || cur == yk.ctx_sub)
+      return;
+   yk.prev_ctx  = cur;
+   yk.prev_draw = yk.GetCurrentSurface ? yk.GetCurrentSurface(YK_EGL_DRAW) : NULL;
+   yk.prev_read = yk.GetCurrentSurface ? yk.GetCurrentSurface(YK_EGL_READ) : NULL;
+}
+
+/* Hand the calling thread its own context back.
+ *
+ * Why this matters: the frontend (SDL) keeps a PER-THREAD record of which
+ * context it made current and treats "the context I would make current is
+ * already the one I recorded" as a no-op.  Releasing the borrowing thread to
+ * EGL_NO_CONTEXT behind SDL's back therefore leaves the frontend believing its
+ * context is current while the thread really has none, so every frontend GL
+ * call of that frame is silently void -- measured on device as
+ * "present shader compile failed" with an uninitialised info-log one frame
+ * before the retry succeeded, and in the offscreen harness (with the frontend's
+ * unconditional eglMakeCurrent disabled) as a permanently context-less frontend
+ * thread whose every FBO readback comes back black.  Restoring the saved
+ * context keeps that record true, and keeps the frontend's FBO/texture
+ * namespace (names 1/3, the same names the engine's own objects use) from ever
+ * being touched by the wrong context.
+ *
+ * Unconditional on purpose: if this thread already holds a context that is not
+ * ours there is nothing to give back; if it holds ctx_sub (the normal case) or
+ * nothing at all (the VDP thread took ctx_sub over while the engine was
+ * starting) the frontend's context is the right thing to have current.
+ */
+static void yk_restore_front(void)
+{
+   YK_Context cur, back;
+   if (!yk.GetCurrentContext || !yk.MakeCurrent)
+      return;
+   cur = yk.GetCurrentContext();
+   if (cur && cur != yk.ctx_sub)
+      return;                   /* somebody else's context is current here */
+   back = yk.prev_ctx ? yk.prev_ctx : yk.ctx_front;
+   if (!back)
+      return;
+   yk.MakeCurrent(yk.dpy,
+         yk.prev_ctx ? yk.prev_draw : yk.draw,
+         yk.prev_ctx ? yk.prev_read : yk.read,
+         back);
 }
 
 static void yk_detach(void)
 {
    if (yk.state != 1)
       return;
-   if (yk.GetCurrentContext && yk.GetCurrentContext() != yk.ctx_sub)
-      return;                   /* not ours on this thread */
-   yk.MakeCurrent(yk.dpy, NULL, NULL, NULL);
+   if (yk.worker_valid && pthread_self() == yk.worker)
+   {
+      if (yk.GetCurrentContext && yk.GetCurrentContext() != yk.ctx_sub)
+         return;                /* not ours on this thread */
+      yk.MakeCurrent(yk.dpy, NULL, NULL, NULL);   /* VDP thread: plain release */
+      return;
+   }
+   /* Frontend thread: hand back the context this thread owns (no-op when it is
+    * already current, which is also what makes a failed yk_attach() harmless). */
+   yk_restore_front();
 }
 
 /* Does the calling thread currently hold the shared context? */
@@ -957,8 +1038,22 @@ static void context_reset(void)
 #if defined(YAB_CORE_SHARED_CONTEXT)
    /* Create the core's own (shared) context and leave it current on this
     * thread, so YabauseInit()'s GL objects live in the context the VDP
-    * thread uses.  Must happen before YabauseInit() starts that thread. */
+    * thread uses.  Must happen before YabauseInit() starts that thread.
+    * yk_remember_front() first, and yk_restore_front() at the end: the engine's GL
+    * work below is the only part of this call that must run in the core's
+    * context -- handing the frontend's context back afterwards is what keeps
+    * the frontend thread's notion of "which context is current" true (see
+    * yk_restore_front).  yk_attach() re-borrows ctx_sub on a repeat reset,
+    * where yk_load() is a no-op. */
+   /* If the core's context is already current on this thread, an OUTER borrow
+    * (retro_run's option/res_pending bracket, or apply_state_buffer) is in
+    * progress and owns the hand-back -- this re-entry (MA_GL_update_fbo_size ->
+    * context_reset) must not hand the frontend's context back early. */
+   int outer_borrow = yk_held();
+   if (!outer_borrow)
+      yk_remember_front();
    yk_load();
+   yk_attach();
 #endif
 #if !defined(_USEGLEW_)
    glsm_ctl(GLSM_CTL_STATE_CONTEXT_RESET, NULL);
@@ -981,6 +1076,12 @@ static void context_reset(void)
       retro_set_resolution();
       set_memory_maps();
    }
+#if defined(YAB_CORE_SHARED_CONTEXT)
+   /* Engine is up: give the frontend's thread its own context back (unless an
+    * outer borrow is still holding it; see outer_borrow above). */
+   if (!outer_borrow)
+      yk_restore_front();
+#endif
 }
 
 static void context_destroy(void)
@@ -988,13 +1089,18 @@ static void context_destroy(void)
 #if defined(YAB_CORE_SHARED_CONTEXT)
    /* The frontend calls context_destroy before retro_unload_game, so the
     * VDP thread has not been joined yet: stop it, then hold the shared
-    * context on this thread for the engine's GL teardown. */
+    * context on this thread for the engine's GL teardown.  yk_attach()
+    * remembers the frontend's context and yk_detach() hands it back, so the
+    * frontend keeps drawing with the context it thinks it owns. */
    Vdp2StopRenderThread();
    yk_attach();
 #endif
    if (renderer_running)
       VIDCore->DeInit();
    renderer_running = false;
+#if defined(YAB_CORE_SHARED_CONTEXT)
+   yk_detach();
+#endif
 #if !defined(_USEGLEW_)
    glsm_ctl(GLSM_CTL_STATE_CONTEXT_DESTROY, NULL);
 #endif
