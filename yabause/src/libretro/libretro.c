@@ -1276,7 +1276,44 @@ bool retro_serialize(void *data, size_t size)
    return true;
 }
 
-bool retro_unserialize(const void *data, size_t size)
+/* ---------------------------------------------------------------------------
+ * Deferred state load ("warm-up gate").
+ *
+ * Loading a state is not safe until the emulated machine has been running for a
+ * while.  On the RGSP, loading a mid-game state during the first ~2 s of boot --
+ * exactly what "resume on launch" does -- leaves the sound path silent for the
+ * rest of the session: the SCSP keeps producing 735 samples per frame, but they
+ * are all +/-1 LSB (~-90 dBFS).  The restored state itself is fine (the same
+ * file loads with working audio once the machine has booted) and loading it
+ * again later does not repair it, so the damage is to state the savestate does
+ * not cover.
+ *
+ * Measured boundary (headless harness; Golden Axe's state is unaffected,
+ * Daytona USA -- which plays CD audio -- stays silent until the load happens at
+ * frame >= ~150; see .notes/audio-ab/SCSP-SAVESTATE-BATCH.md):
+ *
+ *   load at frame   0/1/5/60/90/120  -> silent (+/-1 LSB)
+ *   load at frame   150/180/300/420  -> normal audio
+ *
+ * So if a load arrives before YAB_STATE_WARM_FRAMES frames have been emulated,
+ * stash a copy, claim success (so the frontend's resume-on-launch keeps its
+ * flow) and apply it from retro_run() once the machine is warm.
+ * ------------------------------------------------------------------------- */
+#ifndef YAB_STATE_WARM_FRAMES
+#define YAB_STATE_WARM_FRAMES 240u   /* ~4 s at 60 Hz; 150 was the measured minimum */
+#endif
+static void   *g_pending_state = NULL;
+static size_t  g_pending_size  = 0;
+static unsigned long long g_frames_emulated = 0;
+
+static void free_pending_state(void)
+{
+   free(g_pending_state);
+   g_pending_state = NULL;
+   g_pending_size  = 0;
+}
+
+static int apply_state_buffer(const void *data, size_t size)
 {
    int error = YabLoadStateBuffer(data, size);
 #if defined(YAB_CORE_SHARED_CONTEXT)
@@ -1292,8 +1329,26 @@ bool retro_unserialize(const void *data, size_t size)
 #else
    retro_set_resolution();
 #endif
+   return error;
+}
 
-   return !error;
+bool retro_unserialize(const void *data, size_t size)
+{
+   if (g_frames_emulated < (unsigned long long)YAB_STATE_WARM_FRAMES)
+   {
+      void *copy = malloc(size ? size : 1);
+      if (!copy)
+         return false;
+      memcpy(copy, data, size);
+      free_pending_state();
+      g_pending_state = copy;
+      g_pending_size  = size;
+      log_cb(RETRO_LOG_INFO,
+             "[state] load deferred until warm-up (%llu/%u frames emulated)\n",
+             g_frames_emulated, (unsigned)YAB_STATE_WARM_FRAMES);
+      return true;
+   }
+   return apply_state_buffer(data, size) == 0;
 }
 
 void retro_cheat_reset(void)
@@ -1371,6 +1426,8 @@ bool retro_load_game_common()
 {
    enum retro_pixel_format fmt = RETRO_PIXEL_FORMAT_XRGB8888;
    g_serialize_size = 0; /* re-probe the savestate size for this content */
+   free_pending_state();  /* a state stashed for the previous content is meaningless */
+   g_frames_emulated = 0;
    if (!environ_cb(RETRO_ENVIRONMENT_SET_PIXEL_FORMAT, &fmt))
       return false;
    if (!retro_init_hw_context())
@@ -1686,6 +1743,7 @@ bool retro_load_game_special(unsigned game_type, const struct retro_game_info *i
 
 void retro_unload_game(void)
 {
+   free_pending_state();
    if (!renderer_running)
       VIDCore->Init();
    YabauseDeInit();
@@ -1793,6 +1851,19 @@ void retro_run(void)
    /* Keep the frontend's SAVE_RAM (.srm) and the live backup RAM in sync.  Runs
     * on the same thread that just emulated the frame, so no locking is needed. */
    sram_sync();
+
+   /* Apply a state that arrived before the machine was warm (see the warm-up gate
+    * above).  Done at the frame boundary, which is also where a normal
+    * retro_unserialize() lands, and the SCSP thread is parked inside
+    * YabLoadStateBuffer() just like there. */
+   g_frames_emulated++;
+   if (g_pending_state && g_frames_emulated >= (unsigned long long)YAB_STATE_WARM_FRAMES)
+   {
+      int rv = apply_state_buffer(g_pending_state, g_pending_size);
+      log_cb(RETRO_LOG_INFO, "[state] deferred load applied at frame %llu (rv=%d)\n",
+             g_frames_emulated, rv);
+      free_pending_state();
+   }
 
 #if defined(YAB_CORE_SHARED_CONTEXT)
    /* The async VDP thread only marks frames: the libretro contract wants
