@@ -863,6 +863,81 @@ void YuiSwapBuffers(void)
    one_frame_rendered = true;
 }
 
+/* ---------------------------------------------------------------------------
+ * Frontend-visible memory: backup RAM (.srm / RetroAchievements) and the work
+ * RAM layout.  Ported from lr-yabasanshiro src/libretro/libretro.c:1700-1793.
+ *
+ * The frontend may write its .srm into the buffer returned by
+ * retro_get_memory_data(RETRO_MEMORY_SAVE_RAM) before the core's own BupRam
+ * exists, so expose a shadow buffer, seed it from the core's backup.bin, push it
+ * into BupRam once that exists, then mirror it back out every frame.  The core
+ * keeps writing its own backup.bin as well, so saves persist either way.
+ * ------------------------------------------------------------------------- */
+#define YABA_INTERNAL_BUP_SIZE 0x10000
+
+static u8  sram_shadow[YABA_INTERNAL_BUP_SIZE];
+static int sram_apply_pending = 0; /* push shadow -> BupRam once BupRam exists */
+
+static void sram_seed_from_backup(const char *path)
+{
+   FILE *bf = fopen(path, "rb");
+   if (bf)
+   {
+      size_t n = fread(sram_shadow, 1, sizeof(sram_shadow), bf);
+      fclose(bf);
+      if (n < sizeof(sram_shadow))
+         FormatBackupRam(sram_shadow, sizeof(sram_shadow));
+   }
+   else
+      FormatBackupRam(sram_shadow, sizeof(sram_shadow));
+   sram_apply_pending = 1;
+}
+
+static void sram_sync(void)
+{
+   if (!BupRam)
+      return;
+   if (sram_apply_pending)
+   {
+      memcpy(BupRam, sram_shadow, sizeof(sram_shadow));
+      sram_apply_pending = 0;
+   }
+   else
+      memcpy(sram_shadow, BupRam, sizeof(sram_shadow));
+}
+
+/* Publish the Saturn work-RAM layout so the frontend (RetroAchievements, cheat
+ * search, ...) can address it.  Called from context_reset() once YabauseInit()
+ * has allocated the buffers. */
+static void set_memory_maps(void)
+{
+   static struct retro_memory_descriptor descs[2];
+   struct retro_memory_map mmap;
+
+   if (!HighWram || !LowWram)
+      return;
+
+   memset(descs, 0, sizeof(descs));
+
+   /* High Work RAM -- HWRAM @ 0x06000000, 1 MB (the primary region). */
+   descs[0].flags     = RETRO_MEMDESC_SYSTEM_RAM;
+   descs[0].ptr       = HighWram;
+   descs[0].start     = 0x06000000;
+   descs[0].len       = 0x100000;
+   descs[0].addrspace = "HWRAM";
+
+   /* Low Work RAM -- LWRAM @ 0x00200000, 1 MB. */
+   descs[1].flags     = RETRO_MEMDESC_SYSTEM_RAM;
+   descs[1].ptr       = LowWram;
+   descs[1].start     = 0x00200000;
+   descs[1].len       = 0x100000;
+   descs[1].addrspace = "LWRAM";
+
+   mmap.descriptors     = descs;
+   mmap.num_descriptors = 2;
+   environ_cb(RETRO_ENVIRONMENT_SET_MEMORY_MAPS, &mmap);
+}
+
 static void context_reset(void)
 {
 #if defined(YAB_CORE_SHARED_CONTEXT)
@@ -882,6 +957,7 @@ static void context_reset(void)
       renderer_running = true;
       retro_set_resolution();
       OSDChangeCore(OSDCORE_DUMMY);
+      set_memory_maps();   /* HighWram/LowWram exist only after YabauseInit() */
    }
    else
    {
@@ -889,6 +965,7 @@ static void context_reset(void)
          VIDCore->Init();
       renderer_running = true;
       retro_set_resolution();
+      set_memory_maps();
    }
 }
 
@@ -1367,6 +1444,10 @@ bool retro_load_game(const struct retro_game_info *info)
 
    snprintf(bup_path, sizeof(bup_path), "%s%cyabasanshiro%cbackup.bin", g_save_dir, slash, slash);
 
+   /* Prime the SAVE_RAM shadow from the core's backup card; the frontend may
+    * then overlay its .srm on top before the first frame. */
+   sram_seed_from_backup(bup_path);
+
    struct retro_input_descriptor desc[] = {
       { 0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_LEFT,  "D-Pad Left" },
       { 0, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_UP,    "D-Pad Up" },
@@ -1622,12 +1703,22 @@ unsigned retro_api_version(void)
 
 void *retro_get_memory_data(unsigned id)
 {
-   return NULL;
+   switch (id)
+   {
+      case RETRO_MEMORY_SAVE_RAM:   return sram_shadow;
+      case RETRO_MEMORY_SYSTEM_RAM: return HighWram;
+      default:                      return NULL;
+   }
 }
 
 size_t retro_get_memory_size(unsigned id)
 {
-   return 0;
+   switch (id)
+   {
+      case RETRO_MEMORY_SAVE_RAM:   return sizeof(sram_shadow);
+      case RETRO_MEMORY_SYSTEM_RAM: return 0x100000;
+      default:                      return 0;
+   }
 }
 
 void retro_deinit(void)
@@ -1698,6 +1789,10 @@ void retro_run(void)
    //YabauseExec(); runs from handle events
    if(PERCore)
       PERCore->HandleEvents();
+
+   /* Keep the frontend's SAVE_RAM (.srm) and the live backup RAM in sync.  Runs
+    * on the same thread that just emulated the frame, so no locking is needed. */
+   sram_sync();
 
 #if defined(YAB_CORE_SHARED_CONTEXT)
    /* The async VDP thread only marks frames: the libretro contract wants
