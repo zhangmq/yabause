@@ -1135,43 +1135,86 @@ void retro_set_controller_port_device(unsigned port, unsigned device)
    }
 }
 
+/* libretro requires retro_serialize_size() to stay constant for the lifetime of
+ * a loaded game, but Yabause's raw state size varies a little frame to frame
+ * (VDP1 command lists, movie data, ...).  Probe once, then return a generous
+ * fixed upper bound for the rest of the session and zero-pad every serialize to
+ * fill it.  Reset per content in retro_load_game_common().
+ *
+ * This is the reference implementation (lr-yabasanshiro
+ * src/libretro/libretro.c:976-1034).  It replaces the previous no-op stubs that
+ * returned size 0 / true, which left the frontend unable to save states at all
+ * (minarch's State_write() bails out when serialize_size() is 0) while making
+ * every load look successful.  The old dead code below them memcpy'd the
+ * caller's size out of a freshly allocated buffer with no bounds check. */
+static size_t g_serialize_size = 0;
+
 size_t retro_serialize_size(void)
 {
-   // Disabling savestates until they are safe
-   return 0;
-   void *buffer;
-   size_t size;
+   void *buffer = NULL;
+   size_t size = 0;
+   int error;
+
+   if (g_serialize_size != 0)
+      return g_serialize_size;
 
    ScspMuteAudio(SCSP_MUTE_SYSTEM);
-   YabSaveStateBuffer (&buffer, &size);
+   error = YabSaveStateBuffer (&buffer, &size);
    ScspUnMuteAudio(SCSP_MUTE_SYSTEM);
 
    free(buffer);
 
-   return size;
+   if (error || size == 0)
+      return 0; /* not ready yet -- do not cache, the frontend retries */
+
+   /* +25% +2MB headroom over the first observed state size. */
+   g_serialize_size = size + (size / 4) + (2 * 1024 * 1024);
+   return g_serialize_size;
 }
 
 bool retro_serialize(void *data, size_t size)
 {
-   // Disabling savestates until they are safe
-   return true;
-   void *buffer;
-   size_t out_size;
+   void *buffer = NULL;
+   size_t out_size = 0;
+   int error;
 
-   int error = YabSaveStateBuffer (&buffer, &out_size);
+   ScspMuteAudio(SCSP_MUTE_SYSTEM);
+   error = YabSaveStateBuffer (&buffer, &out_size);
+   ScspUnMuteAudio(SCSP_MUTE_SYSTEM);
 
-   memcpy(data, buffer, size);
+   if (error || !buffer)
+      return false;
 
+   if (out_size > size)
+   {
+      /* State grew past the cached upper bound -- fail rather than truncate. */
+      free(buffer);
+      return false;
+   }
+
+   memcpy(data, buffer, out_size);
+   if (out_size < size)
+      memset((unsigned char *)data + out_size, 0, size - out_size);
    free(buffer);
-   return !error;
+   return true;
 }
 
 bool retro_unserialize(const void *data, size_t size)
 {
-   // Disabling savestates until they are safe
-   return true;
    int error = YabLoadStateBuffer(data, size);
+#if defined(YAB_CORE_SHARED_CONTEXT)
+   /* retro_set_resolution() rebuilds the video core's GL objects, and the thread
+    * driving retro_run does not own the core's shared context -- borrow it from
+    * the VDP thread for the duration, exactly like the option-change and
+    * res_pending paths in retro_run(). */
+   VdpRevoke();
+   yk_attach();
    retro_set_resolution();
+   yk_detach();
+   VdpResume();
+#else
+   retro_set_resolution();
+#endif
 
    return !error;
 }
@@ -1250,6 +1293,7 @@ void retro_init(void)
 bool retro_load_game_common()
 {
    enum retro_pixel_format fmt = RETRO_PIXEL_FORMAT_XRGB8888;
+   g_serialize_size = 0; /* re-probe the savestate size for this content */
    if (!environ_cb(RETRO_ENVIRONMENT_SET_PIXEL_FORMAT, &fmt))
       return false;
    if (!retro_init_hw_context())

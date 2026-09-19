@@ -1,4 +1,4 @@
-﻿/*  Copyright 2005 Guillaume Duhamel
+/*  Copyright 2005 Guillaume Duhamel
     Copyright 2005-2006 Theo Berkau
 
     This file is part of Yabause.
@@ -1791,10 +1791,16 @@ int YabLoadStateStream(FILE *fp)
       return -3;
    }
 
-   // Make sure size variable matches actual size minus header
+   // Make sure the buffer holds at least the recorded payload.  The libretro
+   // frontend hands us a fixed-size buffer (retro_serialize_size() must be
+   // constant) that is usually larger than the actual state, with trailing
+   // padding, so accept >= instead of requiring an exact match.  The recorded
+   // `size` is authoritative and every chunk is parsed by its own header, so the
+   // padding is never read.  Reference implementation: lr-yabasanshiro
+   // src/memory.c (same check, already relaxed to >=).
    fseek(fp, 0, SEEK_END);
 
-   if (size != (ftell(fp) - headersize))
+   if ((ftell(fp) - headersize) < size)
    {
       return -2;
    }
