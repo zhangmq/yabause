@@ -6046,6 +6046,18 @@ M68KClearCodeBreakpoints ()
 
 //////////////////////////////////////////////////////////////////////////////
 
+/* SCSP savestate chunk version.
+ *
+ * v4 and older: the sound CPU (68k) register block was delegated to
+ *   M68K->SaveState()/M68K->LoadState(), and the Musashi interface implemented
+ *   both as empty stubs -- so those files carry no 68k state at all, and a load
+ *   leaves the 68k wherever the live machine has it (PC=0 after a cold start,
+ *   which leaves the SCSP silent forever).
+ * v5: those hooks really write/read the 23-word register block (see
+ *   m68kmusashi.c).  v4 files still load -- their block is simply absent and the
+ *   68k is left untouched, exactly as before. */
+#define SCSP_STATE_VERSION 5
+
 int
 SoundSaveState (FILE *fp)
 {
@@ -6055,7 +6067,7 @@ SoundSaveState (FILE *fp)
   u8 nextphase;
   IOCheck_struct check = { 0, 0 };
 
-  offset = StateWriteHeader (fp, "SCSP", 4);
+  offset = StateWriteHeader (fp, "SCSP", SCSP_STATE_VERSION);
 
   // Save 68k registers first
   ywrite (&check, (void *)&IsM68KRunning, 1, 1, fp);
@@ -6355,7 +6367,10 @@ SoundLoadState (FILE *fp, int version, int size)
   yread(&check, (void *)&savedcycles, sizeof(u32), 1, fp);
 
 #ifdef IMPROVED_SAVESTATES
-  M68K->LoadState(fp);
+  /* SCSP_STATE_VERSION 5 and up carry the 68k register block; older chunks do
+   * not, so skip the read instead of consuming the next fields as registers. */
+  if (version >= SCSP_STATE_VERSION)
+    M68K->LoadState(fp);
 #else
   for (i = 0; i < 8; i++)
     {
