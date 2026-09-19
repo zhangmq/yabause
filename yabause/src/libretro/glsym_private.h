@@ -37,6 +37,16 @@ extern RGLSYMGLBINDFRAGDATALOCATIONPROC __rglgen_glBindFragDataLocation;
 extern RGLSYMGLPATCHPARAMETERIPROC __rglgen_glPatchParameteri;
 extern RGLSYMGLDISPATCHCOMPUTEPROC __rglgen_glDispatchCompute;
 extern RGLSYMGLBINDIMAGETEXTUREPROC __rglgen_glBindImageTexture;
+
+/* Resolve the ES 3.1 entry points the engine uses for RBGGenerator's
+ * compute-shader path.  glsym_es3.c's symbol table has no ES 3.1 entries, so
+ * rglgen_resolve_symbols() leaves the pointers above NULL and the engine's
+ * glBindImageTexture()/glDispatchCompute()/glMemoryBarrier() calls jump to
+ * NULL (observed: pc=0 SIGSEGV on a game whose RBG0 layer takes that path,
+ * e.g. Virtua Fighter 2's title screen).  Call after the glsm reset/setup pass
+ * with the frontend's get_proc_address; entries the driver cannot provide stay
+ * NULL and the caller must fall back to the fragment-shader path. */
+void glsym_private_resolve_es31(void *(*get_proc)(const char *));
 #else
 typedef void (APIENTRYP RGLSYMGLTEXTUREBARRIERNVPROC) (void);
 

@@ -586,6 +586,17 @@ static struct {
 #define YK_GL_FRAMEBUFFER_BINDING 0x8CA6
 #define YK_GL_FRAMEBUFFER_COMPLETE 0x8CD5
 
+/* Context-handoff trace: build with -DYAB_CTX_TRACE to see, on every borrow /
+ * hand-back, which EGL context really ends up current on which thread.  The
+ * hi-res crash is a resolution-switch (res_pending) handover, so this is the
+ * cheap way to tell "engine GL ran in the frontend's context" (yk_attach
+ * failed) apart from "engine GL ran in the right one". */
+#if defined(YAB_CTX_TRACE)
+#define YK_TRACE(...) yk_log("[CTX] " __VA_ARGS__)
+#else
+#define YK_TRACE(...) ((void)0)
+#endif
+
 static void yk_log(const char *fmt, ...)
 {
    char buf[512];
@@ -753,8 +764,18 @@ static int yk_attach(void)
    if (!(yk.worker_valid && pthread_self() == yk.worker))
       yk_remember_front();
    if (yk.GetCurrentContext && yk.GetCurrentContext() == yk.ctx_sub)
+   {
+      YK_TRACE("attach tid=%lu: already sub", (unsigned long)pthread_self());
       return 0;                 /* already ours on this thread */
-   return yk.MakeCurrent(yk.dpy, yk.pb, yk.pb, yk.ctx_sub) ? 0 : -1;
+   }
+   {
+      YK_Bool ok = yk.MakeCurrent(yk.dpy, yk.pb, yk.pb, yk.ctx_sub);
+      YK_TRACE("attach tid=%lu rc=%d now=%p sub=%p front=%p", (unsigned long)pthread_self(),
+            (int)ok,
+            (void *)(yk.GetCurrentContext ? yk.GetCurrentContext() : NULL),
+            (void *)yk.ctx_sub, (void *)yk.ctx_front);
+      return ok ? 0 : -1;
+   }
 }
 
 /* Remember the frontend's context (and the surfaces it has current) so it can
@@ -806,10 +827,15 @@ static void yk_restore_front(void)
    back = yk.prev_ctx ? yk.prev_ctx : yk.ctx_front;
    if (!back)
       return;
-   yk.MakeCurrent(yk.dpy,
-         yk.prev_ctx ? yk.prev_draw : yk.draw,
-         yk.prev_ctx ? yk.prev_read : yk.read,
-         back);
+   {
+      YK_Bool ok = yk.MakeCurrent(yk.dpy,
+            yk.prev_ctx ? yk.prev_draw : yk.draw,
+            yk.prev_ctx ? yk.prev_read : yk.read,
+            back);
+      YK_TRACE("restore-front tid=%lu cur_was=%p back=%p rc=%d now=%p",
+            (unsigned long)pthread_self(), (void *)cur, (void *)back, (int)ok,
+            (void *)(yk.GetCurrentContext ? yk.GetCurrentContext() : NULL));
+   }
 }
 
 static void yk_detach(void)
@@ -821,6 +847,9 @@ static void yk_detach(void)
       if (yk.GetCurrentContext && yk.GetCurrentContext() != yk.ctx_sub)
          return;                /* not ours on this thread */
       yk.MakeCurrent(yk.dpy, NULL, NULL, NULL);   /* VDP thread: plain release */
+      YK_TRACE("detach[worker] tid=%lu -> released (now=%p)",
+            (unsigned long)pthread_self(),
+            (void *)(yk.GetCurrentContext ? yk.GetCurrentContext() : NULL));
       return;
    }
    /* Frontend thread: hand back the context this thread owns (no-op when it is
@@ -1050,6 +1079,8 @@ static void context_reset(void)
     * progress and owns the hand-back -- this re-entry (MA_GL_update_fbo_size ->
     * context_reset) must not hand the frontend's context back early. */
    int outer_borrow = yk_held();
+   YK_TRACE("context_reset enter outer_borrow=%d now=%p", outer_borrow,
+         (void *)(yk.GetCurrentContext ? yk.GetCurrentContext() : NULL));
    if (!outer_borrow)
       yk_remember_front();
    yk_load();
@@ -1058,6 +1089,27 @@ static void context_reset(void)
 #if !defined(_USEGLEW_)
    glsm_ctl(GLSM_CTL_STATE_CONTEXT_RESET, NULL);
    glsm_ctl(GLSM_CTL_STATE_SETUP, NULL);
+#endif
+#if defined(_OGLES3_)
+   /* glsym_es3.c's symbol table has no ES 3.1 entries, so the rglgen pass above
+    * leaves glBindImageTexture()/glDispatchCompute()/glMemoryBarrier() NULL and
+    * the first game that takes RBGGenerator's compute path (e.g. Virtua
+    * Fighter 2's title screen) jumps to NULL: si_code=SEGV_MAPERR, si_addr=0,
+    * PC=0.  Resolve them here, and if the driver cannot provide them, keep the
+    * engine on the fragment-shader path instead of calling NULL. */
+   glsym_private_resolve_es31((void *(*)(const char *))hw_render.get_proc_address);
+   log_cb(RETRO_LOG_INFO,
+          "ES 3.1 entry points: glBindImageTexture=%p glDispatchCompute=%p glMemoryBarrier=%p",
+          (void *)__rglgen_glBindImageTexture, (void *)__rglgen_glDispatchCompute,
+          (void *)__rglgen_glMemoryBarrier);
+   if (!__rglgen_glBindImageTexture || !__rglgen_glDispatchCompute || !__rglgen_glMemoryBarrier)
+   {
+      log_cb(RETRO_LOG_WARN,
+             "RBG compute shader unavailable (missing ES 3.1 image/compute entry points): using the fragment-shader path");
+      g_rbg_use_compute_shader = 0;
+      if (VIDCore)
+         VIDCore->SetSettingValue(VDP_SETTING_RBG_USE_COMPUTESHADER, g_rbg_use_compute_shader);
+   }
 #endif
    if (first_ctx_reset == 1)
    {
@@ -1079,6 +1131,8 @@ static void context_reset(void)
 #if defined(YAB_CORE_SHARED_CONTEXT)
    /* Engine is up: give the frontend's thread its own context back (unless an
     * outer borrow is still holding it; see outer_borrow above). */
+   YK_TRACE("context_reset engine-up now=%p (outer_borrow=%d)",
+         (void *)(yk.GetCurrentContext ? yk.GetCurrentContext() : NULL), outer_borrow);
    if (!outer_borrow)
       yk_restore_front();
 #endif
@@ -2187,9 +2241,15 @@ void retro_run(void)
    if (yk.res_pending)
    {
       yk.res_pending = 0;
+      YK_TRACE("res_pending begin cur_w=%dx%d now=%p", game_width, game_height,
+            (void *)(yk.GetCurrentContext ? yk.GetCurrentContext() : NULL));
       VdpRevoke();
       yk_attach();
+      YK_TRACE("res_pending engine-GL start now=%p (sub=%p)", 
+            (void *)(yk.GetCurrentContext ? yk.GetCurrentContext() : NULL), (void *)yk.ctx_sub);
       retro_set_resolution();
+      YK_TRACE("res_pending engine-GL done now=%p", 
+            (void *)(yk.GetCurrentContext ? yk.GetCurrentContext() : NULL));
       yk_detach();
       VdpResume();
    }
