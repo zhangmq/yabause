@@ -149,8 +149,11 @@ On screen (minarch-gl, hardware render, frameskip disabled, debug HUD off), fps 
 The emulation thread runs at ~0.70–0.84 cores instead of the synchronous build's ~1.0 (capped at
 one core), which is where the gain comes from; the render worker holds its own core.
 
-Known costs: the worker performs one `glFinish()` per frame (cross-context synchronisation), and
-the presentation path adds a normalise pass in the frontend.
+Known costs: the worker performs one `glFinish()` per frame (a whole-pipeline drain on the render
+thread, so the frame is complete in the shared texture before the frontend samples it from its own
+context — this is *not* the frontend's ring fence, which is a `glFenceSync`/`glClientWaitSync` pair
+guarding a slot against being overwritten while the GPU still reads it, and which measured as never
+blocking), and the presentation path adds a normalise pass in the frontend.
 
 ## Upstream, credits and license
 
