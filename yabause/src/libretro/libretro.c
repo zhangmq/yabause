@@ -1009,6 +1009,11 @@ int YuiRevokeOGLOnThisThread()
  * new slot's texture.  Runs on the frontend's thread with the FRONTEND's
  * context current (retro_run, right after video_cb), which is where the
  * frontend's FBO and its attachment can be queried.
+ *
+ * The attachment is re-read EVERY frame, not only when the FBO name changes:
+ * a frontend that recreates its hw-render FBO (resolution/geometry change,
+ * MA_GL_update_fbo_size) can get the same FBO name back from the driver and
+ * would otherwise leave the mirror pointing at a deleted texture.
  * ------------------------------------------------------------------------- */
 static void yk_adopt_front_fbo(void)
 {
@@ -1019,7 +1024,7 @@ static void yk_adopt_front_fbo(void)
    if (yk.state != 1 || !hw_render.get_current_framebuffer)
       return;
    fbo = (YK_Uint)(uintptr_t)hw_render.get_current_framebuffer();
-   if (!fbo || fbo == yk.front_fbo)
+   if (!fbo)
       return;
    if (!yk.BindFramebuffer || !yk.GetFramebufferAttachmentParameteriv)
       return;
@@ -1032,13 +1037,12 @@ static void yk_adopt_front_fbo(void)
       yk.GetFramebufferAttachmentParameteriv(YK_GL_FRAMEBUFFER, YK_GL_COLOR_ATTACHMENT0,
             YK_GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME, &name);
    yk.BindFramebuffer(YK_GL_FRAMEBUFFER, (YK_Uint)prev_fbo);
-   if (name)
-      yk_query_front_size((YK_Uint)name);
    if (name && name != yk.front_tex)
    {
       yk.front_fbo = fbo;
       yk.front_tex = name;
       yk.retarget  = 1;
+      yk_query_front_size((YK_Uint)name);
       if (yk.ring_adopt_log < 24)
       {
          log_cb(RETRO_LOG_INFO, "[YK] ring adopt: front fbo=%u tex=%u\n",
@@ -1051,26 +1055,34 @@ static void yk_adopt_front_fbo(void)
 
 /* Applied on the VDP thread, at the top of YglRender(): the engine binds the
  * mirror FBO (its cached _Ygl->default_fbo == yk.mirror_fbo) for the whole
- * frame, so following the frontend's ring is one attachment change here. */
+ * frame, so following the frontend's ring is one attachment change here.
+ *
+ * RetroArch's rule for the same hand-over (gfx/drivers/gl3.c: the hw-render
+ * ring attaches hw_render_rb_ds -- GL_DEPTH24_STENCIL8 when the core asked for
+ * stencil -- to EVERY ring slot, "sharing the depth renderbuffer, which only
+ * the core's rendering touches") is that the FBO handed to the core always
+ * carries the depth/stencil the core asked for in retro_hw_render_callback.
+ * RetroArch's driver owns that FBO and re-establishes it; here the core owns
+ * the mirror, so the core has to RESTORE the attachments itself whenever the
+ * frontend hands the frame back.  Done unconditionally, once per frame: three
+ * cheap GL calls, and it also covers a ring slot whose colour texture the
+ * frontend replaced without changing the FBO name. */
 void YuiRetargetFB(void)
 {
 #if defined(YAB_CORE_SHARED_CONTEXT)
-   if (yk.state == 1 && yk.retarget)
+   if (yk.state == 1 && yk.front_tex)
    {
-      yk.retarget = 0;
       yk.BindFramebuffer(YK_GL_FRAMEBUFFER, yk.mirror_fbo);
       yk.FramebufferTexture2D(YK_GL_FRAMEBUFFER, YK_GL_COLOR_ATTACHMENT0,
             YK_GL_TEXTURE_2D, yk.front_tex, 0);
-      /* the ring slot changed: keep the depth/stencil attachment in step
-       * (it is re-attached every retarget, recreated only if the slot size
-       * differs from the one we sized it for) */
       yk_mirror_depth();
-      if (yk.ring_log < 24)
+      if (yk.retarget && yk.ring_log < 24)
       {
          log_cb(RETRO_LOG_INFO, "[YK] ring draw: mirror=%u <- front fbo=%u tex=%u\n",
                (unsigned)yk.mirror_fbo, (unsigned)yk.front_fbo, (unsigned)yk.front_tex);
          yk.ring_log++;
       }
+      yk.retarget = 0;
    }
 #endif
 }
