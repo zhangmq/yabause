@@ -808,7 +808,16 @@ void retro_set_resolution()
    switch(resolution_mode)
    {
       case 1:
-         g_resolution_mode = 3;
+         /* "original" -> RES_NATIVE (0): draw straight into the framebuffer the
+          * frontend gave us (YuiGetFB(), i.e. the mirror FBO over its colour
+          * texture).  RES_ORIGINAL (3) instead renders into a game-sized
+          * sub-render-target and blits/upscales it every frame: on a hi-res game
+          * (e.g. Virtua Fighter 2 at 704x480) that costs an extra target + blit
+          * per frame, and the mode switch on the BIOS->game handover reallocates
+          * those targets mid-stream.  Aligned with lr-yabasanshiro's libretro
+          * frontend, which picks native for the same reason (its comment: the
+          * upscale path is broken under the libretro HW context). */
+         g_resolution_mode = RES_NATIVE;
          break;
       case 2:
          g_resolution_mode = 2;
@@ -819,8 +828,10 @@ void retro_set_resolution()
    }
    current_width = game_width * resolution_mode;
    current_height = game_height * resolution_mode;
-   /* this tree's Resize() takes the aspect-rate mode as a 6th argument */
-   VIDCore->Resize(0, 0, current_width, current_height, 0, FULL);
+   /* this tree's Resize() takes the aspect-rate mode as a 6th argument
+    * (ASPECT_RATE_MODE: ORIGINAL=0, _4_3, _16_9, FULL=3); the reference core
+    * passes ORIGINAL here, so match it. */
+   VIDCore->Resize(0, 0, current_width, current_height, 0, ORIGINAL);
    retro_reinit_av_info();
    VIDCore->SetSettingValue(VDP_SETTING_RESOLUTION_MODE, g_resolution_mode);
 }
