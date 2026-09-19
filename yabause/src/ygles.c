@@ -4030,6 +4030,14 @@ void YglRender(void)
   int from = 0;
   int to = 0;
   YglMatrix mtx;
+#ifdef __LIBRETRO__
+  /* The frontend rotates its hw-render ring once per presented frame, so the
+   * mirror FBO this frame draws into has to follow it before any draw. */
+  {
+    extern void YuiRetargetFB(void);
+    YuiRetargetFB();
+  }
+#endif
   YglMatrix dmtx;
   unsigned int i, j;
   int ccwindow = 0;
