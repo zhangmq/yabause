@@ -1187,11 +1187,23 @@ void retro_set_resolution()
    VIDCore->SetSettingValue(VDP_SETTING_RESOLUTION_MODE, g_resolution_mode);
 }
 
+/* what the engine actually renders (ygles.c globals); see YuiSwapBuffers */
+extern int GlWidth, GlHeight;
+
 void YuiSwapBuffers(void)
 {
    int prev_game_width = game_width;
    int prev_game_height = game_height;
    VIDCore->GetNativeResolution(&game_width, &game_height, &game_interlace);
+   /* Some Saturn modes are DOUBLE HEIGHT: the engine renders 704x448 while
+    * GetNativeResolution reports the field height (224) with interlace=0, so the
+    * frontend was handed 704x224 out of a 704x448 render -- half the picture
+    * (Virtua Fighter's attract mode lost the fighters' legs and the floor).
+    * ygles.c's GlWidth/GlHeight are what the engine actually renders; take the
+    * larger of the two.  No effect when they agree (BIOS 320x224, VF2's
+    * 704x448, 352x224 games). */
+   if (GlHeight > game_height) game_height = GlHeight;
+   if (GlWidth  > game_width)  game_width  = GlWidth;
    if ((prev_game_width != game_width) || (prev_game_height != game_height))
    {
 #if defined(YAB_CORE_SHARED_CONTEXT)
