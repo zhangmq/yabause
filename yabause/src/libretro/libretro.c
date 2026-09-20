@@ -2366,8 +2366,16 @@ bool retro_load_game_special(unsigned game_type, const struct retro_game_info *i
 
 void retro_unload_game(void)
 {
+   /* The frontend runs context_destroy() before retro_unload_game() (minarch:
+    * MA_GL_context_destroy() then this; the offscreen harness mirrors that
+    * order), so context_destroy() has already DeInit()ed VIDCore and there is
+    * no valid GL context left to re-init against -- the old VIDCore->Init()
+    * here re-initialised the video core after teardown (lr-yabasanshiro calls
+    * the equivalent change its clean-quit crash fix).  Detach the pointer
+    * instead: YabauseDeInit()'s VideoDeInit() then skips a second DeInit
+    * (VideoDeInit() NULL-checks VIDCore and clears it). */
    if (!renderer_running)
-      VIDCore->Init();
+      VIDCore = NULL;
    YabauseDeInit();
 }
 
