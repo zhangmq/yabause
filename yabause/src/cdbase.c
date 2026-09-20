@@ -1815,6 +1815,14 @@ static void ISOCDReadAheadFAD(UNUSED u32 FAD)
 //////////////////////////////////////////////////////////////////////////////
 
 #include "chd.h"
+/* The standalone libchdr's coretypes.h pulls in libretro-common's
+ * streams/file_stream_transforms.h, which #defines FILE as RFILE (the
+ * filestream type).  cdbase.c talks plain stdio FILE everywhere else, so undo
+ * that mapping here: the libchdr translation units keep their own, and our
+ * forward declarations (LoadCHD etc.) then agree with the definitions. */
+#ifdef FILE
+#undef FILE
+#endif
 
 #define CD_MAX_SECTOR_DATA      (2352)
 #define CD_MAX_SUBCODE_DATA     (96)

@@ -7,8 +7,9 @@ ZLIB_DIR := $(LIBCHDR_DIR)/deps/zlib-1.2.11
 
 INCLUDE_DIRS := $(CORE_DIR) \
 	$(SOURCE_DIR) \
+	$(LIBCHDR_DIR)/include \
+	$(LIBCHDR_DIR)/include/libchdr \
 	$(LIBRETRO_COMM_DIR)/include \
-	$(LIBRETRO_COMM_DIR)/include/libchdr \
 	$(LZMA_DIR)/include \
 	$(FLAC_DIR)/include \
 	$(FLAC_DIR)/src/include \
@@ -70,14 +71,11 @@ SOURCES_C := $(SOURCE_DIR)/osdcore.c \
 	$(LIBRETRO_COMM_DIR)/file/file_path.c \
 	$(LIBRETRO_COMM_DIR)/compat/compat_strcasestr.c \
 	$(LIBRETRO_COMM_DIR)/vfs/vfs_implementation.c \
-	$(LIBRETRO_COMM_DIR)/formats/libchdr/libchdr_chd.c \
-	$(LIBRETRO_COMM_DIR)/formats/libchdr/libchdr_bitstream.c \
-	$(LIBRETRO_COMM_DIR)/formats/libchdr/libchdr_huffman.c \
-	$(LIBRETRO_COMM_DIR)/formats/libchdr/libchdr_cdrom.c \
-	$(LIBRETRO_COMM_DIR)/formats/libchdr/libchdr_flac.c \
-	$(LIBRETRO_COMM_DIR)/formats/libchdr/libchdr_flac_codec.c \
-	$(LIBRETRO_COMM_DIR)/formats/libchdr/libchdr_lzma.c \
-	$(LIBRETRO_COMM_DIR)/formats/libchdr/libchdr_zlib.c \
+	$(LIBCHDR_DIR)/src/libchdr_chd.c \
+	$(LIBCHDR_DIR)/src/libchdr_bitstream.c \
+	$(LIBCHDR_DIR)/src/libchdr_huffman.c \
+	$(LIBCHDR_DIR)/src/libchdr_flac.c \
+	$(LIBCHDR_DIR)/src/libchdr_cdrom.c \
 	$(FLAC_DIR)/src/stream_decoder.c \
 	$(FLAC_DIR)/src/format.c \
 	$(FLAC_DIR)/src/bitreader.c \
