@@ -1116,7 +1116,7 @@ void FASTCALL MappedMemoryWriteByte(u32 addr, u8 val, u32 * cycle)
   }
 
 #ifdef YAB_STV_DEBUG
-   if (yabsys.isSTV && CurrentSH2 && addr >= 0x06000000 && addr < 0x06100000 && stv_wdbg < 200) {
+   if (yabsys.isSTV && CurrentSH2 && addr == 0x0600065a && stv_wdbg < 60) {
       printf("[TRWRITE] pc=%08x w8 %08x = %x\n", CurrentSH2->regs.PC, addr, val); stv_wdbg++;
    }
 #endif
@@ -1185,7 +1185,7 @@ void FASTCALL MappedMemoryWriteWord(u32 addr, u16 val, u32 * cycle )
   }
 
 #ifdef YAB_STV_DEBUG
-   if (yabsys.isSTV && CurrentSH2 && addr >= 0x06000000 && addr < 0x06100000 && stv_wdbg < 200) {
+   if (yabsys.isSTV && CurrentSH2 && addr == 0x0600065a && stv_wdbg < 60) {
       printf("[TRWRITE] pc=%08x w16 %08x = %x\n", CurrentSH2->regs.PC, addr, val); stv_wdbg++;
    }
 #endif
@@ -1267,7 +1267,7 @@ void FASTCALL MappedMemoryWriteLong(u32 addr, u32 val, u32 * cycle )
    }
 
 #ifdef YAB_STV_DEBUG
-   if (yabsys.isSTV && CurrentSH2 && addr >= 0x06000000 && addr < 0x06100000 && stv_wdbg < 200) {
+   if (yabsys.isSTV && CurrentSH2 && addr == 0x0600065a && stv_wdbg < 60) {
       printf("[TRWRITE] pc=%08x w32 %08x = %x\n", CurrentSH2->regs.PC, addr, val); stv_wdbg++;
    }
 #endif
