@@ -941,6 +941,7 @@ u16 FASTCALL MappedMemoryReadWordNocache(u32 addr, u32 * cycle)
 /* Set while MappedMemoryReadInst is fetching so the ST-V read probe below can
    ignore instruction fetches (ReadInst simply calls ReadWord). */
 int stv_in_fetch = 0;
+static unsigned int stv_wdbg = 0;
 #endif
 u16 MappedMemoryReadInst(u32 addr, u32 * cycle) {
 #ifdef YAB_STV_DEBUG
@@ -1114,6 +1115,11 @@ void FASTCALL MappedMemoryWriteByte(u32 addr, u8 val, u32 * cycle)
     *cycle = getMemClock(addr);
   }
 
+#ifdef YAB_STV_DEBUG
+   if (yabsys.isSTV && CurrentSH2 && addr >= 0x06000000 && addr < 0x06100000 && stv_wdbg < 200) {
+      printf("[TRWRITE] pc=%08x w8 %08x = %x\n", CurrentSH2->regs.PC, addr, val); stv_wdbg++;
+   }
+#endif
   switch (addr >> 29)
    {
       case 0x0:
@@ -1178,6 +1184,11 @@ void FASTCALL MappedMemoryWriteWord(u32 addr, u16 val, u32 * cycle )
     *cycle = getMemClock(addr);
   }
 
+#ifdef YAB_STV_DEBUG
+   if (yabsys.isSTV && CurrentSH2 && addr >= 0x06000000 && addr < 0x06100000 && stv_wdbg < 200) {
+      printf("[TRWRITE] pc=%08x w16 %08x = %x\n", CurrentSH2->regs.PC, addr, val); stv_wdbg++;
+   }
+#endif
    switch (addr >> 29)
    {
       case 0x0:
@@ -1255,6 +1266,11 @@ void FASTCALL MappedMemoryWriteLong(u32 addr, u32 val, u32 * cycle )
      *cycle = getMemClock(addr);
    }
 
+#ifdef YAB_STV_DEBUG
+   if (yabsys.isSTV && CurrentSH2 && addr >= 0x06000000 && addr < 0x06100000 && stv_wdbg < 200) {
+      printf("[TRWRITE] pc=%08x w32 %08x = %x\n", CurrentSH2->regs.PC, addr, val); stv_wdbg++;
+   }
+#endif
    switch (addr >> 29)
    {
       case 0x0:
