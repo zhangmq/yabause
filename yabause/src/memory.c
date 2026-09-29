@@ -80,6 +80,13 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301  USA
 #if CACHE_ENABLE
 #else
 u8 FASTCALL MappedMemoryReadByteNocache(u32 addr, u32 * cycle){ return MappedMemoryReadByte(addr, NULL); }
+/* ST-V ROM decryption (decrypt.c) reads the ROM area with no SH2 context and no
+   cache bookkeeping -- equivalent of Kronos' DMAMappedMemoryReadWord. */
+u16 FASTCALL DMAMappedMemoryReadWord(u32 addr)
+{
+   return ReadWordList[(addr >> 16) & 0xFFF](addr);
+}
+
 u16 FASTCALL MappedMemoryReadWordNocache(u32 addr, u32 * cycle){ return MappedMemoryReadWord(addr, NULL); }
 u32 FASTCALL MappedMemoryReadLongNocache(u32 addr, u32 * cycle){ return MappedMemoryReadLong(addr, NULL); }
 void FASTCALL MappedMemoryWriteByteNocache(u32 addr, u8 val, u32 * cycle){ MappedMemoryWriteByte(addr,val, NULL);  }

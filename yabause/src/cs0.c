@@ -1043,6 +1043,69 @@ static void FASTCALL ROM16MBITCs0WriteLong(u32 addr, u32 val)
 // General Cart functions
 //////////////////////////////////////////////////////////////////////////////
 
+
+/* ST-V ROM board mapped on A-bus CS0 (first 32 MiB) + CS1 (rest).
+   Ported from libretro/yabause@kronos (yabause/src/sys/memory/src/cs0.c, case CART_ROMSTV). */
+static u8 FASTCALL ROMSTVCs0ReadByte(u32 addr)
+{
+   return T1ReadByte(CartridgeArea->rom, addr & 0x1FFFFFF);
+}
+
+static u16 FASTCALL ROMSTVCs0ReadWord(u32 addr)
+{
+   return T1ReadWord(CartridgeArea->rom, addr & 0x1FFFFFF);
+}
+
+static u32 FASTCALL ROMSTVCs0ReadLong(u32 addr)
+{
+   return T1ReadLong(CartridgeArea->rom, addr & 0x1FFFFFF);
+}
+
+static void FASTCALL ROMSTVCs0WriteByte(u32 addr, u8 val)
+{
+   T1WriteByte(CartridgeArea->rom, addr & 0x1FFFFFF, val);
+}
+
+static void FASTCALL ROMSTVCs0WriteWord(u32 addr, u16 val)
+{
+   T1WriteWord(CartridgeArea->rom, addr & 0x1FFFFFF, val);
+}
+
+static void FASTCALL ROMSTVCs0WriteLong(u32 addr, u32 val)
+{
+   T1WriteLong(CartridgeArea->rom, addr & 0x1FFFFFF, val);
+}
+
+static u8 FASTCALL ROMSTVCs1ReadByte(u32 addr)
+{
+   return T1ReadByte(&((u8 *)CartridgeArea->rom)[0x2000000], addr & 0xFFFFFF);
+}
+
+static u16 FASTCALL ROMSTVCs1ReadWord(u32 addr)
+{
+   return T1ReadWord(&((u8 *)CartridgeArea->rom)[0x2000000], addr & 0xFFFFFF);
+}
+
+static u32 FASTCALL ROMSTVCs1ReadLong(u32 addr)
+{
+   return T1ReadLong(&((u8 *)CartridgeArea->rom)[0x2000000], addr & 0xFFFFFF);
+}
+
+static void FASTCALL ROMSTVCs1WriteByte(u32 addr, u8 val)
+{
+   T1WriteByte(&((u8 *)CartridgeArea->rom)[0x2000000], addr & 0xFFFFFF, val);
+}
+
+static void FASTCALL ROMSTVCs1WriteWord(u32 addr, u16 val)
+{
+   T1WriteWord(&((u8 *)CartridgeArea->rom)[0x2000000], addr & 0xFFFFFF, val);
+}
+
+static void FASTCALL ROMSTVCs1WriteLong(u32 addr, u32 val)
+{
+   T1WriteLong(&((u8 *)CartridgeArea->rom)[0x2000000], addr & 0xFFFFFF, val);
+}
+
 int CartInit(const char * filename, int type)
 {
    if ((CartridgeArea = (cartridge_struct *)calloc(1, sizeof(cartridge_struct))) == NULL)
@@ -1241,6 +1304,29 @@ int CartInit(const char * filename, int type)
          CartridgeArea->Cs0WriteByte = &ROM16MBITCs0WriteByte;
          CartridgeArea->Cs0WriteWord = &ROM16MBITCs0WriteWord;
          CartridgeArea->Cs0WriteLong = &ROM16MBITCs0WriteLong;
+         break;
+      }
+      case CART_ROMSTV: // ST-V ROM board (48 MiB linear image, filled by stv.c)
+      {
+         if ((CartridgeArea->rom = T1MemoryInit(CART_ROMSTV_SIZE)) == NULL)
+            return -1;
+
+         CartridgeArea->cartid = 0xFF; // same as Kronos; the real id is unknown
+
+         // Setup Functions
+         CartridgeArea->Cs0ReadByte = &ROMSTVCs0ReadByte;
+         CartridgeArea->Cs0ReadWord = &ROMSTVCs0ReadWord;
+         CartridgeArea->Cs0ReadLong = &ROMSTVCs0ReadLong;
+         CartridgeArea->Cs0WriteByte = &ROMSTVCs0WriteByte;
+         CartridgeArea->Cs0WriteWord = &ROMSTVCs0WriteWord;
+         CartridgeArea->Cs0WriteLong = &ROMSTVCs0WriteLong;
+
+         CartridgeArea->Cs1ReadByte = &ROMSTVCs1ReadByte;
+         CartridgeArea->Cs1ReadWord = &ROMSTVCs1ReadWord;
+         CartridgeArea->Cs1ReadLong = &ROMSTVCs1ReadLong;
+         CartridgeArea->Cs1WriteByte = &ROMSTVCs1WriteByte;
+         CartridgeArea->Cs1WriteWord = &ROMSTVCs1WriteWord;
+         CartridgeArea->Cs1WriteLong = &ROMSTVCs1WriteLong;
          break;
       }
       case CART_JAPMODEM: // Sega Saturn Modem(Japanese)

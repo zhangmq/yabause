@@ -52,6 +52,7 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301  USA
 #include "cheat.h"
 #include "cs0.h"
 #include "cs2.h"
+#include "stv.h"
 #include "debug.h"
 #include "error.h"
 #include "memory.h"
@@ -276,6 +277,16 @@ int YabauseInit(yabauseinit_struct *init)
       return -1;
    }
 
+   /* ST-V: identify/assemble the romset into the CART_ROMSTV board image.
+      Ported from libretro/yabause@kronos (ctrl/src/yabause.c). */
+   if (STVSingleInit(init->stvgamepath, init->stvbiospath, init->eepromdir, init->stv_favorite_region) != 0) {
+     if (STVInit(init->stvgame, init->cartpath, init->eepromdir, init->stv_favorite_region) != 0)
+     {
+       YabSetError(YAB_ERR_CANNOTINIT, _("STV emulation"));
+       return -1;
+     }
+   }
+
    MappedMemoryInit();
 
    VideoSetSetting(VDP_SETTING_RBG_USE_COMPUTESHADER, init->rbg_use_compute_shader);
@@ -489,6 +500,8 @@ void YabFlushBackups(void)
 //////////////////////////////////////////////////////////////////////////////
 
 void YabauseDeInit(void) {
+
+   STVDeInit();
    
   OSDDeInit();
    Vdp2DeInit();

@@ -89,6 +89,12 @@ typedef struct
    const char *playRecordPath;
    int use_cpu_affinity;
    int use_sh2_cache;
+   /* ST-V (Sega Titan Video) -- ported from libretro/yabause@kronos */
+   const char *stvgamepath;      /* the .zip romset, for STVSingleInit() */
+   const char *stvgame;          /* romset basename, for STVInit() */
+   const char *stvbiospath;      /* stvbios.zip */
+   const char *eepromdir;        /* where the per-game .nv lives */
+   int stv_favorite_region;
 } yabauseinit_struct;
 
 #define CLKTYPE_26MHZ           0
@@ -148,6 +154,10 @@ typedef struct
    int use_cpu_affinity;
    int use_sh2_cache;
    int Hcount;
+   /* ST-V (Sega Titan Video) -- ported from libretro/yabause@kronos */
+   u8 isSTV;
+   int stvInputType;
+   int isRotated;
 } yabsys_struct;
 
 extern yabsys_struct yabsys;

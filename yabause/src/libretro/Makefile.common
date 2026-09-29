@@ -34,6 +34,10 @@ SOURCES_C := $(SOURCE_DIR)/osdcore.c \
 	$(SOURCE_DIR)/coffelf.c \
 	$(SOURCE_DIR)/cs0.c \
 	$(SOURCE_DIR)/cs1.c \
+	$(SOURCE_DIR)/stv.c \
+	$(SOURCE_DIR)/eeprom.c \
+	$(SOURCE_DIR)/decrypt.c \
+	$(SOURCE_DIR)/junzip.c \
 	$(SOURCE_DIR)/cs2.c \
 	$(SOURCE_DIR)/debug.c \
 	$(SOURCE_DIR)/error.c \

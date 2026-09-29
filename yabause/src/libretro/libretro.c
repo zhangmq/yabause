@@ -11,6 +11,7 @@
 #endif
 
 #include <sys/stat.h>
+#include <strings.h>
 
 #include <libretro.h>
 
@@ -26,6 +27,7 @@
 
 #include "cs0.h"
 #include "cs2.h"
+#include "stv.h"
 
 #include "m68kcore.h"
 #include "vidogl.h"
@@ -44,6 +46,12 @@ static char g_save_dir[PATH_MAX];
 static char g_system_dir[PATH_MAX];
 static char full_path[PATH_MAX];
 static char bios_path[PATH_MAX];
+/* ST-V (Sega Titan Video) -- ported from libretro/yabause@kronos */
+static char stv_bios_path[PATH_MAX];
+static char stv_eeprom_dir[PATH_MAX];
+static char *stvgame = NULL;
+static bool stv_mode = false;
+static int stv_favorite_region = STV_REGION_EU;
 static char bup_path[PATH_MAX];
 
 static int game_width  = 320;
@@ -2105,6 +2113,24 @@ bool retro_load_game(const struct retro_game_info *info)
     * playlist (disk control can swap to the other entries later). */
    disk_init_from_content(info->path);
    snprintf(full_path, sizeof(full_path), "%s", disk_paths[disk_index]);
+   /* ST-V: an ST-V game is a MAME romset zip whose entries match Kronos' GameList
+      (filename + CRC32); the ST-V BIOS is stvbios.zip. Detect it before the Saturn
+      BIOS probing below, because an ST-V game needs no Saturn BIOS. */
+   snprintf(stv_bios_path, sizeof(stv_bios_path), "%s%cstvbios.zip", g_system_dir, slash);
+   stvgame = NULL;
+   stv_mode = false;
+   {
+      const char *ext = path_get_extension(info->path);
+
+      if (ext != NULL && strcasecmp(ext, "zip") == 0)
+         STVGetSingle(info->path, stv_bios_path, &stvgame);
+      if (stvgame != NULL)
+      {
+         stv_mode = true;
+         log_cb(RETRO_LOG_INFO, "ST-V game detected: %s\n", stvgame);
+      }
+   }
+
    snprintf(bios_path, sizeof(bios_path), "%s%csaturn_bios.bin", g_system_dir, slash);
    if (does_file_exist(bios_path) != 1)
    {
@@ -2124,7 +2150,15 @@ bool retro_load_game(const struct retro_game_info *info)
    // Real bios is REQUIRED, even if we support HLE bios
    // HLE bios is deprecated and causing more issues than it solves
    // No "autoselect HLE when bios is missing" ever again !
-   if (does_file_exist(bios_path) != 1)
+   if (stv_mode)
+   {
+      if (does_file_exist(stv_bios_path) != 1)
+      {
+         log_cb(RETRO_LOG_ERROR, "ST-V game detected but %s is missing, ABORTING\n", stv_bios_path);
+         return false;
+      }
+   }
+   else if (does_file_exist(bios_path) != 1)
    {
       log_cb(RETRO_LOG_ERROR, "We are missing the bios, ABORTING\n");
       return false;
@@ -2362,11 +2396,31 @@ bool retro_load_game(const struct retro_game_info *info)
 
    environ_cb(RETRO_ENVIRONMENT_SET_INPUT_DESCRIPTORS, desc);
 
-   yinit.cdcoretype       = CDCORE_ISO;
-   yinit.cdpath           = full_path;
-   yinit.biospath         = (hle_bios_force ? NULL : bios_path);
-   yinit.carttype         = addon_cart_type;
-   yinit.cartpath         = "\0";
+   if (stv_mode)
+   {
+      /* Sega Titan Video: ROM board on CS0/CS1 assembled from the romset zip,
+         the ST-V BIOS, and a per-game NVRAM file. ST-V has no CD block. */
+      snprintf(stv_eeprom_dir, sizeof(stv_eeprom_dir), "%s%cstv%c", g_save_dir, slash, slash);
+
+      yinit.stvgamepath         = full_path;
+      yinit.stvgame             = stvgame;
+      yinit.stvbiospath         = stv_bios_path;
+      yinit.eepromdir           = stv_eeprom_dir;
+      yinit.stv_favorite_region = stv_favorite_region;
+      yinit.carttype            = CART_ROMSTV;
+      yinit.cartpath            = NULL;
+      yinit.cdcoretype          = CDCORE_DUMMY;
+      yinit.cdpath              = NULL;
+      yinit.biospath            = NULL;
+   }
+   else
+   {
+      yinit.cdcoretype       = CDCORE_ISO;
+      yinit.cdpath           = full_path;
+      yinit.biospath         = (hle_bios_force ? NULL : bios_path);
+      yinit.carttype         = addon_cart_type;
+      yinit.cartpath         = "\0";
+   }
 
    return retro_load_game_common();
 }
