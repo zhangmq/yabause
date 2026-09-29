@@ -3214,7 +3214,7 @@ FASTCALL void SH2InterpreterExec(SH2_struct *context, u32 cycles)
            0xd24 returns false, so follow both ranges instruction by instruction. */
         {
            static unsigned int stv_trace = 0;
-           if (yabsys.isSTV && stv_trace < 2000 && context->regs.PC < 0x1000) {
+           if (yabsys.isSTV && stv_trace < 3000 && context->regs.PC >= 0x4ec0 && context->regs.PC < 0x4ef0) {
               printf("[TR] pc=%08x op=%04x R0=%08x R1=%08x R2=%08x R3=%08x R4=%08x R7=%08x R8=%08x R15=%08x GBR=%08x SR=%08x\n",
                      context->regs.PC, context->instruction,
                      context->regs.R[0], context->regs.R[1], context->regs.R[2], context->regs.R[3],
