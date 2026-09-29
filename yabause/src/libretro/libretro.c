@@ -166,11 +166,63 @@ void retro_set_input_state(retro_input_state_t cb) { input_state_cb = cb; }
 // PERLIBRETRO
 #define PERCORE_LIBRETRO 2
 
+/* ST-V JAMMA key maps (ported from libretro/yabause@kronos libretro.c). */
+typedef struct { unsigned id; unsigned key; unsigned player; const char *description; } KeyConfig_struct;
+
+static KeyConfig_struct system_key_config[] = {
+   { RETRO_DEVICE_ID_JOYPAD_L2, PERJAMMA_TEST,    0, "Test"    },
+   { RETRO_DEVICE_ID_JOYPAD_R2, PERJAMMA_SERVICE, 0, "Service" },
+   { RETRO_DEVICE_ID_JOYPAD_L3, PERJAMMA_PAUSE,   0, "Pause"   },
+};
+
+static KeyConfig_struct stv_key_config[] = {
+   { RETRO_DEVICE_ID_JOYPAD_SELECT, PERJAMMA_COIN1,      0, "Coin"   },
+   { RETRO_DEVICE_ID_JOYPAD_START,  PERJAMMA_START1,     0, "Start"  },
+   { RETRO_DEVICE_ID_JOYPAD_UP,     PERPAD_UP,           0, "Up"     },
+   { RETRO_DEVICE_ID_JOYPAD_RIGHT,  PERPAD_RIGHT,        0, "Right"  },
+   { RETRO_DEVICE_ID_JOYPAD_DOWN,   PERPAD_DOWN,         0, "Down"   },
+   { RETRO_DEVICE_ID_JOYPAD_LEFT,   PERPAD_LEFT,         0, "Left"   },
+   { RETRO_DEVICE_ID_JOYPAD_B,      PERPAD_A,            0, "Button1"},
+   { RETRO_DEVICE_ID_JOYPAD_A,      PERPAD_B,            0, "Button2"},
+   { RETRO_DEVICE_ID_JOYPAD_Y,      PERPAD_C,            0, "Button3"},
+   { RETRO_DEVICE_ID_JOYPAD_X,      PERPAD_X,            0, "Button4"},
+   { RETRO_DEVICE_ID_JOYPAD_SELECT, PERJAMMA_COIN2,      1, "Coin"   },
+   { RETRO_DEVICE_ID_JOYPAD_START,  PERJAMMA_START2,     1, "Start"  },
+   { RETRO_DEVICE_ID_JOYPAD_UP,     PERJAMMA_P2_UP,      1, "Up"     },
+   { RETRO_DEVICE_ID_JOYPAD_RIGHT,  PERJAMMA_P2_RIGHT,   1, "Right"  },
+   { RETRO_DEVICE_ID_JOYPAD_DOWN,   PERJAMMA_P2_DOWN,    1, "Down"   },
+   { RETRO_DEVICE_ID_JOYPAD_LEFT,   PERJAMMA_P2_LEFT,    1, "Left"   },
+   { RETRO_DEVICE_ID_JOYPAD_B,      PERJAMMA_P2_BUTTON1, 1, "Button1"},
+   { RETRO_DEVICE_ID_JOYPAD_A,      PERJAMMA_P2_BUTTON2, 1, "Button2"},
+   { RETRO_DEVICE_ID_JOYPAD_Y,      PERJAMMA_P2_BUTTON3, 1, "Button3"},
+   { RETRO_DEVICE_ID_JOYPAD_X,      PERJAMMA_P2_BUTTON4, 1, "Button4"},
+};
+
+static KeyConfig_struct* current_key_config = NULL;
+static int current_key_config_nb = 0;
+static int system_key_config_nb = 0;
+
+#define STV_KEYCFG_NB(a) ((int)(sizeof(a)/sizeof(a[0])))
+
 int PERLIBRETROInit(void)
 {
    void *controller;
 
    uint32_t i, j;
+
+   if (stv_mode) {
+      system_key_config_nb = STV_KEYCFG_NB(system_key_config);
+      current_key_config_nb = STV_KEYCFG_NB(stv_key_config);
+      current_key_config = stv_key_config;
+      PerPortReset();
+      controller = (void*)PerCabAdd(NULL);
+      for (i = 0; i < (uint32_t)system_key_config_nb; i++)
+         PerSetKey(system_key_config[i].key, system_key_config[i].key, controller);
+      for (i = 0; i < (uint32_t)current_key_config_nb; i++)
+         PerSetKey(current_key_config[i].key, current_key_config[i].key, controller);
+      players = 2;
+      return 0;
+   }
    PortData_struct* portdata = NULL;
 
    //1 multitap + 1 peripherial
@@ -230,6 +282,7 @@ static int PERLIBRETROHandleEvents(void)
    unsigned i = 0;
 
    input_poll_cb();
+
 
    for(i = 0; i < players; i++)
    {
@@ -334,6 +387,23 @@ static int PERLIBRETROHandleEvents(void)
             default:
                break;
          }
+   }
+
+   if (stv_mode) {
+      /* ST-V cabinet inputs: poll the JAMMA key maps straight into IOGA. */
+      for (i = 0; i < 2; i++) libretro_input_bitmask[i] = -1;
+      for (i = 0; i < (unsigned)system_key_config_nb; i++) {
+         if (input_state_cb_wrapper(system_key_config[i].player, RETRO_DEVICE_JOYPAD, 0, system_key_config[i].id))
+            PerKeyDown(system_key_config[i].key);
+         else
+            PerKeyUp(system_key_config[i].key);
+      }
+      for (i = 0; i < (unsigned)current_key_config_nb; i++) {
+         if (input_state_cb_wrapper(current_key_config[i].player, RETRO_DEVICE_JOYPAD, 0, current_key_config[i].id))
+            PerKeyDown(current_key_config[i].key);
+         else
+            PerKeyUp(current_key_config[i].key);
+      }
    }
 
    if ( YabauseExec() != 0 )

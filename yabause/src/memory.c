@@ -50,6 +50,7 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301  USA
 #include <ctype.h>
 
 #include "memory.h"
+#include "peripheral.h"
 #include "coffelf.h"
 #include "cs0.h"
 #include "cs1.h"
@@ -651,6 +652,15 @@ void MappedMemoryInit()
                                 &LowWramMemoryWriteByte,
                                 &LowWramMemoryWriteWord,
                                 &LowWramMemoryWriteLong);
+   /* ST-V IOGA ports (JAMMA cabinet inputs).  Without this mapping the
+      whole 0x040 area falls through to Unhandled* and the BIOS reads 0,
+      so the test menu never sees a key press. */
+   FillMemoryArea(0x040, 0x041, &IOPortReadByte,
+                                &IOPortReadWord,
+                                &UnhandledMemoryReadLong,
+                                &IOPortWriteByte,
+                                &UnhandledMemoryWriteWord,
+                                &UnhandledMemoryWriteLong);
    FillMemoryArea(0x100, 0x17F, &UnhandledMemoryReadByte,
                                 &UnhandledMemoryReadWord,
                                 &UnhandledMemoryReadLong,
