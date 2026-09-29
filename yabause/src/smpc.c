@@ -71,6 +71,9 @@ u8 bustmp = 0;
 /* ST-V: the 68k sound CPU is started/stopped through PDR2 bit 0x10
    (ported from libretro/yabause@kronos smpc.c; see critical fact 26). */
 static u8 m_pdr2_readback = 0;
+#ifdef YAB_STV_DEBUG
+static unsigned int stv_smpc_dbg = 0;
+#endif
 
 //////////////////////////////////////////////////////////////////////////////
 
@@ -550,6 +553,9 @@ void SmpcExec(s32 t) {
 
       SmpcInternalVars->timing -= t;
       if (SmpcInternalVars->timing <= 0) {
+#ifdef YAB_STV_DEBUG
+         if (yabsys.isSTV) printf("[SMPCDBG] exec COMREG=%02x\n", SmpcRegs->COMREG);
+#endif
          switch(SmpcRegs->COMREG) {
             case 0x0:
                SMPCLOG("smpc\t: MSHON not implemented\n");
@@ -743,6 +749,14 @@ u8 do_th_mode(u8 val)
 //////////////////////////////////////////////////////////////////////////////
 
 void FASTCALL SmpcWriteByte(u32 addr, u8 val) {
+#ifdef YAB_STV_DEBUG
+   if (yabsys.isSTV && stv_smpc_dbg < 300) {
+      printf("[SMPCDBG] w %02x = %02x (COMREG=%02x SF=%02x DDR=%02x,%02x PDR=%02x,%02x)\n",
+             addr & 0x7F, val, SmpcRegs->COMREG, SmpcRegs->SF,
+             SmpcRegs->DDR[0], SmpcRegs->DDR[1], SmpcRegs->PDR[0], SmpcRegs->PDR[1]);
+      stv_smpc_dbg++;
+   }
+#endif
    addr &= 0x7F;
    bustmp = val;
    SmpcRegsT[addr >> 1] = val;
