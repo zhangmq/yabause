@@ -731,6 +731,11 @@ int YabauseEmulate(void) {
              MSH2 ? MSH2->isIdle : -1, MSH2 ? MSH2->isSleeping : -1,
              MSH2 ? MSH2->NumberOfInterrupts : 0,
              MSH2 ? MSH2->regs.PC : 0);
+      if (SSH2) printf("[STVDBG]   SSH2 PC=%08x IsRunning=%d nint=%u SR=%08x | MSH2 SR=%08x int0=%d/%d\n",
+             SSH2->regs.PC, yabsys.IsSSH2Running, SSH2->NumberOfInterrupts, SSH2->regs.SR.all,
+             MSH2 ? MSH2->regs.SR.all : 0u,
+             (MSH2 && MSH2->NumberOfInterrupts) ? (int)MSH2->interrupts[0].vector : -1,
+             (MSH2 && MSH2->NumberOfInterrupts) ? (int)MSH2->interrupts[0].level : -1);
       if ((yabsys.frame_count % 300) == 0)
          printf("[STVDBG] CART cached 0x02000000: nocache=%04x cached=%04x | uncached 0x20000000: nocache=%04x | BIOS 0x0=%04x (expect cart 0053)\n",
                 MappedMemoryReadWordNocache(0x02000000, NULL),
