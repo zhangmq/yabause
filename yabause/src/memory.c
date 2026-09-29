@@ -866,6 +866,12 @@ u8 FASTCALL MappedMemoryReadByte(u32 addr, u32 * cycle)
     *cycle = getMemClock(addr);
   }
 
+#ifdef YAB_STV_DEBUG
+   if (yabsys.isSTV && MSH2 && MSH2->regs.PC >= 0x4ec0 && MSH2->regs.PC < 0x4f00) {
+      static unsigned int stv_bdbg = 0;
+      if (stv_bdbg < 80) { printf("[TRBYTE] pc=%08x rdb %08x\n", MSH2->regs.PC, addr); stv_bdbg++; }
+   }
+#endif
    switch (addr >> 29)
    {
       case 0x0:
@@ -931,8 +937,21 @@ u16 FASTCALL MappedMemoryReadWord(u32 addr, u32 * cycle){
 }
 u16 FASTCALL MappedMemoryReadWordNocache(u32 addr, u32 * cycle)
 #else
+#ifdef YAB_STV_DEBUG
+/* Set while MappedMemoryReadInst is fetching so the ST-V read probe below can
+   ignore instruction fetches (ReadInst simply calls ReadWord). */
+int stv_in_fetch = 0;
+#endif
 u16 MappedMemoryReadInst(u32 addr, u32 * cycle) {
+#ifdef YAB_STV_DEBUG
+  u16 r;
+  stv_in_fetch = 1;
+  r = MappedMemoryReadWord(addr,cycle);
+  stv_in_fetch = 0;
+  return r;
+#else
   return MappedMemoryReadWord(addr,cycle);
+#endif
 }
 u16 FASTCALL MappedMemoryReadWord(u32 addr, u32 * cycle)
 #endif
@@ -950,7 +969,7 @@ u16 FASTCALL MappedMemoryReadWord(u32 addr, u32 * cycle)
          // Cache/Non-Cached
          u16 rtn = ReadWordList[(addr >> 16) & 0xFFF](addr);
 #ifdef YAB_STV_DEBUG
-           if (yabsys.isSTV && MSH2 && MSH2->regs.PC >= 0x4ec0 && MSH2->regs.PC < 0x4ef0) {
+           if (yabsys.isSTV && !stv_in_fetch && MSH2 && MSH2->regs.PC >= 0x4e00 && MSH2->regs.PC < 0x4f80) {
               static unsigned int stv_memdbg = 0;
               if (stv_memdbg < 200) {
                  printf("[TRMEM] pc=%08x rdw %08x = %04x\n", MSH2->regs.PC, addr, rtn);

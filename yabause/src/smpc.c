@@ -44,6 +44,7 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301  USA
 #include <stdlib.h>
 #include <time.h>
 #include "smpc.h"
+#include "eeprom.h"
 #include "cs2.h"
 #include "debug.h"
 #include "peripheral.h"
@@ -70,6 +71,7 @@ u8 bustmp = 0;
 
 /* ST-V: the 68k sound CPU is started/stopped through PDR2 bit 0x10
    (ported from libretro/yabause@kronos smpc.c; see critical fact 26). */
+static u8 m_pdr1_readback = 0;
 static u8 m_pdr2_readback = 0;
 #ifdef YAB_STV_DEBUG
 static unsigned int stv_smpc_dbg = 0;
@@ -643,6 +645,14 @@ u8 FASTCALL SmpcReadByte(u32 addr) {
          neither, issues SMPC SYSRES and spins forever at 0x234. */
       return 0xF0;
    }
+     if (addr == 0x075) {
+        /* PDR1 read-back: the ST-V BIOS polls this for the EEPROM DO bit (bit 0).
+           Ported from Kronos -- without it the poll at 0x4ed8 never sees a 1. */
+        if ((SmpcRegs->DDR[0] & 0x7F) == 0x3f) {
+           return (u8)((((0x40 & 0x40) | 0x3f) & ~SmpcRegs->DDR[0]) | m_pdr1_readback);
+        }
+        return SmpcRegsT[addr >> 1];
+     }
    if (addr == 0x063) {
      bustmp &= ~0x01;
      bustmp |= SmpcRegs->SF;
@@ -831,6 +841,16 @@ void FASTCALL SmpcWriteByte(u32 addr, u8 val) {
                }
 
                SmpcRegs->PDR[0] = val;
+               break;
+            case 0x3f: /* EEPROM bit-bang.  ST-V needs it: the BIOS polls the DO line
+                          at 0x4ed8 and spins forever when it never reads 1.  Kronos
+                          drives the eeprom here and reads it back in SmpcReadByte(0x75). */
+               m_pdr1_readback = (val & SmpcRegs->DDR[0]) & 0x7f;
+               eeprom_set_clk((val & 0x08) ? 1 : 0);
+               eeprom_set_di((val >> 4) & 1);
+               eeprom_set_cs((val & 0x04) ? 1 : 0);
+               SmpcRegs->PDR[0] = m_pdr1_readback;
+               m_pdr1_readback |= (val & 0x80);
                break;
             default:
                SMPCLOG("smpc\t: Peripheral Unknown Control Method not implemented\n");
