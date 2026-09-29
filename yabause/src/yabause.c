@@ -423,7 +423,7 @@ int YabauseInit(yabauseinit_struct *init)
    yabsys.usequickload = 0;
 
    #if defined(SH2_DYNAREC)
-   if(SH2Core->id==2) {
+   if(SH2Core->id==3) /* SH2CORE_DYNAMIC, see DynarecSh2CInterface.cpp */ {
      sh2_dynarec_init();
    }
    #endif
@@ -793,7 +793,7 @@ int YabauseEmulate(void) {
    //DoMovie();
 
    #if defined(SH2_DYNAREC)
-   if(SH2Core->id==2) {
+   if(SH2Core->id==3) /* SH2CORE_DYNAMIC, see DynarecSh2CInterface.cpp */ {
      if (yabsys.IsPal)
        YabauseDynarecOneFrameExec(722,0); // m68kcycles,m68kcenticycles
      else
