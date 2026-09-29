@@ -44,6 +44,7 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301  USA
 
 #include <stdlib.h>
 #include "cs0.h"
+#include "decrypt.h"
 #include "error.h"
 #include "japmodem.h"
 #include "netlink.h"
@@ -1046,6 +1047,11 @@ static void FASTCALL ROM16MBITCs0WriteLong(u32 addr, u32 val)
 
 /* ST-V ROM board mapped on A-bus CS0 (first 32 MiB) + CS1 (rest).
    Ported from libretro/yabause@kronos (yabause/src/sys/memory/src/cs0.c, case CART_ROMSTV). */
+/* ST-V ROM decryption: the cart drives decrypt.c through cs1; the command is
+   encoded in the low nibble of the address.  Ported from
+   libretro/yabause@kronos yabause/src/sys/memory/src/cs0.c. */
+static u8 decryptOn = 0;
+
 static u8 FASTCALL ROMSTVCs0ReadByte(u32 addr)
 {
    return T1ReadByte(CartridgeArea->rom, addr & 0x1FFFFFF);
@@ -1088,17 +1094,44 @@ static u16 FASTCALL ROMSTVCs1ReadWord(u32 addr)
 
 static u32 FASTCALL ROMSTVCs1ReadLong(u32 addr)
 {
+#ifdef YAB_STV_DEBUG
+   { static unsigned int d = 0; if (d < 40) { printf("[DEC] rd cmd=%x decryptOn=%d addr=%08x\n", addr & 0xF, decryptOn, addr); d++; } }
+#endif
+   u8 decryptCmd = addr & 0xF;
+   if ((decryptOn & 0x1) && decryptCmd == 0xc) {
+      u16 res = cryptoDecrypt();
+      u16 res2 = cryptoDecrypt();
+      res = (u16)(((res & 0xff00) >> 8) | ((res & 0x00ff) << 8));
+      res2 = (u16)(((res2 & 0xff00) >> 8) | ((res2 & 0x00ff) << 8));
+      return (u32)(res2 | (res << 16));
+   }
    return T1ReadLong(&((u8 *)CartridgeArea->rom)[0x2000000], addr & 0xFFFFFF);
 }
 
 static void FASTCALL ROMSTVCs1WriteByte(u32 addr, u8 val)
 {
+   u8 decryptCmd = addr & 0xF;
+   if (decryptCmd == 0x1) { decryptOn = val & 0x1; return; }
    T1WriteByte(&((u8 *)CartridgeArea->rom)[0x2000000], addr & 0xFFFFFF, val);
 }
 
 static void FASTCALL ROMSTVCs1WriteWord(u32 addr, u16 val)
 {
-   T1WriteWord(&((u8 *)CartridgeArea->rom)[0x2000000], addr & 0xFFFFFF, val);
+#ifdef YAB_STV_DEBUG
+   { static unsigned int d2 = 0; if (d2 < 40) { printf("[DEC] wr cmd=%x val=%04x addr=%08x\n", addr & 0xF, val, addr); d2++; } }
+#endif
+   u8 decryptCmd = addr & 0xF;
+   if (decryptCmd == 0x1) {
+      decryptOn = val & 0x1;
+   } else if (decryptCmd == 0x8) {
+      cyptoSetLowAddr(val);
+   } else if (decryptCmd == 0xa) {
+      cyptoSetHighAddr(val);
+   } else if (decryptCmd == 0xc) {
+      cyptoSetSubkey(val);
+   } else {
+      T1WriteWord(&((u8 *)CartridgeArea->rom)[0x2000000], addr & 0xFFFFFF, val);
+   }
 }
 
 static void FASTCALL ROMSTVCs1WriteLong(u32 addr, u32 val)
