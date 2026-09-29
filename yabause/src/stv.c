@@ -28,7 +28,7 @@ extern "C" {
 #endif
 
 
-#ifdef YAB_STV_DEBUG
+#ifdef STV_DEBUG
 #define LOGSTV(...) do { printf(__VA_ARGS__); fflush(stdout); } while(0)
 #else
 #define LOGSTV(...) do { } while(0)
@@ -2559,11 +2559,7 @@ int copyBios(JZFile *zip, void* id) {
                 if (strcmp(biosname,filename) == 0) {
                   LOGSTV("Load bios %s\n", filename);
                   for (j=0; j<biosLink.entry->blobs[i].length;j++) {
-                    /* The ST-V .ic8 BIOS images are stored 16-bit byte-swapped relative to what
-                         the SH2 fetches (device-verified: the straight copy leaves the SH2
-                         looping on an illegal 0xFEAF opcode at PC=0x234, swapping boots
-                         it into the cart at 0x060136f0). */
-                      T1WriteByte(BiosRom, biosLink.entry->blobs[i].offset+(j^1), data[j]);
+                    T1WriteByte(BiosRom, biosLink.entry->blobs[i].offset+j, data[j]);
                   }
                 }
               } else {
@@ -2572,11 +2568,7 @@ int copyBios(JZFile *zip, void* id) {
                 && (stv_favorite_region == biosLink.entry->blobs[i].region || (availableGames[gameId].entry->regions & stv_favorite_region) != stv_favorite_region)) {
                   LOGSTV("Load bios %s\n", filename);
                   for (j=0; j<biosLink.entry->blobs[i].length;j++) {
-                    /* The ST-V .ic8 BIOS images are stored 16-bit byte-swapped relative to what
-                         the SH2 fetches (device-verified: the straight copy leaves the SH2
-                         looping on an illegal 0xFEAF opcode at PC=0x234, swapping boots
-                         it into the cart at 0x060136f0). */
-                      T1WriteByte(BiosRom, biosLink.entry->blobs[i].offset+(j^1), data[j]);
+                    T1WriteByte(BiosRom, biosLink.entry->blobs[i].offset+j, data[j]);
                   }
                   biosloaded = i;
                 }
