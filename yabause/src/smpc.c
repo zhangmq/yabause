@@ -68,6 +68,10 @@ SmpcInternal * SmpcInternalVars = NULL;
 int intback_wait_for_line = 0;
 u8 bustmp = 0;
 
+/* ST-V: the 68k sound CPU is started/stopped through PDR2 bit 0x10
+   (ported from libretro/yabause@kronos smpc.c; see critical fact 26). */
+static u8 m_pdr2_readback = 0;
+
 //////////////////////////////////////////////////////////////////////////////
 
 int SmpcInit(u8 regionid, int clocksync, u32 basetime) {
@@ -803,12 +807,22 @@ void FASTCALL SmpcWriteByte(u32 addr, u8 val) {
                break;
          }
 			break;
-	  case 0x77: // PDR1
+	  case 0x77: // PDR2
 		  // FIX ME (should support other peripherals)
 		  switch (SmpcRegs->DDR[1] & 0x7F) { // Which Control Method do we use?
 		  case 0x00:
 			  if (PORTDATA2.data[1] == PERGUN && (val & 0x7F) == 0x7F)
 				  SmpcRegs->PDR[1] = PORTDATA2.data[2];
+			  break;
+		  case 0x18: /* ST-V sound-CPU wire: PDR2 bit 0x10 stops the 68k */
+			  m_pdr2_readback = (val & SmpcRegs->DDR[1]) & 0x7F;
+			  if (m_pdr2_readback & 0x10) {
+				  M68KStop();
+			  } else {
+				  M68KStart();
+			  }
+			  SmpcRegs->PDR[1] = m_pdr2_readback;
+			  m_pdr2_readback |= val & 0x80;
 			  break;
 		  case 0x60:
 			  switch (val & 0x60) {

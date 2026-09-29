@@ -183,6 +183,17 @@ YabEventQueue * q_scsp_frame_start;
 YabEventQueue * q_scsp_finish;
 
 
+#ifdef YAB_STV_DEBUG
+/* Temporary instrumentation for the ST-V bring-up: is the data in memory and
+   are the SH2s executing at all? */
+static u32 stvdbg_fnv(const u8 *p, size_t n)
+{
+   u32 h = 2166136261u; size_t i;
+   for (i = 0; i < n; i++) { h ^= p[i]; h *= 16777619u; }
+   return h;
+}
+#endif
+
 int YabauseInit(yabauseinit_struct *init)
 {
 
@@ -485,6 +496,28 @@ int YabauseInit(yabauseinit_struct *init)
 #ifdef WEBINTERFACE
    YabStartHttpServer();
 #endif
+#ifdef YAB_STV_DEBUG
+   {
+      printf("[STVDBG] isSTV=%d emulatebios=%d carttype=%d BiosRom=%p Cart=%p\n",
+             yabsys.isSTV, yabsys.emulatebios,
+             CartridgeArea ? CartridgeArea->carttype : -1,
+             (void*)BiosRom, CartridgeArea ? CartridgeArea->rom : NULL);
+      if (BiosRom) printf("[STVDBG] BiosRom fnv=%08x first16=%02x %02x %02x %02x %02x %02x %02x %02x ...\n",
+             stvdbg_fnv((const u8*)BiosRom, 0x80000),
+             ((u8*)BiosRom)[0],((u8*)BiosRom)[1],((u8*)BiosRom)[2],((u8*)BiosRom)[3],
+             ((u8*)BiosRom)[4],((u8*)BiosRom)[5],((u8*)BiosRom)[6],((u8*)BiosRom)[7]);
+      if (CartridgeArea && CartridgeArea->rom) printf("[STVDBG] Cart fnv=%08x first16=%02x %02x %02x %02x %02x %02x %02x %02x ...\n",
+             stvdbg_fnv((const u8*)CartridgeArea->rom, 0x3000000),
+             ((u8*)CartridgeArea->rom)[0],((u8*)CartridgeArea->rom)[1],((u8*)CartridgeArea->rom)[2],((u8*)CartridgeArea->rom)[3],
+             ((u8*)CartridgeArea->rom)[4],((u8*)CartridgeArea->rom)[5],((u8*)CartridgeArea->rom)[6],((u8*)CartridgeArea->rom)[7]);
+      printf("[STVDBG] SH2Core=%p id=%d DecilineStop=%u DecilineMode=%d IsSSH2Running=%d\n",
+             (void*)SH2Core, SH2Core ? SH2Core->id : -1, yabsys.DecilineStop,
+             yabsys.DecilineMode, yabsys.IsSSH2Running);
+      if (MSH2) printf("[STVDBG] MSH2 isIdle=%d isSleeping=%d cycles=%u regs.PC=%08x\n",
+             MSH2->isIdle, MSH2->isSleeping, MSH2->cycles, MSH2->regs.PC);
+      fflush(stdout);
+   }
+#endif
    return 0;
 }
 
@@ -686,6 +719,25 @@ u64 g_m68K_dec_cycle = 0;
 int YabauseEmulate(void) {
    int oneframeexec = 0;
    yabsys.frame_count++;
+#ifdef YAB_STV_DEBUG
+   /* Work-RAM hashes are the reliable probe: regs.PC is only synced at dynarec
+      block boundaries, so a stale 0 there proves nothing. If the SH2s execute,
+      LowWram/HighWram/Vdp2Ram must change. */
+   if ((yabsys.frame_count % 60) == 0)
+      printf("[STVDBG] f=%lu HighWram=%08x Vdp2Ram=%08x MSH2 idle=%d sleep=%d nint=%u PC=%08x\n",
+             (unsigned long)yabsys.frame_count,
+             HighWram ? stvdbg_fnv(HighWram, 0x100000) : 0,
+             Vdp2Ram ? stvdbg_fnv(Vdp2Ram, 0x80000) : 0,
+             MSH2 ? MSH2->isIdle : -1, MSH2 ? MSH2->isSleeping : -1,
+             MSH2 ? MSH2->NumberOfInterrupts : 0,
+             MSH2 ? MSH2->regs.PC : 0);
+      if ((yabsys.frame_count % 300) == 0)
+         printf("[STVDBG] CART cached 0x02000000: nocache=%04x cached=%04x | uncached 0x20000000: nocache=%04x | BIOS 0x0=%04x (expect cart 0053)\n",
+                MappedMemoryReadWordNocache(0x02000000, NULL),
+                MappedMemoryReadWord(0x02000000, NULL),
+                MappedMemoryReadWordNocache(0x20000000, NULL),
+                MappedMemoryReadWordNocache(0x00000000, NULL));
+#endif
    #if !(defined(__LIBRETRO__))
    PlayRecorder_proc(yabsys.frame_count);
    #endif
