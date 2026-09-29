@@ -645,6 +645,16 @@ u8 FASTCALL SmpcReadByte(u32 addr) {
          neither, issues SMPC SYSRES and spins forever at 0x234. */
       return 0xF0;
    }
+     if (addr == 0x077) {
+        /* PDR2 read-back.  Kronos reads the EEPROM DO bit here (not from PDR1):
+           when DDR2 is 0x18 the byte carries eeprom_do_read() in bit 0.  The ST-V
+           BIOS bit-bangs the EEPROM through PDR1 and polls the DO line through
+           PDR2, so without this it never sees a 1. */
+        if ((SmpcRegs->DDR[1] & 0x7F) == 0x18) {
+           return (u8)((((0x67 & ~0x19) | 0x18 | (eeprom_do_read() << 0)) & ~SmpcRegs->DDR[1]) | m_pdr2_readback);
+        }
+        return SmpcRegsT[addr >> 1];
+     }
      if (addr == 0x075) {
         /* PDR1 read-back: the ST-V BIOS polls this for the EEPROM DO bit (bit 0).
            Ported from Kronos -- without it the poll at 0x4ed8 never sees a 1. */
