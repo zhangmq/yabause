@@ -278,8 +278,11 @@ int YabauseInit(yabauseinit_struct *init)
    }
 
    /* ST-V: identify/assemble the romset into the CART_ROMSTV board image.
-      Ported from libretro/yabause@kronos (ctrl/src/yabause.c). */
-   if (STVSingleInit(init->stvgamepath, init->stvbiospath, init->eepromdir, init->stv_favorite_region) != 0) {
+      Ported from libretro/yabause@kronos (ctrl/src/yabause.c), but gated on the
+      cart type: Kronos calls this unconditionally and relies on STVInit()'s
+      carttype check, which returns -1 before that check when romset is NULL. */
+   if (init->carttype == CART_ROMSTV &&
+       STVSingleInit(init->stvgamepath, init->stvbiospath, init->eepromdir, init->stv_favorite_region) != 0) {
      if (STVInit(init->stvgame, init->cartpath, init->eepromdir, init->stv_favorite_region) != 0)
      {
        YabSetError(YAB_ERR_CANNOTINIT, _("STV emulation"));
@@ -383,6 +386,10 @@ int YabauseInit(yabauseinit_struct *init)
    OSDChangeCore(OSDCORE_DEFAULT);
 #endif
 
+   /* ST-V has no Saturn BIOS: never fall back to the HLE BIOS (it would
+      overwrite the ST-V BIOS that stv.c installed in BiosRom).
+      Ported from libretro/yabause@kronos (ctrl/src/yabause.c). */
+   if (yabsys.isSTV == 0) {
    if (init->biospath != NULL && strlen(init->biospath))
    {
       if (LoadBios(init->biospath) != 0)
@@ -399,6 +406,8 @@ int YabauseInit(yabauseinit_struct *init)
      T2WriteLong(BiosRom,0x00000018, 0x20000222); // patch for SAKURA TAISEN
      T2WriteLong(BiosRom,0x00000220, 0x277AAFFE); // patch for SAKURA TAISEN
    }
+   }
+   else yabsys.emulatebios = 0;
 
    yabsys.usequickload = 0;
 

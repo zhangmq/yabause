@@ -1406,7 +1406,14 @@ int MappedMemoryLoadExec(const char *filename, u32 pc)
 
 int LoadBios(const char *filename)
 {
-   return T123Load(BiosRom, 0x80000, 2, filename);
+   /* On ST-V the ST-V BIOS is already in BiosRom (installed by stv.c); loading the
+      Saturn BIOS on top of it would clobber it.  Ported from libretro/yabause@kronos. */
+   int ret = 0;
+   if (yabsys.isSTV == 0)
+      ret = T123Load(BiosRom, 0x80000, 2, filename); // Saturn
+   if (yabsys.isSTV) YuiMsg("ST-V Emulation mode\n");
+   else YuiMsg("Saturn Emulation mode\n");
+   return ret;
 }
 
 //////////////////////////////////////////////////////////////////////////////

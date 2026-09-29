@@ -28,7 +28,11 @@ extern "C" {
 #endif
 
 
-#define LOGSTV
+#ifdef STV_DEBUG
+#define LOGSTV(...) do { printf(__VA_ARGS__); fflush(stdout); } while(0)
+#else
+#define LOGSTV(...) do { } while(0)
+#endif
 //YuiMsg
 #define ROTATED 1
 
