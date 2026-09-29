@@ -180,6 +180,14 @@ static void SmpcSNDON(void) {
 
 //////////////////////////////////////////////////////////////////////////////
 
+/* SYSRES: on the Saturn this would reset the console; the SMPC registers
+   themselves survive, so OREG[31] becomes 0x0D and the BIOS's next boot sees
+   it and continues past the check at 0xd24.  Kronos does exactly this
+   (SmpcSYSRES + SF = 0) and it was missing from our port. */
+static void SmpcSYSRES(void) {
+   SmpcRegs->OREG[31] = 0xD;
+}
+
 static void SmpcSNDOFF(void) {
    if (!yabsys.isSTV) M68KStop(); // C68k wire is controlled by pdr2 on STV
    SmpcRegs->OREG[31] = 0x7;
@@ -584,6 +592,8 @@ void SmpcExec(s32 t) {
                break;
             case 0xD:
                SMPCLOG("smpc\t: SYSRES not implemented\n");
+               SmpcSYSRES();
+               SmpcRegs->SF = 0;
                break;
             case 0xE:
                SMPCLOG("smpc\t: CKCHG352\n");
@@ -627,6 +637,12 @@ void SmpcExec(s32 t) {
 
 u8 FASTCALL SmpcReadByte(u32 addr) {
    addr &= 0x7F;
+   if (addr == 0x05F && yabsys.isSTV) {
+      /* OREG[31] on the ST-V reads as 0xF0 (bus not driven / unknown device).
+         The BIOS checks it at 0x228/0x22C for 0xF0 or 0x0D and, when it is
+         neither, issues SMPC SYSRES and spins forever at 0x234. */
+      return 0xF0;
+   }
    if (addr == 0x063) {
      bustmp &= ~0x01;
      bustmp |= SmpcRegs->SF;

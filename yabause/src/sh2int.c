@@ -3209,6 +3209,21 @@ FASTCALL void SH2InterpreterExec(SH2_struct *context, u32 cycles)
       //context->instruction =  MappedMemoryReadWord(context->regs.PC,NULL);  //fetchlist[(context->regs.PC >> 20) & 0x0FF](context->regs.PC);
 
         context->instruction = MappedMemoryReadInst(context->regs.PC, NULL);// fetchlist[(context->regs.PC >> 20) & 0x0FF](context->regs.PC);
+#ifdef YAB_STV_DEBUG
+        /* ST-V bring-up trace: the BIOS hangs at 0x234 because the check at
+           0xd24 returns false, so follow both ranges instruction by instruction. */
+        {
+           static unsigned int stv_trace = 0;
+           if (yabsys.isSTV && stv_trace < 2000 && context->regs.PC < 0x1000) {
+              printf("[TR] pc=%08x op=%04x R0=%08x R1=%08x R2=%08x R3=%08x R4=%08x R7=%08x R8=%08x R15=%08x GBR=%08x SR=%08x\n",
+                     context->regs.PC, context->instruction,
+                     context->regs.R[0], context->regs.R[1], context->regs.R[2], context->regs.R[3],
+                     context->regs.R[4], context->regs.R[7], context->regs.R[8], context->regs.R[15],
+                     context->regs.GBR, context->regs.SR);
+              stv_trace++;
+           }
+        }
+#endif
 
       // Execute it
       opcodes[context->instruction](context);
