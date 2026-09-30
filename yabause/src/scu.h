@@ -299,7 +299,7 @@ extern "C" {
 
   int ScuInit(void);
   void ScuDeInit(void);
-  void ScuReset(void);
+  void ScuReset(u8 powering_up);
   void ScuExec(u32 timing);
 
   u8 FASTCALL	ScuReadByte(u32);

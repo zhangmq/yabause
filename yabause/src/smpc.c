@@ -159,6 +159,9 @@ void SmpcReset(void) {
 
    memset((void *)&SmpcInternalVars->port1, 0, sizeof(PortData_struct));
    memset((void *)&SmpcInternalVars->port2, 0, sizeof(PortData_struct));
+   /* Kronos sets this in SmpcReset; without it OREG[31] stays 0 after the
+      memset and the ST-V BIOS never sees the 0xD it polls for. */
+   SmpcRegs->OREG[31] = 0xD;
 }
 
 //////////////////////////////////////////////////////////////////////////////
@@ -201,7 +204,7 @@ void SmpcCKCHG352(void) {
    // Reset VDP1, VDP2, SCU, and SCSP
    Vdp1Reset();  
    Vdp2Reset();  
-   ScuReset();  
+   ScuReset(0);  
    ScspReset();  
 
    // Clear VDP1/VDP2 ram
@@ -224,7 +227,7 @@ void SmpcCKCHG320(void) {
    // Reset VDP1, VDP2, SCU, and SCSP
    Vdp1Reset();  
    Vdp2Reset();  
-   ScuReset();  
+   ScuReset(0);  
    ScspReset();  
 
    // Clear VDP1/VDP2 ram
@@ -569,6 +572,8 @@ void SmpcExec(s32 t) {
          switch(SmpcRegs->COMREG) {
             case 0x0:
                SMPCLOG("smpc\t: MSHON not implemented\n");
+               SmpcRegs->OREG[31] = 0x0;
+               SmpcRegs->SF = 0;
                break;
             case 0x2:
                SMPCLOG("smpc\t: SSHON\n");
@@ -588,9 +593,11 @@ void SmpcExec(s32 t) {
                break;
             case 0x8:
                SMPCLOG("smpc\t: CDON not implemented\n");
+               SmpcRegs->SF = 0;
                break;
             case 0x9:
                SMPCLOG("smpc\t: CDOFF not implemented\n");
+               SmpcRegs->SF = 0;
                break;
             case 0xD:
                SMPCLOG("smpc\t: SYSRES not implemented\n");
@@ -640,10 +647,10 @@ void SmpcExec(s32 t) {
 u8 FASTCALL SmpcReadByte(u32 addr) {
    addr &= 0x7F;
    if (addr == 0x05F && yabsys.isSTV) {
-      /* OREG[31] on the ST-V reads as 0xF0 (bus not driven / unknown device).
-         The BIOS checks it at 0x228/0x22C for 0xF0 or 0x0D and, when it is
-         neither, issues SMPC SYSRES and spins forever at 0x234. */
-      return 0xF0;
+      /* Return the real OREG[31].  A hardcoded 0xF0 here (the old hack) made
+         the BIOS boot but also masked every handshake value the game polls
+         for (0x10/0x17/0x18/0x19/0x1A), so coin credits never updated. */
+      return SmpcRegs->OREG[31];
    }
      if (addr == 0x077) {
         /* PDR2 read-back.  Kronos reads the EEPROM DO bit here (not from PDR1):

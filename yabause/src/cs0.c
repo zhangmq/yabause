@@ -1095,7 +1095,6 @@ static u16 FASTCALL ROMSTVCs1ReadWord(u32 addr)
 static u32 FASTCALL ROMSTVCs1ReadLong(u32 addr)
 {
 #ifdef YAB_STV_DEBUG
-   { static unsigned int d = 0; if (d < 40) { printf("[DEC] rd cmd=%x decryptOn=%d addr=%08x\n", addr & 0xF, decryptOn, addr); d++; } }
 #endif
    u8 decryptCmd = addr & 0xF;
    if ((decryptOn & 0x1) && decryptCmd == 0xc) {
@@ -1118,7 +1117,6 @@ static void FASTCALL ROMSTVCs1WriteByte(u32 addr, u8 val)
 static void FASTCALL ROMSTVCs1WriteWord(u32 addr, u16 val)
 {
 #ifdef YAB_STV_DEBUG
-   { static unsigned int d2 = 0; if (d2 < 40) { printf("[DEC] wr cmd=%x val=%04x addr=%08x\n", addr & 0xF, val, addr); d2++; } }
 #endif
    u8 decryptCmd = addr & 0xF;
    if (decryptCmd == 0x1) {

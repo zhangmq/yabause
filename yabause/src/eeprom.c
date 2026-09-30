@@ -84,7 +84,6 @@ static void executeCmd() {
 void eeprom_set_clk(u8 state) {
   state &= 1;
 #ifdef YAB_STV_DEBUG
-    { static unsigned int e = 0; if (e < 400) { printf("[EE] clk=%d di=%d cs=%d idx=%d cmd=%d do=%d\n", state&1, di, cs, di_index, cmd, d_o); e++; } }
 #endif
   if (state == clk)
     return;
@@ -127,7 +126,6 @@ void eeprom_set_cs(u8 state) {
 
 int eeprom_do_read(void) {
 #ifdef YAB_STV_DEBUG
-  { static unsigned int q = 0; if (q < 120) { printf("[EE-DO] d_o=%d idx=%d cmd=%d\n", d_o, di_index, cmd); q++; } }
 #endif
   EEPROM_LOG("Read d_o = %x\n", d_o);
   return d_o;
