@@ -205,6 +205,59 @@ static int system_key_config_nb = 0;
 
 #define STV_KEYCFG_NB(a) ((int)(sizeof(a)/sizeof(a[0])))
 
+/* Ported from libretro/yabause@kronos.  Descriptors must be sent AFTER
+   PERLIBRETROInit() has filled system_key_config_nb/current_key_config_nb --
+   sending them from retro_load_game_common() (where those are still 0) gives
+   the frontend an EMPTY list, and minarch then marks every button as
+   unavailable and ignores it, so no input reaches the core at all. */
+static void set_descriptors(void)
+{
+   int nb_descriptors = ((stv_mode?(system_key_config_nb+current_key_config_nb):(17*players))+1);
+   struct retro_input_descriptor *input_descriptors = (struct retro_input_descriptor*)calloc(nb_descriptors, sizeof(struct retro_input_descriptor));
+
+   if(stv_mode)
+   {
+      unsigned j = 0;
+      if (service_enabled)
+      {
+         for (unsigned i = 0; i < (unsigned)system_key_config_nb; i++)
+            input_descriptors[j++] = (struct retro_input_descriptor){ system_key_config[i].player, RETRO_DEVICE_JOYPAD, 0, system_key_config[i].id, system_key_config[i].description };
+      }
+      for (unsigned i = 0; i < (unsigned)current_key_config_nb; i++)
+         input_descriptors[j++] = (struct retro_input_descriptor){ current_key_config[i].player, RETRO_DEVICE_JOYPAD, 0, current_key_config[i].id, current_key_config[i].description };
+      input_descriptors[j].description = NULL;
+   }
+   else
+   {
+      unsigned j = 0;
+      for (unsigned i = 0; i < players; i++)
+      {
+         input_descriptors[j++] = (struct retro_input_descriptor){ i, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_LEFT,  "D-Pad Left" };
+         input_descriptors[j++] = (struct retro_input_descriptor){ i, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_UP,    "D-Pad Up" };
+         input_descriptors[j++] = (struct retro_input_descriptor){ i, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_DOWN,  "D-Pad Down" };
+         input_descriptors[j++] = (struct retro_input_descriptor){ i, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_RIGHT, "D-Pad Right" };
+         input_descriptors[j++] = (struct retro_input_descriptor){ i, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_B,     "A" };
+         input_descriptors[j++] = (struct retro_input_descriptor){ i, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_A,     "B" };
+         input_descriptors[j++] = (struct retro_input_descriptor){ i, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_R,     "C" };
+         input_descriptors[j++] = (struct retro_input_descriptor){ i, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_Y,     "X" };
+         input_descriptors[j++] = (struct retro_input_descriptor){ i, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_X,     "Y" };
+         input_descriptors[j++] = (struct retro_input_descriptor){ i, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_L,     "Z" };
+         input_descriptors[j++] = (struct retro_input_descriptor){ i, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_L2,    "L" };
+         input_descriptors[j++] = (struct retro_input_descriptor){ i, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_R2,    "R" };
+         input_descriptors[j++] = (struct retro_input_descriptor){ i, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_START, "Start" };
+         input_descriptors[j++] = (struct retro_input_descriptor){ i, RETRO_DEVICE_ANALOG, RETRO_DEVICE_INDEX_ANALOG_LEFT, RETRO_DEVICE_ID_ANALOG_X,  "Analog X" };
+         input_descriptors[j++] = (struct retro_input_descriptor){ i, RETRO_DEVICE_ANALOG, RETRO_DEVICE_INDEX_ANALOG_LEFT, RETRO_DEVICE_ID_ANALOG_Y,  "Analog Y" };
+         input_descriptors[j++] = (struct retro_input_descriptor){ i, RETRO_DEVICE_ANALOG, RETRO_DEVICE_INDEX_ANALOG_RIGHT, RETRO_DEVICE_ID_ANALOG_X, "Analog X (Right)" };
+         input_descriptors[j++] = (struct retro_input_descriptor){ i, RETRO_DEVICE_ANALOG, RETRO_DEVICE_INDEX_ANALOG_RIGHT, RETRO_DEVICE_ID_ANALOG_Y, "Analog Y (Right)" };
+      }
+      input_descriptors[j].description = NULL;
+   }
+   environ_cb(RETRO_ENVIRONMENT_SET_INPUT_DESCRIPTORS, input_descriptors);
+   free(input_descriptors);
+}
+
+/* Running first frame: all device ids were set, so send the descriptors. */
+static bool all_devices_ready = false;
 int PERLIBRETROInit(void)
 {
    void *controller;
@@ -223,6 +276,7 @@ int PERLIBRETROInit(void)
          PerSetKey(system_key_config[i].key, system_key_config[i].key, controller);
       for (i = 0; i < (uint32_t)current_key_config_nb; i++)
          PerSetKey(current_key_config[i].key, current_key_config[i].key, controller);
+
       players = 2;
       return 0;
    }
@@ -1732,6 +1786,9 @@ void retro_set_controller_port_device(unsigned port, unsigned device)
       pad_type[port] = device;
       if(PERCore)
          PERCore->Init();
+      // When all devices are set, we can send input descriptors
+      if (all_devices_ready)
+         set_descriptors();
    }
 }
 
@@ -1905,6 +1962,14 @@ void retro_init(void)
 
    char save_dir[PATH_MAX];
    snprintf(save_dir, sizeof(save_dir), "%s%cyabasanshiro%c", g_save_dir, slash, slash);
+   path_mkdir(save_dir);
+
+   /* ST-V EEPROM/NVRAM lives in <save_dir>/stv/ (see the eepromdir set in
+      retro_load_game).  T123Save() just fopen()s the path, so the directory
+      has to exist or every write silently fails and the machine settings
+      (credits, coin mode) are lost on exit.  Kronos creates its equivalent
+      directory the same way. */
+   snprintf(save_dir, sizeof(save_dir), "%s%cstv%c", g_save_dir, slash, slash);
    path_mkdir(save_dir);
 
    if (environ_cb(RETRO_ENVIRONMENT_GET_INPUT_BITMASKS, NULL))
@@ -2483,31 +2548,11 @@ bool retro_load_game(const struct retro_game_info *info)
       { 0 },
    };
 
-   if (stv_mode)
-   {
-      /* ST-V: describe the JAMMA cabinet keys from the key tables (Kronos
-         set_descriptors()), not the Saturn pad table. */
-      unsigned j = 0, n;
-      struct retro_input_descriptor *stv_desc;
-      n = (unsigned)(system_key_config_nb + current_key_config_nb) + 1;
-      stv_desc = (struct retro_input_descriptor*)calloc(n, sizeof(struct retro_input_descriptor));
-      if (stv_desc != NULL)
-      {
-         for (unsigned k = 0; k < (unsigned)system_key_config_nb; k++)
-            stv_desc[j++] = (struct retro_input_descriptor){ system_key_config[k].player, RETRO_DEVICE_JOYPAD, 0, system_key_config[k].id, system_key_config[k].description };
-         for (unsigned k = 0; k < (unsigned)current_key_config_nb; k++)
-            stv_desc[j++] = (struct retro_input_descriptor){ current_key_config[k].player, RETRO_DEVICE_JOYPAD, 0, current_key_config[k].id, current_key_config[k].description };
-         stv_desc[j].description = NULL;
-         environ_cb(RETRO_ENVIRONMENT_SET_INPUT_DESCRIPTORS, stv_desc);
-         free(stv_desc);
-      }
-   }
-   else
-   {
-      environ_cb(RETRO_ENVIRONMENT_SET_INPUT_DESCRIPTORS, desc);
-   }
-
-
+   /* NOTE: descriptors are NOT sent here.  Kronos sends them from
+      set_descriptors() (first retro_run frame / port-device change), because
+      this static Saturn table has no JOYPAD_SELECT and minarch's Input_init()
+      latches on the FIRST SET_INPUT_DESCRIPTORS it ever sees -- sending this
+      one here marked Select as unavailable and swallowed the ST-V coin key. */
    if (stv_mode)
    {
       /* Sega Titan Video: ROM board on CS0/CS1 assembled from the romset zip,
@@ -2590,6 +2635,7 @@ size_t retro_get_memory_size(unsigned id)
 void retro_deinit(void)
 {
    libretro_supports_bitmasks = false;
+   all_devices_ready = false;
 }
 
 void retro_reset(void)
@@ -2620,6 +2666,14 @@ void retro_run(void)
    unsigned i;
    bool updated  = false;
    one_frame_rendered = false;
+
+   if (!all_devices_ready)
+   {
+      // Running first frame, so we can assume all devices id were set
+      // Let's send input descriptors
+      all_devices_ready = true;
+      set_descriptors();
+   }
 
    if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE_UPDATE, &updated) && updated)
    {
