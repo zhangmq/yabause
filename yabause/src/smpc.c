@@ -497,7 +497,7 @@ static void SmpcINTBACKPeripheral(void) {
 //////////////////////////////////////////////////////////////////////////////
 
 static void SmpcINTBACK(void) {
-  if (SmpcInternalVars->firstPeri == 1) {
+    if (SmpcInternalVars->firstPeri == 1) {
      //in a continous mode.
       SMPCLOG("Continue on command SF %d\n", SmpcRegs->SF);
       SmpcINTBACKPeripheral();
@@ -579,7 +579,7 @@ static void SmpcRESDISA(void) {
 
 //////////////////////////////////////////////////////////////////////////////
 static void processCommand(void) {
-  switch(SmpcRegs->COMREG) {
+    switch(SmpcRegs->COMREG) {
      case 0x0:
         SMPCLOG("smpc\t: MSHON not implemented\n");
         SmpcRegs->OREG[31]=0x0;
@@ -661,7 +661,7 @@ static void processCommand(void) {
 void SmpcExec(s32 t) {
   if (intback_wait_for_vblankout != 0)
   {
-    if (yabsys.LineCount == yabsys.MaxLineCount - 1)
+        if (yabsys.LineCount == yabsys.MaxLineCount - 1)
     {
       intback_wait_for_vblankout = 0;
       SmpcInternalVars->timing = 1;
@@ -765,7 +765,7 @@ static void SmpcSetTiming(void) {
          SmpcInternalVars->timing = 400; // this has to be tested on a real saturn
          return;
       case 0x10:
-          if (SmpcInternalVars->firstPeri == 1) {
+                    if (SmpcInternalVars->firstPeri == 1) {
             //Continue
             if (yabsys.LineCount >= yabsys.VBlankLineCount) {
               SMPCLOG("Continue on read for peri 1 - wait for vblankout\n");
@@ -879,8 +879,7 @@ void FASTCALL SmpcWriteByte(u32 addr, u8 val) {
 
    switch(addr) {
       case 0x01: // Maybe an INTBACK continue/break request
-         if (SmpcRegs->SF ==0) SMPCLOG("Request a continue/break but no intback on going\n");
-         if ((SmpcInternalVars->firstPeri != 0) && (SmpcInternalVars->timing <= 0))
+                  if ((SmpcInternalVars->firstPeri != 0) && (SmpcInternalVars->timing <= 0))
          {
             /* SMPC doc Table 3.2: continue/break is coded in the top two bits
                of IREG[0] -- 01xxxxxx = break, 10xxxxxx = continue.  Testing a
@@ -900,6 +899,17 @@ void FASTCALL SmpcWriteByte(u32 addr, u8 val) {
                SMPCLOG("INTBACK Continue\n");
                SmpcSetTiming();
                SmpcRegs->SF = 1;
+            }
+            else {
+               /* 11xxxxxx (e.g. 0xFF, which cotton2 writes).  The two-bit test
+                * above leaves it unhandled, so the request is silently dropped
+                * and SF stays 1 forever -- the game then spins on SF.  The old
+                * single-bit test (IREG[0] & 0x40) classified 11xxxxxx as a
+                * Break, which is what the hardware does: treat it as a break. */
+                              SmpcInternalVars->firstPeri = 0;
+               SmpcRegs->SR &= 0x0F;
+               SmpcRegs->SF = 0;
+               break;
             }
          }
          return;
