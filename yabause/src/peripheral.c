@@ -885,7 +885,6 @@ void PerFlush(PortData_struct * port)
 void PerKeyDown(u32 key)
 {
 	unsigned int i = 0;
-	IOPortPressed(key);
 
 	while(i < perkeyconfigsize)
 	{
@@ -902,7 +901,6 @@ void PerKeyDown(u32 key)
 void PerKeyUp(u32 key)
 {
 	unsigned int i = 0;
-	IOPortReleased(key);
 
 	while(i < perkeyconfigsize)
 	{
@@ -968,10 +966,16 @@ void PerAxisMove(u32 key, s32 dispx, s32 dispy)
 
 void PerPortReset(void)
 {
+  int i;
         PORTDATA1.data[0] = 0xF0;
         PORTDATA1.size = 1;
         PORTDATA2.data[0] = 0xF0;
         PORTDATA2.size = 1;
+
+        for (i=0; i<ioPortMAX; i++)
+          IOPORT[i] = 0xFF; //IOPORT are in pull up mode.
+        for (i=0; i<256; i++)
+          IOkeys[i] = NULL;
 
 	perkeyconfigsize = 0;
         if (perkeyconfig)
@@ -987,12 +991,21 @@ void PerUpdateConfig(PerBaseConfig_struct * baseconfig, int nelems, void * contr
    u32 i, j;
 
    perkeyconfigsize += nelems;
-   perkeyconfig = realloc(perkeyconfig, perkeyconfigsize * sizeof(PerConfig_struct));
+
+	 PerConfig_struct *new_data = (PerConfig_struct*)realloc(perkeyconfig, perkeyconfigsize * sizeof(PerConfig_struct));
+ 	if (new_data == NULL)
+ 	{
+		YuiMsg("Peripheral realloc Error\n");
+ 	} else {
+     perkeyconfig = new_data;
+ 	}
+
    j = 0;
    for(i = oldsize;i < perkeyconfigsize;i++)
    {
       perkeyconfig[i].base = baseconfig + j;
       perkeyconfig[i].controller = controller;
+      perkeyconfig[i].key = -1;
       j++;
    }
 }
@@ -1143,7 +1156,9 @@ static PerBaseConfig_struct percabinetbaseconfig[] = {
    { PERJAMMA_P2_BUTTON6, PERCB(PerCabP2Button6Pressed), PERCB(PerCabP2Button6Released), NULL, NULL },
 };
 
-/* System keys (coin/test/service/pause) live on IOGA PORT_C. */
+/* Kronos leaves these IOPortAdd() calls commented out -- the PerCab* handlers
+   below write IOPORT[] directly, so IOkeys[] stays all-NULL.  Kept verbatim. */
+#if 0
 static void PerCabSystemKeys(void) {
    IOPortAdd(PERJAMMA_COIN1, PORT_C, 0x0);
    IOPortAdd(PERJAMMA_COIN2, PORT_C, 0x1);
@@ -1154,12 +1169,10 @@ static void PerCabSystemKeys(void) {
    IOPortAdd(PERJAMMA_MULTICART, PORT_C, 0x6);
    IOPortAdd(PERJAMMA_PAUSE, PORT_C, 0x7);
 }
+#endif
 
 PerCab_struct * PerCabAdd(PortData_struct * port) {
    (void)port;
-   memset(IOPORT, 0xFF, sizeof(IOPORT));
-   memset(IOkeys, 0, sizeof(IOkeys));
-   PerCabSystemKeys();
    PerUpdateConfig(percabinetbaseconfig, sizeof(percabinetbaseconfig)/sizeof(PerBaseConfig_struct), IOPORT);
    return IOPORT;
 }
