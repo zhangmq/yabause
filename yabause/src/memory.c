@@ -78,15 +78,25 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301  USA
 #include "vidsoft.h"
 #include "vidogl.h"
 
-#if CACHE_ENABLE
-#else
-u8 FASTCALL MappedMemoryReadByteNocache(u32 addr, u32 * cycle){ return MappedMemoryReadByte(addr, NULL); }
+#ifdef YAB_STV_DEBUG
+/* Set while MappedMemoryReadInst is fetching so the ST-V read probe can ignore
+   instruction fetches (ReadInst simply calls ReadWord).  Declared here, outside
+   the CACHE_ENABLE branches, because the write probes reference it too. */
+int stv_in_fetch = 0;
+static unsigned int stv_wdbg = 0;
+#endif
+
 /* ST-V ROM decryption (decrypt.c) reads the ROM area with no SH2 context and no
-   cache bookkeeping -- equivalent of Kronos' DMAMappedMemoryReadWord. */
+   cache bookkeeping -- equivalent of Kronos' DMAMappedMemoryReadWord.  Kept
+   outside the CACHE_ENABLE branch because decrypt.c needs it either way. */
 u16 FASTCALL DMAMappedMemoryReadWord(u32 addr)
 {
    return ReadWordList[(addr >> 16) & 0xFFF](addr);
 }
+
+#if CACHE_ENABLE
+#else
+u8 FASTCALL MappedMemoryReadByteNocache(u32 addr, u32 * cycle){ return MappedMemoryReadByte(addr, NULL); }
 
 u16 FASTCALL MappedMemoryReadWordNocache(u32 addr, u32 * cycle){ return MappedMemoryReadWord(addr, NULL); }
 u32 FASTCALL MappedMemoryReadLongNocache(u32 addr, u32 * cycle){ return MappedMemoryReadLong(addr, NULL); }
@@ -522,23 +532,29 @@ static u8 FASTCALL BupRamMemoryReadByte(u32 addr)
     addr = addr & 0x0000FFFF;
   }
   //printf("BupRamMemoryReadByte %08X\n",addr);
-  return T1ReadByte(BupRam, addr);
+  /* The backup RAM is a 16-bit device with only its high byte wired up, so
+     software reaches byte N through the odd address 2N+1; even addresses read
+     back 0xFF.  Kronos maps it the same way. */
+  if (addr & 0x1) {
+    return T1ReadByte(BupRam, addr >> 1);
+  }
+  return 0xFF;
 }
 
 //////////////////////////////////////////////////////////////////////////////
 
 static u16 FASTCALL BupRamMemoryReadWord(USED_IF_DEBUG u32 addr)
 {
-   LOG("bup\t: BackupRam read word - %08X\n", addr);
-   return 0;
+   // LOG("bup\t: BackupRam read word - %08X\n", addr);
+   return (BupRamMemoryReadByte(addr | 0x1) << 8);
 }
 
 //////////////////////////////////////////////////////////////////////////////
 
 static u32 FASTCALL BupRamMemoryReadLong(USED_IF_DEBUG u32 addr)
 {
-   LOG("bup\t: BackupRam read long - %08X\n", addr);
-   return 0;
+   // LOG("bup\t: BackupRam read long - %08X\n", addr);
+   return ((BupRamMemoryReadByte(addr | 0x1) << 8) || (BupRamMemoryReadByte(addr | 0x3) << 16));
 }
 
 //////////////////////////////////////////////////////////////////////////////
@@ -578,21 +594,30 @@ static void FASTCALL BupRamMemoryWriteByte(u32 addr, u8 val)
     addr = addr & 0x0000FFFF;
   }
   //printf("BupRamMemoryWriteByte %08X\n",addr);
-  T1WriteByte(BupRam, addr|0x1, val);
+  /* See BupRamMemoryReadByte: only the odd (high-byte) addresses are stored. */
+  if (addr & 0x1) {
+    T1WriteByte(BupRam, addr >> 1, val);
+  }
+#ifdef YAB_STV_DEBUG
+  { static unsigned int nb=0; if (nb<40) { printf("[BRAMW] addr=%08x val=%02x M=%08x S=%08x\n", addr, val, MSH2?MSH2->regs.PC:0, SSH2?SSH2->regs.PC:0); fflush(stdout); nb++; } }
+#endif
 }
 
 //////////////////////////////////////////////////////////////////////////////
 
 static void FASTCALL BupRamMemoryWriteWord(USED_IF_DEBUG u32 addr, UNUSED u16 val)
 {
-   LOG("bup\t: BackupRam write word - %08X\n", addr);
+   // LOG("bup\t: BackupRam write word - %08X %x\n", addr, val);
+   BupRamMemoryWriteByte(addr | 0x1, (val>>8) & 0xFF);
 }
 
 //////////////////////////////////////////////////////////////////////////////
 
 static void FASTCALL BupRamMemoryWriteLong(USED_IF_DEBUG u32 addr, UNUSED u32 val)
 {
-   LOG("bup\t: BackupRam write long - %08X\n", addr);
+   // LOG("bup\t: BackupRam write long - %08X %x\n", addr, val);
+   BupRamMemoryWriteByte(addr | 0x1, (val>>8) & 0xFF);
+   BupRamMemoryWriteByte(addr | 0x3, (val>>24) & 0xFF);
 }
 
 //////////////////////////////////////////////////////////////////////////////
@@ -947,12 +972,6 @@ u16 FASTCALL MappedMemoryReadWord(u32 addr, u32 * cycle){
 }
 u16 FASTCALL MappedMemoryReadWordNocache(u32 addr, u32 * cycle)
 #else
-#ifdef YAB_STV_DEBUG
-/* Set while MappedMemoryReadInst is fetching so the ST-V read probe below can
-   ignore instruction fetches (ReadInst simply calls ReadWord). */
-int stv_in_fetch = 0;
-static unsigned int stv_wdbg = 0;
-#endif
 u16 MappedMemoryReadInst(u32 addr, u32 * cycle) {
 #ifdef YAB_STV_DEBUG
   u16 r;
@@ -1114,6 +1133,14 @@ void FASTCALL MappedMemoryWriteByteNocache(u32 addr, u8 val, u32 * cycle)
 void FASTCALL MappedMemoryWriteByte(u32 addr, u8 val, u32 * cycle)
 #endif
 {
+   /* Invalidate any dynarec block covering this address: ST-V games
+      (and a few Saturn ones) rewrite code in work RAM and expect the
+      new instructions to take effect immediately.  Kronos notifies on
+      every CPU write path; without it the dynarec keeps running the
+      stale translation and the game's logic silently diverges. */
+   SH2WriteNotify(addr, 1);
+
+
   //if ((addr & 0x0FFFFFFF) == 0x060f9600) {
   //  LOG("[%s] %d Write %zu-byte write of 0x%08x to 0x%08x PC=%08X frame=%d:%d", CurrentSH2->isslave ? "SH2-S" : "SH2-M", CurrentSH2->cycles, 1, val, addr, CurrentSH2->regs.PC, yabsys.frame_count, yabsys.LineCount);
     //if (slogp != NULL){
@@ -1190,6 +1217,14 @@ void FASTCALL MappedMemoryWriteWordNocache(u32 addr, u16 val, u32 * cycle)
 void FASTCALL MappedMemoryWriteWord(u32 addr, u16 val, u32 * cycle )
 #endif
 {
+   /* Invalidate any dynarec block covering this address: ST-V games
+      (and a few Saturn ones) rewrite code in work RAM and expect the
+      new instructions to take effect immediately.  Kronos notifies on
+      every CPU write path; without it the dynarec keeps running the
+      stale translation and the game's logic silently diverges. */
+   SH2WriteNotify(addr, 2);
+
+
   if (cycle != NULL) {
     *cycle = getMemClock(addr);
   }
@@ -1263,6 +1298,14 @@ void FASTCALL MappedMemoryWriteLongNocache(u32 addr, u32 val , u32 * cycle)
 void FASTCALL MappedMemoryWriteLong(u32 addr, u32 val, u32 * cycle )
 #endif
 {
+   /* Invalidate any dynarec block covering this address: ST-V games
+      (and a few Saturn ones) rewrite code in work RAM and expect the
+      new instructions to take effect immediately.  Kronos notifies on
+      every CPU write path; without it the dynarec keeps running the
+      stale translation and the game's logic silently diverges. */
+   SH2WriteNotify(addr, 4);
+
+
 #if 0   
    if( (addr & 0x0FFFFFFF) == 0x060f9600){
      LOG("[%s] %d Write %zu-byte write of 0x%08x to 0x%08x PC=%08X frame=%d:%d", CurrentSH2->isslave ? "SH2-S" : "SH2-M", CurrentSH2->cycles, 4, val, addr, CurrentSH2->regs.PC, yabsys.frame_count, yabsys.LineCount);
@@ -1477,11 +1520,11 @@ int LoadBackupRam(const char *filename)
    return T123Load(BupRam, 0x10000, 1, filename);
 }
 
-static u8 header[32] = {
-  0xFF, 'B', 0xFF, 'a', 0xFF, 'c', 0xFF, 'k',
-  0xFF, 'U', 0xFF, 'p', 0xFF, 'R', 0xFF, 'a',
-  0xFF, 'm', 0xFF, ' ', 0xFF, 'F', 0xFF, 'o',
-  0xFF, 'r', 0xFF, 'm', 0xFF, 'a', 0xFF, 't'
+static u8 header[16] = {
+  'B', 'a', 'c', 'k',
+  'U', 'p', 'R', 'a',
+  'm', ' ', 'F', 'o',
+  'r', 'm', 'a', 't'
 };
 
 int CheckBackupFile(FILE *fp) {
@@ -1490,7 +1533,7 @@ int CheckBackupFile(FILE *fp) {
 
   // Fill in header
   for (i2 = 0; i2 < 4; i2++) {
-    for (i = 0; i < 32; i++) {
+    for (i = 0; i < 16; i++) {
       u8 val = fgetc(fp);
       if ( val != header[i]) {
         return -1;
@@ -1507,9 +1550,8 @@ int ExtendBackupFile(FILE *fp, u32 size ) {
   if (acsize < size) {
     // Clear the rest
     u32 i;
-    for ( i = (acsize&0xFFFFFFFE) ; i < size; i += 2)
+    for ( i = (acsize&0xFFFFFFFE) ; i < size; i++)
     {
-      fputc(0xFF, fp);
       fputc(0x00, fp);
     }
     fflush(fp);
@@ -1528,13 +1570,12 @@ void FormatBackupRamFile(FILE *fp, u32 size) {
 
   // Fill in header
   for (i2 = 0; i2 < 4; i2++)
-    for (i = 0; i < 32; i++)
+    for (i = 0; i < 16; i++)
       fputc(header[i],fp);
 
   // Clear the rest
-  for (i3 = 0x80; i3 < size; i3 += 2)
+  for (i3 = 0x80; i3 < size; i3 ++)
   {
-    fputc(0xFF,fp);
     fputc(0x00,fp);
   }
   fflush(fp);
@@ -1547,14 +1588,13 @@ void FormatBackupRam(void *mem, u32 size)
 
    // Fill in header
    for(i2 = 0; i2 < 4; i2++)
-      for(i = 0; i < 32; i++)
-         T1WriteByte(mem, (i2 * 32) + i, header[i]);
+      for(i = 0; i < 16; i++)
+         T1WriteByte(mem, (i2 * 16) + i, header[i]);
 
    // Clear the rest
-   for(i3 = 0x80; i3 < size; i3+=2)
+   for(i3 = 0x80; i3 < size; i3++)
    {
-      T1WriteByte(mem, i3, 0xFF);
-      T1WriteByte(mem, i3+1, 0x00);
+      T1WriteByte(mem, i3, 0x00);
    }
 }
 

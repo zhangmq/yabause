@@ -808,13 +808,18 @@ void FASTCALL SmpcWriteByte(u32 addr, u8 val) {
       case 0x01: // Maybe an INTBACK continue/break request
          if (SmpcInternalVars->intback)
          {
-            if (SmpcRegs->IREG[0] & 0x40) {
+            /* SMPC doc Table 3.2: continue/break is coded in the top two bits
+               of IREG[0] -- 01xxxxxx = break, 10xxxxxx = continue.  Testing a
+               single bit misclassifies 11xxxxxx and makes several ST-V games
+               (Cotton 2/Boomerang, Radiant Silvergun) ignore START.
+               Ported from FCare/Kronos b07079bf35a3a3cefd6f8e768e40d486c28e50fc. */
+            if ((SmpcRegs->IREG[0] & 0xC0) == 0x40) {
                // Break
                SmpcInternalVars->intback = 0;
                SmpcRegs->SR &= 0x0F;
                break;
             }
-            else if (SmpcRegs->IREG[0] & 0x80) {                    
+            else if ((SmpcRegs->IREG[0] & 0xC0) == 0x80) {
                // Continue
                SmpcRegs->COMREG = 0x10;
                SmpcSetTiming();

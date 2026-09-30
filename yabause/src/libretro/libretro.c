@@ -1675,6 +1675,16 @@ void check_variables(void)
          g_sh2coretype = 3;
       else if (strcmp(var.value, "interpreter") == 0)
          g_sh2coretype = SH2CORE_INTERPRETER;
+
+      /* Debug override: YAB_SH2=interp forces the interpreter even when the
+         frontend option says dynarec.  The dynarec only syncs regs.PC at block
+         boundaries, so PC-based probes read 0 and cannot tell which CPU (BIOS
+         or game) is polling the IOGA ports. */
+      {
+         const char *e = getenv("YAB_SH2");
+         if (e && strcmp(e, "interp") == 0)
+            g_sh2coretype = SH2CORE_INTERPRETER;
+      }
    }
 #endif
 
@@ -2248,7 +2258,6 @@ bool retro_load_game_common()
    yinit.buppath                   = bup_path;
    yinit.use_new_scsp              = 1;
    yinit.scsp_sync_count_per_frame = 1;
-   yinit.extend_backup             = 1;
    yinit.scsp_main_mode            = 1;
    yinit.videoformattype           = VIDEOFORMATTYPE_NTSC;
    yinit.video_filter_type         = 0;
@@ -2308,8 +2317,18 @@ bool retro_load_game(const struct retro_game_info *info)
    {
       if (does_file_exist(stv_bios_path) != 1)
       {
-         log_cb(RETRO_LOG_ERROR, "ST-V game detected but %s is missing, ABORTING\n", stv_bios_path);
-         return false;
+         /* Experiment: YAB_STV_HLE=1 lets an ST-V game run on the HLE BIOS
+            instead of aborting, to find out whether the coin path depends on
+            the real BIOS.  Kronos itself always tolerates a missing ST-V BIOS
+            (it only warns), so this is also closer to its behaviour. */
+         const char *hle = getenv("YAB_STV_HLE");
+         if (hle && strcmp(hle, "1") == 0)
+            log_cb(RETRO_LOG_WARN, "ST-V BIOS missing but YAB_STV_HLE=1 -- using HLE BIOS\n");
+         else
+         {
+            log_cb(RETRO_LOG_ERROR, "ST-V game detected but %s is missing, ABORTING\n", stv_bios_path);
+            return false;
+         }
       }
    }
    else if (does_file_exist(bios_path) != 1)

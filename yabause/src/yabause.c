@@ -408,7 +408,16 @@ int YabauseInit(yabauseinit_struct *init)
      T2WriteLong(BiosRom,0x00000220, 0x277AAFFE); // patch for SAKURA TAISEN
    }
    }
-   else yabsys.emulatebios = 0;
+   else {
+      /* ST-V: HLE BIOS is only reachable when the experiment switch is on. */
+      const char *hle = getenv("YAB_STV_HLE");
+      if (hle && strcmp(hle, "1") == 0) {
+         yabsys.emulatebios = 1;
+         T2WriteLong(BiosRom, 0x04, 0x06002000); // set base stack pointer
+      } else {
+         yabsys.emulatebios = 0;
+      }
+   }
 
    yabsys.usequickload = 0;
 
