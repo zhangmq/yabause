@@ -52,6 +52,7 @@ static char stv_eeprom_dir[PATH_MAX];
 static char *stvgame = NULL;
 static bool stv_mode = false;
 static int stv_favorite_region = STV_REGION_EU;
+static bool service_enabled = false;   /* kronos_service_enabled: Test/Service/Pause keys */
 static char bup_path[PATH_MAX];
 
 static int game_width  = 320;
@@ -211,7 +212,9 @@ int PERLIBRETROInit(void)
    uint32_t i, j;
 
    if (stv_mode) {
-      system_key_config_nb = STV_KEYCFG_NB(system_key_config);
+      /* Kronos only registers the system keys (Test/Service/Pause) when the
+         service option is on; the game keys are always registered. */
+      system_key_config_nb = service_enabled ? STV_KEYCFG_NB(system_key_config) : 0;
       current_key_config_nb = STV_KEYCFG_NB(stv_key_config);
       current_key_config = stv_key_config;
       PerPortReset();
@@ -284,6 +287,27 @@ static int PERLIBRETROHandleEvents(void)
    input_poll_cb();
 
 
+   if (stv_mode) {
+      /* ST-V: cabinet inputs only.  Kronos uses if/else here, so the Saturn
+         pad loop below must NOT run in ST-V mode (it would push PERPAD_* keys
+         through the shared perkeyconfig and clear the bitmask cache the ST-V
+         polling just filled). */
+      for (i = 0; i < players; i++)
+         libretro_input_bitmask[i] = -1;
+
+      for (i = 0; i < (unsigned)system_key_config_nb; i++) {
+         if (input_state_cb_wrapper(system_key_config[i].player, RETRO_DEVICE_JOYPAD, 0, system_key_config[i].id))
+            PerKeyDown(system_key_config[i].key);
+         else
+            PerKeyUp(system_key_config[i].key);
+      }
+      for (i = 0; i < (unsigned)current_key_config_nb; i++) {
+         if (input_state_cb_wrapper(current_key_config[i].player, RETRO_DEVICE_JOYPAD, 0, current_key_config[i].id))
+            PerKeyDown(current_key_config[i].key);
+         else
+            PerKeyUp(current_key_config[i].key);
+      }
+   } else {
    for(i = 0; i < players; i++)
    {
          int analog_left_x = 0;
@@ -388,23 +412,9 @@ static int PERLIBRETROHandleEvents(void)
                break;
          }
    }
-
-   if (stv_mode) {
-      /* ST-V cabinet inputs: poll the JAMMA key maps straight into IOGA. */
-      for (i = 0; i < 2; i++) libretro_input_bitmask[i] = -1;
-      for (i = 0; i < (unsigned)system_key_config_nb; i++) {
-         if (input_state_cb_wrapper(system_key_config[i].player, RETRO_DEVICE_JOYPAD, 0, system_key_config[i].id))
-            PerKeyDown(system_key_config[i].key);
-         else
-            PerKeyUp(system_key_config[i].key);
-      }
-      for (i = 0; i < (unsigned)current_key_config_nb; i++) {
-         if (input_state_cb_wrapper(current_key_config[i].player, RETRO_DEVICE_JOYPAD, 0, current_key_config[i].id))
-            PerKeyDown(current_key_config[i].key);
-         else
-            PerKeyUp(current_key_config[i].key);
-      }
    }
+
+
 
    if ( YabauseExec() != 0 )
       return -1;
@@ -1645,6 +1655,15 @@ void check_variables(void)
       else if (strcmp(var.value, "enabled") == 0)
          multitap[1] = 1;
    }
+   var.key = "yabasanshiro_service_enabled";
+   var.value = NULL;
+   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+   {
+      if (strcmp(var.value, "enabled") == 0)
+         service_enabled = true;
+      else
+         service_enabled = false;
+   }
 
    var.key = "yabasanshiro_resolution_mode";
    var.value = NULL;
@@ -2464,7 +2483,30 @@ bool retro_load_game(const struct retro_game_info *info)
       { 0 },
    };
 
-   environ_cb(RETRO_ENVIRONMENT_SET_INPUT_DESCRIPTORS, desc);
+   if (stv_mode)
+   {
+      /* ST-V: describe the JAMMA cabinet keys from the key tables (Kronos
+         set_descriptors()), not the Saturn pad table. */
+      unsigned j = 0, n;
+      struct retro_input_descriptor *stv_desc;
+      n = (unsigned)(system_key_config_nb + current_key_config_nb) + 1;
+      stv_desc = (struct retro_input_descriptor*)calloc(n, sizeof(struct retro_input_descriptor));
+      if (stv_desc != NULL)
+      {
+         for (unsigned k = 0; k < (unsigned)system_key_config_nb; k++)
+            stv_desc[j++] = (struct retro_input_descriptor){ system_key_config[k].player, RETRO_DEVICE_JOYPAD, 0, system_key_config[k].id, system_key_config[k].description };
+         for (unsigned k = 0; k < (unsigned)current_key_config_nb; k++)
+            stv_desc[j++] = (struct retro_input_descriptor){ current_key_config[k].player, RETRO_DEVICE_JOYPAD, 0, current_key_config[k].id, current_key_config[k].description };
+         stv_desc[j].description = NULL;
+         environ_cb(RETRO_ENVIRONMENT_SET_INPUT_DESCRIPTORS, stv_desc);
+         free(stv_desc);
+      }
+   }
+   else
+   {
+      environ_cb(RETRO_ENVIRONMENT_SET_INPUT_DESCRIPTORS, desc);
+   }
+
 
    if (stv_mode)
    {
@@ -2591,6 +2633,7 @@ void retro_run(void)
 #endif
       int prev_resolution_mode = resolution_mode;
       int prev_multitap[2] = {multitap[0],multitap[1]};
+      bool prev_service_enabled = service_enabled;
       check_variables();
       if(prev_resolution_mode != resolution_mode)
          retro_set_resolution();
@@ -2598,7 +2641,8 @@ void retro_run(void)
       //VIDCore->SetSettingValue(VDP_SETTING_POLYGON_MODE, polygon_mode);
       VIDCore->SetSettingValue(VDP_SETTING_RBG_RESOLUTION_MODE, g_rbg_resolution_mode);
       VIDCore->SetSettingValue(VDP_SETTING_RBG_USE_COMPUTESHADER, g_rbg_use_compute_shader);
-      if(PERCore && (prev_multitap[0] != multitap[0] || prev_multitap[1] != multitap[1]))
+      if(PERCore && (prev_multitap[0] != multitap[0] || prev_multitap[1] != multitap[1]
+                     || prev_service_enabled != service_enabled))
          PERCore->Init();
       if(g_frame_skip == 1)
          EnableAutoFrameSkip();

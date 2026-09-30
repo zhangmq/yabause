@@ -63,7 +63,7 @@ typedef struct {
    u8 mask;
 } PerIO_struct;
 
-static u8 IOPORT[ioPortMAX];
+u8 IOPORT[ioPortMAX];
 static PerIO_struct* IOkeys[256];
 static PerIO_struct IOalloc[ioPortMAX][8];
 
@@ -95,6 +95,9 @@ static void IOPortReleased(int key) {
 
 u8 IOPortReadByte(u32 addr) {
    addr = addr & 0x1F;
+#ifdef YAB_STV_DEBUG
+   { static unsigned int r=0; if ((IOPORT[PORT_A]!=0xff || IOPORT[PORT_C]!=0xff) && r<80) { printf("[IOGA] rd addr=%02x A=%02x C=%02x\n", addr & 0x1F, IOPORT[PORT_A], IOPORT[PORT_C]); r++; } }
+#endif
    switch (addr) {
       case 0x01: return IOPORT[PORT_A];
       case 0x03: return IOPORT[PORT_B];

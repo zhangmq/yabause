@@ -309,6 +309,7 @@ typedef enum {
 } ioPort;
 
 int IOPortAdd(int key, ioPort port, u8 index);
+extern u8 IOPORT[ioPortMAX];
 u8 IOPortReadByte(u32 addr);
 u16 IOPortReadWord(u32 addr);
 void IOPortWriteByte(u32 addr, u8 val);
