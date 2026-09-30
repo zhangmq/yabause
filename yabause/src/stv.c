@@ -28,7 +28,7 @@ extern "C" {
 #endif
 
 
-#ifdef STV_DEBUG
+#if defined(STV_DEBUG) || defined(YAB_STV_DEBUG)
 #define LOGSTV(...) do { printf(__VA_ARGS__); fflush(stdout); } while(0)
 #else
 #define LOGSTV(...) do { } while(0)

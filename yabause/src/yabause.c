@@ -359,7 +359,10 @@ int YabauseInit(yabauseinit_struct *init)
       return -1;
    }
 
-   if (SmpcInit(init->regionid, init->clocksync, init->basetime) != 0)
+   /* Kronos' SmpcInit() takes the SMPC/BIOS-settings path and the boot
+      language; this tree has no smpcpath plumbing yet (SmpcSaveBiosSettings()
+      simply returns -1 when it is NULL) and defaults to English. */
+   if (SmpcInit(init->regionid, init->basetime, NULL, 0) != 0)
    {
       YabSetError(YAB_ERR_CANNOTINIT, _("SMPC"));
       return -1;
@@ -695,6 +698,12 @@ u64 g_m68K_dec_cycle = 0;
 
 int YabauseEmulate(void) {
    int oneframeexec = 0;
+   /* Frame end is driven by a frame-local line counter, NOT by yabsys.LineCount:
+    * the latter is a global that YabauseChangeTiming() (CLKCHG) and the savestate
+    * loader rename, and a mid-frame rewrite used to make a frame 1.5x-4x long --
+    * which is how cotton2 lost its video handshake at the 352x246 -> 352x224
+    * switch.  yabsys.LineCount is still maintained because VDP2 needs it. */
+   int local_line = 0;
    yabsys.frame_count++;
    #if !(defined(__LIBRETRO__))
    PlayRecorder_proc(yabsys.frame_count);
@@ -829,8 +838,9 @@ int YabauseEmulate(void) {
          PROFILE_STOP("SCSP");
          yabsys.DecilineCount = 0;
          yabsys.LineCount++;
+         local_line++;
 
-         if (yabsys.LineCount == yabsys.VBlankLineCount) {
+         if (local_line == yabsys.VBlankLineCount) {
 
 #if defined(ASYNC_SCSP)
             setM68kCounter((u64)(44100 * 256 / 60) << SCSP_FRACTIONAL_BITS);
@@ -845,7 +855,7 @@ int YabauseEmulate(void) {
             PROFILE_STOP("vblankin");
             CheatDoPatches();
          }
-         else if (yabsys.LineCount == yabsys.MaxLineCount)
+         else if (local_line == yabsys.MaxLineCount)
          {
             // VBlankOUT
             PROFILE_START("VDP1/VDP2");
