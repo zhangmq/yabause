@@ -50,6 +50,7 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301  USA
 #include <ctype.h>
 
 #include "memory.h"
+#include "peripheral.h"
 #include "coffelf.h"
 #include "cs0.h"
 #include "cs1.h"
@@ -77,9 +78,26 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301  USA
 #include "vidsoft.h"
 #include "vidogl.h"
 
+#ifdef YAB_STV_DEBUG
+/* Set while MappedMemoryReadInst is fetching so the ST-V read probe can ignore
+   instruction fetches (ReadInst simply calls ReadWord).  Declared here, outside
+   the CACHE_ENABLE branches, because the write probes reference it too. */
+int stv_in_fetch = 0;
+static unsigned int stv_wdbg = 0;
+#endif
+
+/* ST-V ROM decryption (decrypt.c) reads the ROM area with no SH2 context and no
+   cache bookkeeping -- equivalent of Kronos' DMAMappedMemoryReadWord.  Kept
+   outside the CACHE_ENABLE branch because decrypt.c needs it either way. */
+u16 FASTCALL DMAMappedMemoryReadWord(u32 addr)
+{
+   return ReadWordList[(addr >> 16) & 0xFFF](addr);
+}
+
 #if CACHE_ENABLE
 #else
 u8 FASTCALL MappedMemoryReadByteNocache(u32 addr, u32 * cycle){ return MappedMemoryReadByte(addr, NULL); }
+
 u16 FASTCALL MappedMemoryReadWordNocache(u32 addr, u32 * cycle){ return MappedMemoryReadWord(addr, NULL); }
 u32 FASTCALL MappedMemoryReadLongNocache(u32 addr, u32 * cycle){ return MappedMemoryReadLong(addr, NULL); }
 void FASTCALL MappedMemoryWriteByteNocache(u32 addr, u8 val, u32 * cycle){ MappedMemoryWriteByte(addr,val, NULL);  }
@@ -514,6 +532,9 @@ static u8 FASTCALL BupRamMemoryReadByte(u32 addr)
     addr = addr & 0x0000FFFF;
   }
   //printf("BupRamMemoryReadByte %08X\n",addr);
+  /* The backup RAM is a 16-bit device with only its high byte wired up, so
+     software reaches byte N through the odd address 2N+1; even addresses read
+     back 0xFF.  Kronos maps it the same way. */
   return T1ReadByte(BupRam, addr);
 }
 
@@ -521,16 +542,16 @@ static u8 FASTCALL BupRamMemoryReadByte(u32 addr)
 
 static u16 FASTCALL BupRamMemoryReadWord(USED_IF_DEBUG u32 addr)
 {
-   LOG("bup\t: BackupRam read word - %08X\n", addr);
-   return 0;
+   // LOG("bup\t: BackupRam read word - %08X\n", addr);
+   return (BupRamMemoryReadByte(addr | 0x1) << 8);
 }
 
 //////////////////////////////////////////////////////////////////////////////
 
 static u32 FASTCALL BupRamMemoryReadLong(USED_IF_DEBUG u32 addr)
 {
-   LOG("bup\t: BackupRam read long - %08X\n", addr);
-   return 0;
+   // LOG("bup\t: BackupRam read long - %08X\n", addr);
+   return ((BupRamMemoryReadByte(addr | 0x1) << 8) || (BupRamMemoryReadByte(addr | 0x3) << 16));
 }
 
 //////////////////////////////////////////////////////////////////////////////
@@ -570,21 +591,28 @@ static void FASTCALL BupRamMemoryWriteByte(u32 addr, u8 val)
     addr = addr & 0x0000FFFF;
   }
   //printf("BupRamMemoryWriteByte %08X\n",addr);
+  /* See BupRamMemoryReadByte: only the odd (high-byte) addresses are stored. */
   T1WriteByte(BupRam, addr|0x1, val);
+#ifdef YAB_STV_DEBUG
+  { static unsigned int nb=0; if (nb<40) { printf("[BRAMW] addr=%08x val=%02x M=%08x S=%08x\n", addr, val, MSH2?MSH2->regs.PC:0, SSH2?SSH2->regs.PC:0); fflush(stdout); nb++; } }
+#endif
 }
 
 //////////////////////////////////////////////////////////////////////////////
 
 static void FASTCALL BupRamMemoryWriteWord(USED_IF_DEBUG u32 addr, UNUSED u16 val)
 {
-   LOG("bup\t: BackupRam write word - %08X\n", addr);
+   // LOG("bup\t: BackupRam write word - %08X %x\n", addr, val);
+   BupRamMemoryWriteByte(addr | 0x1, (val>>8) & 0xFF);
 }
 
 //////////////////////////////////////////////////////////////////////////////
 
 static void FASTCALL BupRamMemoryWriteLong(USED_IF_DEBUG u32 addr, UNUSED u32 val)
 {
-   LOG("bup\t: BackupRam write long - %08X\n", addr);
+   // LOG("bup\t: BackupRam write long - %08X %x\n", addr, val);
+   BupRamMemoryWriteByte(addr | 0x1, (val>>8) & 0xFF);
+   BupRamMemoryWriteByte(addr | 0x3, (val>>24) & 0xFF);
 }
 
 //////////////////////////////////////////////////////////////////////////////
@@ -644,6 +672,15 @@ void MappedMemoryInit()
                                 &LowWramMemoryWriteByte,
                                 &LowWramMemoryWriteWord,
                                 &LowWramMemoryWriteLong);
+   /* ST-V IOGA ports (JAMMA cabinet inputs).  Without this mapping the
+      whole 0x040 area falls through to Unhandled* and the BIOS reads 0,
+      so the test menu never sees a key press. */
+   FillMemoryArea(0x040, 0x041, &IOPortReadByte,
+                                &IOPortReadWord,
+                                &UnhandledMemoryReadLong,
+                                &IOPortWriteByte,
+                                &UnhandledMemoryWriteWord,
+                                &UnhandledMemoryWriteLong);
    FillMemoryArea(0x100, 0x17F, &UnhandledMemoryReadByte,
                                 &UnhandledMemoryReadWord,
                                 &UnhandledMemoryReadLong,
@@ -859,6 +896,12 @@ u8 FASTCALL MappedMemoryReadByte(u32 addr, u32 * cycle)
     *cycle = getMemClock(addr);
   }
 
+#ifdef YAB_STV_DEBUG
+   if (yabsys.isSTV && MSH2 && MSH2->regs.PC >= 0x4ec0 && MSH2->regs.PC < 0x4f00) {
+      static unsigned int stv_bdbg = 0;
+      if (stv_bdbg < 80) { printf("[TRBYTE] pc=%08x rdb %08x\n", MSH2->regs.PC, addr); stv_bdbg++; }
+   }
+#endif
    switch (addr >> 29)
    {
       case 0x0:
@@ -925,7 +968,15 @@ u16 FASTCALL MappedMemoryReadWord(u32 addr, u32 * cycle){
 u16 FASTCALL MappedMemoryReadWordNocache(u32 addr, u32 * cycle)
 #else
 u16 MappedMemoryReadInst(u32 addr, u32 * cycle) {
+#ifdef YAB_STV_DEBUG
+  u16 r;
+  stv_in_fetch = 1;
+  r = MappedMemoryReadWord(addr,cycle);
+  stv_in_fetch = 0;
+  return r;
+#else
   return MappedMemoryReadWord(addr,cycle);
+#endif
 }
 u16 FASTCALL MappedMemoryReadWord(u32 addr, u32 * cycle)
 #endif
@@ -942,6 +993,15 @@ u16 FASTCALL MappedMemoryReadWord(u32 addr, u32 * cycle)
       {
          // Cache/Non-Cached
          u16 rtn = ReadWordList[(addr >> 16) & 0xFFF](addr);
+#ifdef YAB_STV_DEBUG
+           if (yabsys.isSTV && !stv_in_fetch && MSH2 && MSH2->regs.PC >= 0x4e00 && MSH2->regs.PC < 0x4f80) {
+              static unsigned int stv_memdbg = 0;
+              if (stv_memdbg < 200) {
+                 printf("[TRMEM] pc=%08x rdw %08x = %04x\n", MSH2->regs.PC, addr, rtn);
+                 stv_memdbg++;
+              }
+           }
+#endif
          //if( (addr&0xF0000000) == 0x20000000 ){
          //  LOG("[%s] %zu-byte read address=0x%08x value=0x%x\n", CurrentSH2->isslave ? "SH2-S" : "SH2-M", 2, addr, rtn);
          //}
@@ -1068,6 +1128,14 @@ void FASTCALL MappedMemoryWriteByteNocache(u32 addr, u8 val, u32 * cycle)
 void FASTCALL MappedMemoryWriteByte(u32 addr, u8 val, u32 * cycle)
 #endif
 {
+   /* Invalidate any dynarec block covering this address: ST-V games
+      (and a few Saturn ones) rewrite code in work RAM and expect the
+      new instructions to take effect immediately.  Kronos notifies on
+      every CPU write path; without it the dynarec keeps running the
+      stale translation and the game's logic silently diverges. */
+   SH2WriteNotify(addr, 1);
+
+
   //if ((addr & 0x0FFFFFFF) == 0x060f9600) {
   //  LOG("[%s] %d Write %zu-byte write of 0x%08x to 0x%08x PC=%08X frame=%d:%d", CurrentSH2->isslave ? "SH2-S" : "SH2-M", CurrentSH2->cycles, 1, val, addr, CurrentSH2->regs.PC, yabsys.frame_count, yabsys.LineCount);
     //if (slogp != NULL){
@@ -1079,6 +1147,11 @@ void FASTCALL MappedMemoryWriteByte(u32 addr, u8 val, u32 * cycle)
     *cycle = getMemClock(addr);
   }
 
+#ifdef YAB_STV_DEBUG
+   if (yabsys.isSTV && CurrentSH2 && addr == 0x0600065a && stv_wdbg < 60) {
+      printf("[TRWRITE] pc=%08x w8 %08x = %x\n", CurrentSH2->regs.PC, addr, val); stv_wdbg++;
+   }
+#endif
   switch (addr >> 29)
    {
       case 0x0:
@@ -1139,10 +1212,23 @@ void FASTCALL MappedMemoryWriteWordNocache(u32 addr, u16 val, u32 * cycle)
 void FASTCALL MappedMemoryWriteWord(u32 addr, u16 val, u32 * cycle )
 #endif
 {
+   /* Invalidate any dynarec block covering this address: ST-V games
+      (and a few Saturn ones) rewrite code in work RAM and expect the
+      new instructions to take effect immediately.  Kronos notifies on
+      every CPU write path; without it the dynarec keeps running the
+      stale translation and the game's logic silently diverges. */
+   SH2WriteNotify(addr, 2);
+
+
   if (cycle != NULL) {
     *cycle = getMemClock(addr);
   }
 
+#ifdef YAB_STV_DEBUG
+   if (yabsys.isSTV && CurrentSH2 && addr == 0x0600065a && stv_wdbg < 60) {
+      printf("[TRWRITE] pc=%08x w16 %08x = %x\n", CurrentSH2->regs.PC, addr, val); stv_wdbg++;
+   }
+#endif
    switch (addr >> 29)
    {
       case 0x0:
@@ -1207,6 +1293,14 @@ void FASTCALL MappedMemoryWriteLongNocache(u32 addr, u32 val , u32 * cycle)
 void FASTCALL MappedMemoryWriteLong(u32 addr, u32 val, u32 * cycle )
 #endif
 {
+   /* Invalidate any dynarec block covering this address: ST-V games
+      (and a few Saturn ones) rewrite code in work RAM and expect the
+      new instructions to take effect immediately.  Kronos notifies on
+      every CPU write path; without it the dynarec keeps running the
+      stale translation and the game's logic silently diverges. */
+   SH2WriteNotify(addr, 4);
+
+
 #if 0   
    if( (addr & 0x0FFFFFFF) == 0x060f9600){
      LOG("[%s] %d Write %zu-byte write of 0x%08x to 0x%08x PC=%08X frame=%d:%d", CurrentSH2->isslave ? "SH2-S" : "SH2-M", CurrentSH2->cycles, 4, val, addr, CurrentSH2->regs.PC, yabsys.frame_count, yabsys.LineCount);
@@ -1220,6 +1314,11 @@ void FASTCALL MappedMemoryWriteLong(u32 addr, u32 val, u32 * cycle )
      *cycle = getMemClock(addr);
    }
 
+#ifdef YAB_STV_DEBUG
+   if (yabsys.isSTV && CurrentSH2 && addr == 0x0600065a && stv_wdbg < 60) {
+      printf("[TRWRITE] pc=%08x w32 %08x = %x\n", CurrentSH2->regs.PC, addr, val); stv_wdbg++;
+   }
+#endif
    switch (addr >> 29)
    {
       case 0x0:
@@ -1399,7 +1498,14 @@ int MappedMemoryLoadExec(const char *filename, u32 pc)
 
 int LoadBios(const char *filename)
 {
-   return T123Load(BiosRom, 0x80000, 2, filename);
+   /* On ST-V the ST-V BIOS is already in BiosRom (installed by stv.c); loading the
+      Saturn BIOS on top of it would clobber it.  Ported from libretro/yabause@kronos. */
+   int ret = 0;
+   if (yabsys.isSTV == 0)
+      ret = T123Load(BiosRom, 0x80000, 2, filename); // Saturn
+   if (yabsys.isSTV) YuiMsg("ST-V Emulation mode\n");
+   else YuiMsg("Saturn Emulation mode\n");
+   return ret;
 }
 
 //////////////////////////////////////////////////////////////////////////////
@@ -1409,6 +1515,14 @@ int LoadBackupRam(const char *filename)
    return T123Load(BupRam, 0x10000, 1, filename);
 }
 
+/* Classic yabause card layout: the backup RAM is a byte-wide device whose
+   bytes live at ODD offsets, with 0xFF in the even (unconnected) ones, so the
+   header is stored interleaved and the empty fill is 0xFF/0x00 pairs.
+   ac63199e switched this to Kronos' dense layout in the same commit that fixed
+   the ST-V credits, which silently made every card written by an earlier core
+   (and by the shipping h700 core) unreadable: a real BIOS then answers
+   "The System Memory is not ready for use."  The dense layout was never needed
+   for the credit fix -- that was yinit.extend_backup = 0. */
 static u8 header[32] = {
   0xFF, 'B', 0xFF, 'a', 0xFF, 'c', 0xFF, 'k',
   0xFF, 'U', 0xFF, 'p', 0xFF, 'R', 0xFF, 'a',

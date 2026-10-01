@@ -52,6 +52,7 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301  USA
 #include "cheat.h"
 #include "cs0.h"
 #include "cs2.h"
+#include "stv.h"
 #include "debug.h"
 #include "error.h"
 #include "memory.h"
@@ -182,6 +183,7 @@ YabEventQueue * q_scsp_frame_start;
 YabEventQueue * q_scsp_finish;
 
 
+
 int YabauseInit(yabauseinit_struct *init)
 {
 
@@ -276,6 +278,19 @@ int YabauseInit(yabauseinit_struct *init)
       return -1;
    }
 
+   /* ST-V: identify/assemble the romset into the CART_ROMSTV board image.
+      Ported from libretro/yabause@kronos (ctrl/src/yabause.c), but gated on the
+      cart type: Kronos calls this unconditionally and relies on STVInit()'s
+      carttype check, which returns -1 before that check when romset is NULL. */
+   if (init->carttype == CART_ROMSTV &&
+       STVSingleInit(init->stvgamepath, init->stvbiospath, init->eepromdir, init->stv_favorite_region) != 0) {
+     if (STVInit(init->stvgame, init->cartpath, init->eepromdir, init->stv_favorite_region) != 0)
+     {
+       YabSetError(YAB_ERR_CANNOTINIT, _("STV emulation"));
+       return -1;
+     }
+   }
+
    MappedMemoryInit();
 
    VideoSetSetting(VDP_SETTING_RBG_USE_COMPUTESHADER, init->rbg_use_compute_shader);
@@ -344,6 +359,9 @@ int YabauseInit(yabauseinit_struct *init)
       return -1;
    }
 
+   /* Kronos' SmpcInit() takes the SMPC/BIOS-settings path and the boot
+      language; this tree has no smpcpath plumbing yet (SmpcSaveBiosSettings()
+      simply returns -1 when it is NULL) and defaults to English. */
    if (SmpcInit(init->regionid, init->clocksync, init->basetime) != 0)
    {
       YabSetError(YAB_ERR_CANNOTINIT, _("SMPC"));
@@ -372,6 +390,10 @@ int YabauseInit(yabauseinit_struct *init)
    OSDChangeCore(OSDCORE_DEFAULT);
 #endif
 
+   /* ST-V has no Saturn BIOS: never fall back to the HLE BIOS (it would
+      overwrite the ST-V BIOS that stv.c installed in BiosRom).
+      Ported from libretro/yabause@kronos (ctrl/src/yabause.c). */
+   if (yabsys.isSTV == 0) {
    if (init->biospath != NULL && strlen(init->biospath))
    {
       if (LoadBios(init->biospath) != 0)
@@ -388,11 +410,22 @@ int YabauseInit(yabauseinit_struct *init)
      T2WriteLong(BiosRom,0x00000018, 0x20000222); // patch for SAKURA TAISEN
      T2WriteLong(BiosRom,0x00000220, 0x277AAFFE); // patch for SAKURA TAISEN
    }
+   }
+   else {
+      /* ST-V: HLE BIOS is only reachable when the experiment switch is on. */
+      const char *hle = getenv("YAB_STV_HLE");
+      if (hle && strcmp(hle, "1") == 0) {
+         yabsys.emulatebios = 1;
+         T2WriteLong(BiosRom, 0x04, 0x06002000); // set base stack pointer
+      } else {
+         yabsys.emulatebios = 0;
+      }
+   }
 
    yabsys.usequickload = 0;
 
    #if defined(SH2_DYNAREC)
-   if(SH2Core->id==2) {
+   if(SH2Core->id==3) /* SH2CORE_DYNAMIC, see DynarecSh2CInterface.cpp */ {
      sh2_dynarec_init();
    }
    #endif
@@ -489,6 +522,8 @@ void YabFlushBackups(void)
 //////////////////////////////////////////////////////////////////////////////
 
 void YabauseDeInit(void) {
+
+   STVDeInit();
    
   OSDDeInit();
    Vdp2DeInit();
@@ -548,7 +583,7 @@ void YabauseResetNoLoad(void) {
    // Reset CS0 area here
    // Reset CS1 area here
    Cs2Reset();
-   ScuReset();
+   ScuReset(1);
    ScspReset();
    Vdp1Reset();
    Vdp2Reset();
@@ -661,8 +696,29 @@ u64 getM68KCounter();
 u64 g_m68K_dec_cycle = 0;
 
 
+
 int YabauseEmulate(void) {
    int oneframeexec = 0;
+   /* Where is the machine stuck?  The dynarec only syncs regs.PC at block
+    * boundaries, so run with YAB_SH2=interp when using this. */
+   if (getenv("YAB_PCDBG") && (yabsys.frame_count % 10) == 0)
+      printf("[PCDBG] f=%u M=%08X S=%08X line=%d smpc(COM=%02X SF=%02X IREG0=%02X DDR=%02X,%02X)\n",
+             (unsigned)yabsys.frame_count,
+             MSH2 ? (unsigned)MSH2->regs.PC : 0,
+             SSH2 ? (unsigned)SSH2->regs.PC : 0,
+             yabsys.LineCount,
+             SmpcRegs ? (unsigned)SmpcRegs->COMREG : 0,
+             SmpcRegs ? (unsigned)SmpcRegs->SF : 0,
+             SmpcRegs ? (unsigned)SmpcRegs->IREG[0] : 0,
+             SmpcRegs ? (unsigned)SmpcRegs->DDR[0] : 0,
+             SmpcRegs ? (unsigned)SmpcRegs->DDR[1] : 0);
+   static int dbg_lc_prev = 0;
+   /* Frame end is driven by a frame-local line counter, NOT by yabsys.LineCount:
+    * the latter is a global that YabauseChangeTiming() (CLKCHG) and the savestate
+    * loader rename, and a mid-frame rewrite used to make a frame 1.5x-4x long --
+    * which is how cotton2 lost its video handshake at the 352x246 -> 352x224
+    * switch.  yabsys.LineCount is still maintained because VDP2 needs it. */
+   int local_line = 0;
    yabsys.frame_count++;
    #if !(defined(__LIBRETRO__))
    PlayRecorder_proc(yabsys.frame_count);
@@ -719,7 +775,7 @@ int YabauseEmulate(void) {
    //DoMovie();
 
    #if defined(SH2_DYNAREC)
-   if(SH2Core->id==2) {
+   if(SH2Core->id==3) /* SH2CORE_DYNAMIC, see DynarecSh2CInterface.cpp */ {
      if (yabsys.IsPal)
        YabauseDynarecOneFrameExec(722,0); // m68kcycles,m68kcenticycles
      else
@@ -741,7 +797,6 @@ int YabauseEmulate(void) {
    while (!oneframeexec)
    {
       PROFILE_START("Total Emulation");
-
       // Since we run the SCU with half the number of cycles we send
       // to SH2Exec(), we always compute an even number of cycles here
       // and leave any odd remainder in SH2CycleFrac.
@@ -797,8 +852,9 @@ int YabauseEmulate(void) {
          PROFILE_STOP("SCSP");
          yabsys.DecilineCount = 0;
          yabsys.LineCount++;
+         local_line++;
 
-         if (yabsys.LineCount == yabsys.VBlankLineCount) {
+         if (local_line == yabsys.VBlankLineCount) {
 
 #if defined(ASYNC_SCSP)
             setM68kCounter((u64)(44100 * 256 / 60) << SCSP_FRACTIONAL_BITS);
@@ -807,13 +863,20 @@ int YabauseEmulate(void) {
             // VBlankIN
             SmpcINTBACKEnd();
             Vdp2VBlankIN();
+            /* Publish the frame's snapshot table HERE, not at frame end: this
+             * runs right after Vdp2VBlankIN() has synchronised with the VDP
+             * worker (the worker blocks on its event queue until the next
+             * frame), so the publish cannot tear a table the worker is reading.
+             * (Doing it at frame end raced: the worker renders VDPEV_VBLANK_OUT
+             * while the main thread memcpy's over the table it is reading.) */
+            Vdp2LinesSwap();
 #if defined(ASYNC_SCSP)
             SyncCPUtoSCSP();
 #endif
             PROFILE_STOP("vblankin");
             CheatDoPatches();
          }
-         else if (yabsys.LineCount == yabsys.MaxLineCount)
+         else if (local_line == yabsys.MaxLineCount)
          {
             // VBlankOUT
             PROFILE_START("VDP1/VDP2");
@@ -834,6 +897,13 @@ int YabauseEmulate(void) {
 
       yabsys.UsecFrac += usecinc;
       PROFILE_START("SMPC");
+      /* Kronos' SMPC timing constants are in per-line units where 1 unit = 250 us
+       * (its own comment says "4.5ms => 18"), while this frame loop advances in
+       * microseconds.  Feed it Kronos units so the constants mean what they say. */
+      /* The ported Kronos SMPC constants are ~40x smaller than this tree's
+       * microsecond-calibrated ones (its INTBACK is 400 where the old one is
+       * 16000), so scale the time fed in by 1/40.  (1/250 -- the "1 unit =
+       * 250us" reading -- was far too slow: it silenced the sound CPU.) */
       SmpcExec(yabsys.UsecFrac >> YABSYS_TIMING_BITS);
       PROFILE_STOP("SMPC");
       PROFILE_START("CDB");

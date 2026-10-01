@@ -3159,6 +3159,11 @@ FASTCALL void SH2DebugInterpreterExec(SH2_struct *context, u32 cycles)
       // Execute it
       opcodes[context->instruction](context);
 
+      /* Per-instruction interrupt check (Kronos does this from decodeInt(),
+         which it installs in its per-address opcode cache).  Checking only
+         once per Exec() call delays dispatch by up to a whole frame. */
+      SH2HandleInterrupts(context);
+
 #ifdef SH2_UBC
 	  if (ubcinterrupt)
 	     SH2UBCInterrupt(context, ubcflag);
@@ -3209,9 +3214,29 @@ FASTCALL void SH2InterpreterExec(SH2_struct *context, u32 cycles)
       //context->instruction =  MappedMemoryReadWord(context->regs.PC,NULL);  //fetchlist[(context->regs.PC >> 20) & 0x0FF](context->regs.PC);
 
         context->instruction = MappedMemoryReadInst(context->regs.PC, NULL);// fetchlist[(context->regs.PC >> 20) & 0x0FF](context->regs.PC);
+#ifdef YAB_STV_DEBUG
+        /* ST-V bring-up trace: the BIOS hangs at 0x234 because the check at
+           0xd24 returns false, so follow both ranges instruction by instruction. */
+        {
+           static unsigned int stv_trace = 0;
+           if (yabsys.isSTV && stv_trace < 3000 && context->regs.PC >= 0x4f00 && context->regs.PC < 0x4f40) {
+              printf("[TR] pc=%08x op=%04x R0=%08x R1=%08x R2=%08x R3=%08x R4=%08x R7=%08x R8=%08x R9=%08x R10=%08x R11=%08x R12=%08x R13=%08x R14=%08x R15=%08x GBR=%08x SR=%08x\n",
+                     context->regs.PC, context->instruction,
+                     context->regs.R[0], context->regs.R[1], context->regs.R[2], context->regs.R[3],
+                     context->regs.R[4], context->regs.R[7], context->regs.R[8], context->regs.R[9],
+                     context->regs.R[10], context->regs.R[11], context->regs.R[12], context->regs.R[13],
+                     context->regs.R[14], context->regs.R[15],
+                     context->regs.GBR, context->regs.SR);
+              stv_trace++;
+           }
+        }
+#endif
 
       // Execute it
       opcodes[context->instruction](context);
+
+      /* Same per-instruction interrupt check as above. */
+      SH2HandleInterrupts(context);
    }
 
    context->pre_cycle = context->cycles - target_cycle;

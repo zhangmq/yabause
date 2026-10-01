@@ -54,6 +54,8 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301  USA
 #define CART_ROM16MBIT          9
 #define CART_JAPMODEM          10
 #define CART_USBDEV            11
+#define CART_ROMSTV            12
+#define CART_ROMSTV_SIZE       0x3000000 /* 48 MiB, matches Kronos CART_ROMSTV */
 
 typedef struct
 {

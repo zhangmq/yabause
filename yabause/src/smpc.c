@@ -41,9 +41,11 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301  USA
     \brief SMPC emulation functions.
 */
 
+#include <unistd.h>
 #include <stdlib.h>
 #include <time.h>
 #include "smpc.h"
+#include "eeprom.h"
 #include "cs2.h"
 #include "debug.h"
 #include "peripheral.h"
@@ -67,6 +69,14 @@ u8 * SmpcRegsT;
 SmpcInternal * SmpcInternalVars = NULL;
 int intback_wait_for_line = 0;
 u8 bustmp = 0;
+
+/* ST-V: the 68k sound CPU is started/stopped through PDR2 bit 0x10
+   (ported from libretro/yabause@kronos smpc.c; see critical fact 26). */
+static u8 m_pdr1_readback = 0;
+static u8 m_pdr2_readback = 0;
+#ifdef YAB_STV_DEBUG
+static unsigned int stv_smpc_dbg = 0;
+#endif
 
 //////////////////////////////////////////////////////////////////////////////
 
@@ -150,6 +160,9 @@ void SmpcReset(void) {
 
    memset((void *)&SmpcInternalVars->port1, 0, sizeof(PortData_struct));
    memset((void *)&SmpcInternalVars->port2, 0, sizeof(PortData_struct));
+   /* Kronos sets this in SmpcReset; without it OREG[31] stays 0 after the
+      memset and the ST-V BIOS never sees the 0xD it polls for. */
+   SmpcRegs->OREG[31] = 0xD;
 }
 
 //////////////////////////////////////////////////////////////////////////////
@@ -167,14 +180,22 @@ static void SmpcSSHOFF(void) {
 //////////////////////////////////////////////////////////////////////////////
 
 static void SmpcSNDON(void) {
-   M68KStart();
+   if (!yabsys.isSTV) M68KStart(); // C68k wire is controlled by pdr2 on STV
    SmpcRegs->OREG[31] = 0x6;
 }
 
 //////////////////////////////////////////////////////////////////////////////
 
+/* SYSRES: on the Saturn this would reset the console; the SMPC registers
+   themselves survive, so OREG[31] becomes 0x0D and the BIOS's next boot sees
+   it and continues past the check at 0xd24.  Kronos does exactly this
+   (SmpcSYSRES + SF = 0) and it was missing from our port. */
+static void SmpcSYSRES(void) {
+   SmpcRegs->OREG[31] = 0xD;
+}
+
 static void SmpcSNDOFF(void) {
-   M68KStop();
+   if (!yabsys.isSTV) M68KStop(); // C68k wire is controlled by pdr2 on STV
    SmpcRegs->OREG[31] = 0x7;
 }
 
@@ -184,7 +205,7 @@ void SmpcCKCHG352(void) {
    // Reset VDP1, VDP2, SCU, and SCSP
    Vdp1Reset();  
    Vdp2Reset();  
-   ScuReset();  
+   ScuReset(0);  
    ScspReset();  
 
    // Clear VDP1/VDP2 ram
@@ -207,7 +228,7 @@ void SmpcCKCHG320(void) {
    // Reset VDP1, VDP2, SCU, and SCSP
    Vdp1Reset();  
    Vdp2Reset();  
-   ScuReset();  
+   ScuReset(0);  
    ScspReset();  
 
    // Clear VDP1/VDP2 ram
@@ -454,7 +475,12 @@ static void SmpcINTBACKPeripheral(void) {
 
 static void SmpcINTBACK(void) {
    SmpcRegs->SF = 1;
-   if (SmpcInternalVars->intback) {
+   /* Peripheral (pad) data must be available in a CONTINUOUS mode: Kronos keeps
+    * returning it while firstPeri == 1, whereas this tree cleared "intback" at
+    * every INTBACK end and then went silent for requests that ask for neither
+    * status bit 0 nor peripheral data -- measured: ZERO peripheral responses in
+    * a whole run, which is why the pad (and START) never reached the game. */
+   if (SmpcInternalVars->firstPeri == 1) {
       SmpcINTBACKPeripheral();
       ScuSendSystemManager();
       return;
@@ -464,8 +490,8 @@ static void SmpcINTBACK(void) {
    //rather than having to set 0x40 in response to an interrupt
    if ((SmpcInternalVars->intbackIreg0 = (SmpcRegs->IREG[0] & 1))) {
       // Return non-peripheral data
-      SmpcInternalVars->firstPeri = 1;
-      SmpcInternalVars->intback = (SmpcRegs->IREG[1] & 0x8) >> 3; // does the program want peripheral data too?
+      SmpcInternalVars->firstPeri = (SmpcRegs->IREG[1] & 0x8) >> 3; // only if the program wants peripheral data
+      SmpcInternalVars->intback = (SmpcRegs->IREG[1] & 0x8) >> 3;
       SmpcINTBACKStatus();
       SmpcRegs->SR = 0x4F | (SmpcInternalVars->intback << 5); // the low nibble is undefined(or 0xF)
       ScuSendSystemManager();
@@ -546,9 +572,14 @@ void SmpcExec(s32 t) {
 
       SmpcInternalVars->timing -= t;
       if (SmpcInternalVars->timing <= 0) {
+#ifdef YAB_STV_DEBUG
+         if (yabsys.isSTV) printf("[SMPCDBG] exec COMREG=%02x\n", SmpcRegs->COMREG);
+#endif
          switch(SmpcRegs->COMREG) {
             case 0x0:
                SMPCLOG("smpc\t: MSHON not implemented\n");
+               SmpcRegs->OREG[31] = 0x0;
+               SmpcRegs->SF = 0;
                break;
             case 0x2:
                SMPCLOG("smpc\t: SSHON\n");
@@ -568,12 +599,16 @@ void SmpcExec(s32 t) {
                break;
             case 0x8:
                SMPCLOG("smpc\t: CDON not implemented\n");
+               SmpcRegs->SF = 0;
                break;
             case 0x9:
                SMPCLOG("smpc\t: CDOFF not implemented\n");
+               SmpcRegs->SF = 0;
                break;
             case 0xD:
                SMPCLOG("smpc\t: SYSRES not implemented\n");
+               SmpcSYSRES();
+               SmpcRegs->SF = 0;
                break;
             case 0xE:
                SMPCLOG("smpc\t: CKCHG352\n");
@@ -617,8 +652,37 @@ void SmpcExec(s32 t) {
 
 u8 FASTCALL SmpcReadByte(u32 addr) {
    addr &= 0x7F;
+   if (addr == 0x05F && yabsys.isSTV) {
+      /* Return the real OREG[31].  A hardcoded 0xF0 here (the old hack) made
+         the BIOS boot but also masked every handshake value the game polls
+         for (0x10/0x17/0x18/0x19/0x1A), so coin credits never updated. */
+      return SmpcRegs->OREG[31];
+   }
+     if (addr == 0x077) {
+        /* PDR2 read-back.  Kronos reads the EEPROM DO bit here (not from PDR1):
+           when DDR2 is 0x18 the byte carries eeprom_do_read() in bit 0.  The ST-V
+           BIOS bit-bangs the EEPROM through PDR1 and polls the DO line through
+           PDR2, so without this it never sees a 1. */
+        if ((SmpcRegs->DDR[1] & 0x7F) == 0x18) {
+           return (u8)((((0x67 & ~0x19) | 0x18 | (eeprom_do_read() << 0)) & ~SmpcRegs->DDR[1]) | m_pdr2_readback);
+        }
+        return SmpcRegsT[addr >> 1];
+     }
+     if (addr == 0x075) {
+        /* PDR1 read-back: the ST-V BIOS polls this for the EEPROM DO bit (bit 0).
+           Ported from Kronos -- without it the poll at 0x4ed8 never sees a 1. */
+        if ((SmpcRegs->DDR[0] & 0x7F) == 0x3f) {
+           return (u8)((((0x40 & 0x40) | 0x3f) & ~SmpcRegs->DDR[0]) | m_pdr1_readback);
+        }
+        return SmpcRegsT[addr >> 1];
+     }
    if (addr == 0x063) {
-     bustmp &= ~0x01;
+     /* Kronos semantics: the 0x63 read returns the register array byte with the
+        SF flag in bit 0, NOT the last written byte.  Measured at frame 8: the
+        two builds hand the BIOS completely different handshake values here
+        (old: 10 01 02 02 01 1A 0E ... ; ported: 00 01 00 00 01 00 ...), and that
+        first divergence is where the game decides whether to use INTBACK. */
+     bustmp = SmpcRegsT[addr >> 1] & 0xFE;
      bustmp |= SmpcRegs->SF;
      return bustmp;
    }
@@ -688,7 +752,19 @@ static void SmpcSetTiming(void) {
                intback_wait_for_line = 1;
             }
             else {
+              /* Any other IREG[0] still has to be given a timing.  cotton2 asks
+                 for INTBACK with IREG[0] = 0xFF / 0x80 (bit 0 = the status
+                 request, the high nibble = the port mode), which matches
+                 neither "0x01" nor "0" above.  The old code fell through here
+                 and left `timing` at 0, so SmpcExec never ran the command:
+                 SmpcINTBACK() was never called, SR stayed 0, and the game span
+                 forever on SR(0x61) instead of reading the INTBACK payload --
+                 which is exactly why the pad data (and START) never arrived.
+                 Kronos gives this branch `timing = 10` in its own 250us unit,
+                 i.e. ~2.5ms; we use our status-path value (250us) so the
+                 command always completes well inside the frame the game polls. */
               SMPCLOG("smpc\t: unimplemented command: %02X\n", SmpcRegs->COMREG);
+              SmpcInternalVars->timing = 250;
               SmpcRegs->SF = 0;
             }
          }
@@ -739,23 +815,38 @@ u8 do_th_mode(u8 val)
 //////////////////////////////////////////////////////////////////////////////
 
 void FASTCALL SmpcWriteByte(u32 addr, u8 val) {
+#ifdef YAB_STV_DEBUG
+   if (yabsys.isSTV && stv_smpc_dbg < 300) {
+      printf("[SMPCDBG] w %02x = %02x (COMREG=%02x SF=%02x DDR=%02x,%02x PDR=%02x,%02x)\n",
+             addr & 0x7F, val, SmpcRegs->COMREG, SmpcRegs->SF,
+             SmpcRegs->DDR[0], SmpcRegs->DDR[1], SmpcRegs->PDR[0], SmpcRegs->PDR[1]);
+      stv_smpc_dbg++;
+   }
+#endif
    addr &= 0x7F;
    bustmp = val;
    SmpcRegsT[addr >> 1] = val;
 
    switch(addr) {
       case 0x01: // Maybe an INTBACK continue/break request
-         if (SmpcInternalVars->intback)
+         /* Aligned with Kronos (see .notes/smpc-port/smpc.c.kronos-ported).
+            The old gate was "if (intback)", and intback is cleared at every
+            INTBACK end, so cotton2's continue/break writes were dropped; the
+            game then stopped using INTBACK altogether (measured: ZERO INTBACK
+            requests in a whole run) and fell back to register polling, where
+            START never arrives.  Gate on firstPeri/timing as Kronos does, clear
+            SF on break, and do not rewrite COMREG on continue. */
+         if ((SmpcInternalVars->firstPeri != 0) && (SmpcInternalVars->timing <= 0))
          {
             if (SmpcRegs->IREG[0] & 0x40) {
                // Break
-               SmpcInternalVars->intback = 0;
+               SmpcInternalVars->firstPeri = 0;
                SmpcRegs->SR &= 0x0F;
+               SmpcRegs->SF = 0;
                break;
             }
-            else if (SmpcRegs->IREG[0] & 0x80) {                    
+            else if (SmpcRegs->IREG[0] & 0x80) {
                // Continue
-               SmpcRegs->COMREG = 0x10;
                SmpcSetTiming();
                SmpcRegs->SF = 1;
             }
@@ -798,17 +889,37 @@ void FASTCALL SmpcWriteByte(u32 addr, u8 val) {
 
                SmpcRegs->PDR[0] = val;
                break;
+            case 0x3f: /* EEPROM bit-bang.  ST-V needs it: the BIOS polls the DO line
+                          at 0x4ed8 and spins forever when it never reads 1.  Kronos
+                          drives the eeprom here and reads it back in SmpcReadByte(0x75). */
+               m_pdr1_readback = (val & SmpcRegs->DDR[0]) & 0x7f;
+               eeprom_set_clk((val & 0x08) ? 1 : 0);
+               eeprom_set_di((val >> 4) & 1);
+               eeprom_set_cs((val & 0x04) ? 1 : 0);
+               SmpcRegs->PDR[0] = m_pdr1_readback;
+               m_pdr1_readback |= (val & 0x80);
+               break;
             default:
                SMPCLOG("smpc\t: Peripheral Unknown Control Method not implemented\n");
                break;
          }
 			break;
-	  case 0x77: // PDR1
+	  case 0x77: // PDR2
 		  // FIX ME (should support other peripherals)
 		  switch (SmpcRegs->DDR[1] & 0x7F) { // Which Control Method do we use?
 		  case 0x00:
 			  if (PORTDATA2.data[1] == PERGUN && (val & 0x7F) == 0x7F)
 				  SmpcRegs->PDR[1] = PORTDATA2.data[2];
+			  break;
+		  case 0x18: /* ST-V sound-CPU wire: PDR2 bit 0x10 stops the 68k */
+			  m_pdr2_readback = (val & SmpcRegs->DDR[1]) & 0x7F;
+			  if (m_pdr2_readback & 0x10) {
+				  M68KStop();
+			  } else {
+				  M68KStart();
+			  }
+			  SmpcRegs->PDR[1] = m_pdr2_readback;
+			  m_pdr2_readback |= val & 0x80;
 			  break;
 		  case 0x60:
 			  switch (val & 0x60) {
@@ -975,4 +1086,5 @@ int SmpcLoadState(FILE *fp, int version, int size)
 }
 
 //////////////////////////////////////////////////////////////////////////////
-
+u32 g_pdr2_writes = 0, g_pdr2_stops = 0, g_pdr2_starts = 0;
+u8 g_pdr2_last = 0, g_ddr1_last = 0;

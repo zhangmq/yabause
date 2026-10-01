@@ -112,3 +112,6 @@ int SmpcSetClockSync(int clocksync, u32 basetime);
 #endif
 
 #endif
+
+extern u32 g_pdr2_writes, g_pdr2_stops, g_pdr2_starts;
+extern u8 g_pdr2_last, g_ddr1_last;

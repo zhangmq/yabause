@@ -197,3 +197,5 @@ extern int use_new_scsp;
 
 
 #endif
+
+/* Diagnostic accessors for the black-box recorder (test builds only). */

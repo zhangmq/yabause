@@ -11,13 +11,17 @@
 #endif
 
 #include <sys/stat.h>
+#include <strings.h>
 
 #include <libretro.h>
 
 #include <file/file_path.h>
 
+#include <unistd.h>
 #include "vdp1.h"
 #include "vdp2.h"
+#include "smpc.h"
+#include "scu.h"
 #include "peripheral.h"
 #include "cdbase.h"
 #include "yabause.h"
@@ -26,10 +30,12 @@
 
 #include "cs0.h"
 #include "cs2.h"
+#include "stv.h"
 
 #include "m68kcore.h"
 #include "vidogl.h"
 #include "vidsoft.h"
+
 #include "ygl.h"
 
 /* Core options v2 table ported from the reference libretro core
@@ -44,6 +50,13 @@ static char g_save_dir[PATH_MAX];
 static char g_system_dir[PATH_MAX];
 static char full_path[PATH_MAX];
 static char bios_path[PATH_MAX];
+/* ST-V (Sega Titan Video) -- ported from libretro/yabause@kronos */
+static char stv_bios_path[PATH_MAX];
+static char stv_eeprom_dir[PATH_MAX];
+static char *stvgame = NULL;
+static bool stv_mode = false;
+static int stv_favorite_region = STV_REGION_EU;
+static bool service_enabled = false;   /* kronos_service_enabled: Test/Service/Pause keys */
 static char bup_path[PATH_MAX];
 
 static int game_width  = 320;
@@ -158,11 +171,119 @@ void retro_set_input_state(retro_input_state_t cb) { input_state_cb = cb; }
 // PERLIBRETRO
 #define PERCORE_LIBRETRO 2
 
+/* ST-V JAMMA key maps (ported from libretro/yabause@kronos libretro.c). */
+typedef struct { unsigned id; unsigned key; unsigned player; const char *description; } KeyConfig_struct;
+
+static KeyConfig_struct system_key_config[] = {
+   { RETRO_DEVICE_ID_JOYPAD_L2, PERJAMMA_TEST,    0, "Test"    },
+   { RETRO_DEVICE_ID_JOYPAD_R2, PERJAMMA_SERVICE, 0, "Service" },
+   { RETRO_DEVICE_ID_JOYPAD_L3, PERJAMMA_PAUSE,   0, "Pause"   },
+};
+
+static KeyConfig_struct stv_key_config[] = {
+   { RETRO_DEVICE_ID_JOYPAD_SELECT, PERJAMMA_COIN1,      0, "Coin"   },
+   { RETRO_DEVICE_ID_JOYPAD_START,  PERJAMMA_START1,     0, "Start"  },
+   { RETRO_DEVICE_ID_JOYPAD_UP,     PERPAD_UP,           0, "Up"     },
+   { RETRO_DEVICE_ID_JOYPAD_RIGHT,  PERPAD_RIGHT,        0, "Right"  },
+   { RETRO_DEVICE_ID_JOYPAD_DOWN,   PERPAD_DOWN,         0, "Down"   },
+   { RETRO_DEVICE_ID_JOYPAD_LEFT,   PERPAD_LEFT,         0, "Left"   },
+   { RETRO_DEVICE_ID_JOYPAD_B,      PERPAD_A,            0, "Button1"},
+   { RETRO_DEVICE_ID_JOYPAD_A,      PERPAD_B,            0, "Button2"},
+   { RETRO_DEVICE_ID_JOYPAD_Y,      PERPAD_C,            0, "Button3"},
+   { RETRO_DEVICE_ID_JOYPAD_X,      PERPAD_X,            0, "Button4"},
+   { RETRO_DEVICE_ID_JOYPAD_SELECT, PERJAMMA_COIN2,      1, "Coin"   },
+   { RETRO_DEVICE_ID_JOYPAD_START,  PERJAMMA_START2,     1, "Start"  },
+   { RETRO_DEVICE_ID_JOYPAD_UP,     PERJAMMA_P2_UP,      1, "Up"     },
+   { RETRO_DEVICE_ID_JOYPAD_RIGHT,  PERJAMMA_P2_RIGHT,   1, "Right"  },
+   { RETRO_DEVICE_ID_JOYPAD_DOWN,   PERJAMMA_P2_DOWN,    1, "Down"   },
+   { RETRO_DEVICE_ID_JOYPAD_LEFT,   PERJAMMA_P2_LEFT,    1, "Left"   },
+   { RETRO_DEVICE_ID_JOYPAD_B,      PERJAMMA_P2_BUTTON1, 1, "Button1"},
+   { RETRO_DEVICE_ID_JOYPAD_A,      PERJAMMA_P2_BUTTON2, 1, "Button2"},
+   { RETRO_DEVICE_ID_JOYPAD_Y,      PERJAMMA_P2_BUTTON3, 1, "Button3"},
+   { RETRO_DEVICE_ID_JOYPAD_X,      PERJAMMA_P2_BUTTON4, 1, "Button4"},
+};
+
+static KeyConfig_struct* current_key_config = NULL;
+static int current_key_config_nb = 0;
+static int system_key_config_nb = 0;
+
+#define STV_KEYCFG_NB(a) ((int)(sizeof(a)/sizeof(a[0])))
+
+/* Ported from libretro/yabause@kronos.  Descriptors must be sent AFTER
+   PERLIBRETROInit() has filled system_key_config_nb/current_key_config_nb --
+   sending them from retro_load_game_common() (where those are still 0) gives
+   the frontend an EMPTY list, and minarch then marks every button as
+   unavailable and ignores it, so no input reaches the core at all. */
+static void set_descriptors(void)
+{
+   int nb_descriptors = ((stv_mode?(system_key_config_nb+current_key_config_nb):(17*players))+1);
+   struct retro_input_descriptor *input_descriptors = (struct retro_input_descriptor*)calloc(nb_descriptors, sizeof(struct retro_input_descriptor));
+
+   if(stv_mode)
+   {
+      unsigned j = 0;
+      if (service_enabled)
+      {
+         for (unsigned i = 0; i < (unsigned)system_key_config_nb; i++)
+            input_descriptors[j++] = (struct retro_input_descriptor){ system_key_config[i].player, RETRO_DEVICE_JOYPAD, 0, system_key_config[i].id, system_key_config[i].description };
+      }
+      for (unsigned i = 0; i < (unsigned)current_key_config_nb; i++)
+         input_descriptors[j++] = (struct retro_input_descriptor){ current_key_config[i].player, RETRO_DEVICE_JOYPAD, 0, current_key_config[i].id, current_key_config[i].description };
+      input_descriptors[j].description = NULL;
+   }
+   else
+   {
+      unsigned j = 0;
+      for (unsigned i = 0; i < players; i++)
+      {
+         input_descriptors[j++] = (struct retro_input_descriptor){ i, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_LEFT,  "D-Pad Left" };
+         input_descriptors[j++] = (struct retro_input_descriptor){ i, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_UP,    "D-Pad Up" };
+         input_descriptors[j++] = (struct retro_input_descriptor){ i, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_DOWN,  "D-Pad Down" };
+         input_descriptors[j++] = (struct retro_input_descriptor){ i, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_RIGHT, "D-Pad Right" };
+         input_descriptors[j++] = (struct retro_input_descriptor){ i, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_B,     "A" };
+         input_descriptors[j++] = (struct retro_input_descriptor){ i, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_A,     "B" };
+         input_descriptors[j++] = (struct retro_input_descriptor){ i, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_R,     "C" };
+         input_descriptors[j++] = (struct retro_input_descriptor){ i, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_Y,     "X" };
+         input_descriptors[j++] = (struct retro_input_descriptor){ i, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_X,     "Y" };
+         input_descriptors[j++] = (struct retro_input_descriptor){ i, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_L,     "Z" };
+         input_descriptors[j++] = (struct retro_input_descriptor){ i, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_L2,    "L" };
+         input_descriptors[j++] = (struct retro_input_descriptor){ i, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_R2,    "R" };
+         input_descriptors[j++] = (struct retro_input_descriptor){ i, RETRO_DEVICE_JOYPAD, 0, RETRO_DEVICE_ID_JOYPAD_START, "Start" };
+         input_descriptors[j++] = (struct retro_input_descriptor){ i, RETRO_DEVICE_ANALOG, RETRO_DEVICE_INDEX_ANALOG_LEFT, RETRO_DEVICE_ID_ANALOG_X,  "Analog X" };
+         input_descriptors[j++] = (struct retro_input_descriptor){ i, RETRO_DEVICE_ANALOG, RETRO_DEVICE_INDEX_ANALOG_LEFT, RETRO_DEVICE_ID_ANALOG_Y,  "Analog Y" };
+         input_descriptors[j++] = (struct retro_input_descriptor){ i, RETRO_DEVICE_ANALOG, RETRO_DEVICE_INDEX_ANALOG_RIGHT, RETRO_DEVICE_ID_ANALOG_X, "Analog X (Right)" };
+         input_descriptors[j++] = (struct retro_input_descriptor){ i, RETRO_DEVICE_ANALOG, RETRO_DEVICE_INDEX_ANALOG_RIGHT, RETRO_DEVICE_ID_ANALOG_Y, "Analog Y (Right)" };
+      }
+      input_descriptors[j].description = NULL;
+   }
+   environ_cb(RETRO_ENVIRONMENT_SET_INPUT_DESCRIPTORS, input_descriptors);
+   free(input_descriptors);
+}
+
+/* Running first frame: all device ids were set, so send the descriptors. */
+static bool all_devices_ready = false;
 int PERLIBRETROInit(void)
 {
    void *controller;
 
    uint32_t i, j;
+
+   if (stv_mode) {
+      /* Kronos only registers the system keys (Test/Service/Pause) when the
+         service option is on; the game keys are always registered. */
+      system_key_config_nb = service_enabled ? STV_KEYCFG_NB(system_key_config) : 0;
+      current_key_config_nb = STV_KEYCFG_NB(stv_key_config);
+      current_key_config = stv_key_config;
+      PerPortReset();
+      controller = (void*)PerCabAdd(NULL);
+      for (i = 0; i < (uint32_t)system_key_config_nb; i++)
+         PerSetKey(system_key_config[i].key, system_key_config[i].key, controller);
+      for (i = 0; i < (uint32_t)current_key_config_nb; i++)
+         PerSetKey(current_key_config[i].key, current_key_config[i].key, controller);
+
+      players = 2;
+      return 0;
+   }
    PortData_struct* portdata = NULL;
 
    //1 multitap + 1 peripherial
@@ -207,14 +328,16 @@ int PERLIBRETROInit(void)
 
 static int input_state_cb_wrapper(unsigned port, unsigned device, unsigned index, unsigned id)
 {
+   int r;
    if (libretro_supports_bitmasks && device == RETRO_DEVICE_JOYPAD)
    {
       if (libretro_input_bitmask[port] == -1)
          libretro_input_bitmask[port] = input_state_cb(port, RETRO_DEVICE_JOYPAD, index, RETRO_DEVICE_ID_JOYPAD_MASK);
-      return (libretro_input_bitmask[port] & (1 << id));
+      r = (libretro_input_bitmask[port] & (1 << id));
    }
    else
-      return input_state_cb(port, device, index, id);
+      r = input_state_cb(port, device, index, id);
+   return r;
 }
 
 static int PERLIBRETROHandleEvents(void)
@@ -223,6 +346,28 @@ static int PERLIBRETROHandleEvents(void)
 
    input_poll_cb();
 
+
+   if (stv_mode) {
+      /* ST-V: cabinet inputs only.  Kronos uses if/else here, so the Saturn
+         pad loop below must NOT run in ST-V mode (it would push PERPAD_* keys
+         through the shared perkeyconfig and clear the bitmask cache the ST-V
+         polling just filled). */
+      for (i = 0; i < players; i++)
+         libretro_input_bitmask[i] = -1;
+
+      for (i = 0; i < (unsigned)system_key_config_nb; i++) {
+         if (input_state_cb_wrapper(system_key_config[i].player, RETRO_DEVICE_JOYPAD, 0, system_key_config[i].id))
+            PerKeyDown(system_key_config[i].key);
+         else
+            PerKeyUp(system_key_config[i].key);
+      }
+      for (i = 0; i < (unsigned)current_key_config_nb; i++) {
+         if (input_state_cb_wrapper(current_key_config[i].player, RETRO_DEVICE_JOYPAD, 0, current_key_config[i].id))
+            PerKeyDown(current_key_config[i].key);
+         else
+            PerKeyUp(current_key_config[i].key);
+      }
+   } else {
    for(i = 0; i < players; i++)
    {
          int analog_left_x = 0;
@@ -327,6 +472,9 @@ static int PERLIBRETROHandleEvents(void)
                break;
          }
    }
+   }
+
+
 
    if ( YabauseExec() != 0 )
       return -1;
@@ -589,6 +737,8 @@ static struct {
    void (*GetFramebufferAttachmentParameteriv)(YK_Enum, YK_Enum, YK_Enum, YK_Int *);
    void (*GetIntegerv)(YK_Enum, YK_Int *);
    void (*Finish)(void);
+   void (*ReadPixels)(YK_Int, YK_Int, YK_Int, YK_Int, YK_Enum, YK_Enum, void *);
+   YK_Uint mirror_color_tex;
 } yk;
 
 #define YK_EGL_NONE              0x3038
@@ -826,6 +976,7 @@ static void yk_load(void)
          yk.GetProcAddress("glGetFramebufferAttachmentParameteriv");
    yk.GetIntegerv         = yk.GetProcAddress("glGetIntegerv");
    yk.Finish              = yk.GetProcAddress("glFinish");
+   yk.ReadPixels          = yk.GetProcAddress("glReadPixels");
 
    yk.front_fbo = (YK_Uint)(uintptr_t)hw_render.get_current_framebuffer();
    if (yk.GetIntegerv)
@@ -888,6 +1039,15 @@ static void yk_load(void)
  * work, e.g. a resolution/option change). */
 static void yk_remember_front(void);
 static void yk_restore_front(void);
+
+/* Diagnostic build: on unless YAB_YKDBG=0, because the user launches cotton2
+ * from the NextUI menu and we cannot inject environment variables there. */
+static int yk_dbg_on(void)
+{
+   static int v = -1;
+   if (v < 0) { const char *e = getenv("YAB_YKDBG"); v = (e && strcmp(e, "0") == 0) ? 0 : 1; }
+   return v;
+}
 
 static int yk_attach(void)
 {
@@ -1052,6 +1212,15 @@ int YuiRevokeOGLOnThisThread()
  * MA_GL_update_fbo_size) can get the same FBO name back from the driver and
  * would otherwise leave the mirror pointing at a deleted texture.
  * ------------------------------------------------------------------------- */
+/* Diagnostic only: read back what the ENGINE has just rendered, i.e. the mirror
+ * FBO the VDP thread draws into, and write it as a PPM on the sdcard.  The
+ * frontend's own readback cannot be trusted here (it reported nonblack=0 for
+ * cotton2 even when the game was clearly displaying something), so this is the
+ * only way to tell "the engine is producing black frames" (an emulation/VDP2
+ * problem) from "the engine is fine, the present path hands over an empty slot".
+ *   YAB_MIRROR_DUMP=<from>-<to>[:step]   e.g. 600-900:20
+ */
+
 static void yk_adopt_front_fbo(void)
 {
 #if defined(YAB_CORE_SHARED_CONTEXT)
@@ -1080,7 +1249,7 @@ static void yk_adopt_front_fbo(void)
       yk.front_tex = name;
       yk.retarget  = 1;
       yk_query_front_size((YK_Uint)name);
-      if (yk.ring_adopt_log < 24)
+      if (yk.ring_adopt_log < 400)
       {
          log_cb(RETRO_LOG_INFO, "[YK] ring adopt: front fbo=%u tex=%u\n",
                (unsigned)fbo, (unsigned)name);
@@ -1202,6 +1371,17 @@ void YuiSwapBuffers(void)
     * ygles.c's GlWidth/GlHeight are what the engine actually renders; take the
     * larger of the two.  No effect when they agree (BIOS 320x224, VF2's
     * 704x448, 352x224 games). */
+   /* DOUBLE HEIGHT only: the case this was added for renders *twice* the field
+    * height (704x448 while GetNativeResolution reports 224).  A +22 line wobble
+    * is not that, and promoting it turned one switch into two full
+    * VdpRevoke/Resize/mirror-rebuild round trips.  YAB_HEIGHT_PROMOTE=any
+    * restores the old behaviour. */
+   /* Always take the engine's render height.  An earlier version of this tried
+    * to ignore a "+22 line wobble" (352x224 -> 352x246 -> 352x224) as spurious,
+    * but that switch is part of the normal VDP2 mode change: with it suppressed
+    * cotton2's picture never comes back after the switch (verified on the
+    * device: old core reaches 352x246 and back and renders 69196 non-black
+    * pixels; the gated core produces no [res] events at all and stays black). */
    if (GlHeight > game_height) game_height = GlHeight;
    if (GlWidth  > game_width)  game_width  = GlWidth;
    if ((prev_game_width != game_width) || (prev_game_height != game_height))
@@ -1228,6 +1408,9 @@ void YuiSwapBuffers(void)
        * frontend samples the texture this thread just rendered into. */
       if (yk.Finish)
          yk.Finish();
+      {
+         static unsigned yk_dump_frame = 0;
+      }
       yk.frame_pending = 1;
       one_frame_rendered = true;
       return;
@@ -1533,6 +1716,16 @@ void check_variables(void)
          g_sh2coretype = 3;
       else if (strcmp(var.value, "interpreter") == 0)
          g_sh2coretype = SH2CORE_INTERPRETER;
+
+      /* Debug override: YAB_SH2=interp forces the interpreter even when the
+         frontend option says dynarec.  The dynarec only syncs regs.PC at block
+         boundaries, so PC-based probes read 0 and cannot tell which CPU (BIOS
+         or game) is polling the IOGA ports. */
+      {
+         const char *e = getenv("YAB_SH2");
+         if (e && strcmp(e, "interp") == 0)
+            g_sh2coretype = SH2CORE_INTERPRETER;
+      }
    }
 #endif
 
@@ -1566,6 +1759,15 @@ void check_variables(void)
          multitap[1] = 0;
       else if (strcmp(var.value, "enabled") == 0)
          multitap[1] = 1;
+   }
+   var.key = "yabasanshiro_service_enabled";
+   var.value = NULL;
+   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+   {
+      if (strcmp(var.value, "enabled") == 0)
+         service_enabled = true;
+      else
+         service_enabled = false;
    }
 
    var.key = "yabasanshiro_resolution_mode";
@@ -1635,6 +1837,9 @@ void retro_set_controller_port_device(unsigned port, unsigned device)
       pad_type[port] = device;
       if(PERCore)
          PERCore->Init();
+      // When all devices are set, we can send input descriptors
+      if (all_devices_ready)
+         set_descriptors();
    }
 }
 
@@ -1808,6 +2013,14 @@ void retro_init(void)
 
    char save_dir[PATH_MAX];
    snprintf(save_dir, sizeof(save_dir), "%s%cyabasanshiro%c", g_save_dir, slash, slash);
+   path_mkdir(save_dir);
+
+   /* ST-V EEPROM/NVRAM lives in <save_dir>/stv/ (see the eepromdir set in
+      retro_load_game).  T123Save() just fopen()s the path, so the directory
+      has to exist or every write silently fails and the machine settings
+      (credits, coin mode) are lost on exit.  Kronos creates its equivalent
+      directory the same way. */
+   snprintf(save_dir, sizeof(save_dir), "%s%cstv%c", g_save_dir, slash, slash);
    path_mkdir(save_dir);
 
    if (environ_cb(RETRO_ENVIRONMENT_GET_INPUT_BITMASKS, NULL))
@@ -2082,11 +2295,16 @@ bool retro_load_game_common()
    yinit.rotate_screen             = 0;
    yinit.skip_load                 = 0;
    yinit.polygon_generation_mode   = polygon_mode;
+   /* Back to the value committed by ac63199e.  The "= 1" that sat here was a
+    * failed experiment from the picture hunt (see .notes/STV-HANDOFF.md 79.2:
+    * reverting extend_backup alone did NOT restore the picture), but with the
+    * Kronos-aligned backup-RAM handlers that commit also introduced, leaving it
+    * at 1 breaks the ST-V BIOS' credit counting: cotton2 then shows CREDIT 0 and
+    * a coin insert never rises -- measured 2026-10-02, stvS1..stvS4. */
    yinit.extend_backup             = 0;
    yinit.buppath                   = bup_path;
    yinit.use_new_scsp              = 1;
    yinit.scsp_sync_count_per_frame = 1;
-   yinit.extend_backup             = 1;
    yinit.scsp_main_mode            = 1;
    yinit.videoformattype           = VIDEOFORMATTYPE_NTSC;
    yinit.video_filter_type         = 0;
@@ -2105,6 +2323,24 @@ bool retro_load_game(const struct retro_game_info *info)
     * playlist (disk control can swap to the other entries later). */
    disk_init_from_content(info->path);
    snprintf(full_path, sizeof(full_path), "%s", disk_paths[disk_index]);
+   /* ST-V: an ST-V game is a MAME romset zip whose entries match Kronos' GameList
+      (filename + CRC32); the ST-V BIOS is stvbios.zip. Detect it before the Saturn
+      BIOS probing below, because an ST-V game needs no Saturn BIOS. */
+   snprintf(stv_bios_path, sizeof(stv_bios_path), "%s%cstvbios.zip", g_system_dir, slash);
+   stvgame = NULL;
+   stv_mode = false;
+   {
+      const char *ext = path_get_extension(info->path);
+
+      if (ext != NULL && strcasecmp(ext, "zip") == 0)
+         STVGetSingle(info->path, stv_bios_path, &stvgame);
+      if (stvgame != NULL)
+      {
+         stv_mode = true;
+         log_cb(RETRO_LOG_INFO, "ST-V game detected: %s\n", stvgame);
+      }
+   }
+
    snprintf(bios_path, sizeof(bios_path), "%s%csaturn_bios.bin", g_system_dir, slash);
    if (does_file_exist(bios_path) != 1)
    {
@@ -2124,7 +2360,25 @@ bool retro_load_game(const struct retro_game_info *info)
    // Real bios is REQUIRED, even if we support HLE bios
    // HLE bios is deprecated and causing more issues than it solves
    // No "autoselect HLE when bios is missing" ever again !
-   if (does_file_exist(bios_path) != 1)
+   if (stv_mode)
+   {
+      if (does_file_exist(stv_bios_path) != 1)
+      {
+         /* Experiment: YAB_STV_HLE=1 lets an ST-V game run on the HLE BIOS
+            instead of aborting, to find out whether the coin path depends on
+            the real BIOS.  Kronos itself always tolerates a missing ST-V BIOS
+            (it only warns), so this is also closer to its behaviour. */
+         const char *hle = getenv("YAB_STV_HLE");
+         if (hle && strcmp(hle, "1") == 0)
+            log_cb(RETRO_LOG_WARN, "ST-V BIOS missing but YAB_STV_HLE=1 -- using HLE BIOS\n");
+         else
+         {
+            log_cb(RETRO_LOG_ERROR, "ST-V game detected but %s is missing, ABORTING\n", stv_bios_path);
+            return false;
+         }
+      }
+   }
+   else if (does_file_exist(bios_path) != 1)
    {
       log_cb(RETRO_LOG_ERROR, "We are missing the bios, ABORTING\n");
       return false;
@@ -2360,13 +2614,36 @@ bool retro_load_game(const struct retro_game_info *info)
       { 0 },
    };
 
-   environ_cb(RETRO_ENVIRONMENT_SET_INPUT_DESCRIPTORS, desc);
+   /* NOTE: descriptors are NOT sent here.  Kronos sends them from
+      set_descriptors() (first retro_run frame / port-device change), because
+      this static Saturn table has no JOYPAD_SELECT and minarch's Input_init()
+      latches on the FIRST SET_INPUT_DESCRIPTORS it ever sees -- sending this
+      one here marked Select as unavailable and swallowed the ST-V coin key. */
+   if (stv_mode)
+   {
+      /* Sega Titan Video: ROM board on CS0/CS1 assembled from the romset zip,
+         the ST-V BIOS, and a per-game NVRAM file. ST-V has no CD block. */
+      snprintf(stv_eeprom_dir, sizeof(stv_eeprom_dir), "%s%cstv%c", g_save_dir, slash, slash);
 
-   yinit.cdcoretype       = CDCORE_ISO;
-   yinit.cdpath           = full_path;
-   yinit.biospath         = (hle_bios_force ? NULL : bios_path);
-   yinit.carttype         = addon_cart_type;
-   yinit.cartpath         = "\0";
+      yinit.stvgamepath         = full_path;
+      yinit.stvgame             = stvgame;
+      yinit.stvbiospath         = stv_bios_path;
+      yinit.eepromdir           = stv_eeprom_dir;
+      yinit.stv_favorite_region = stv_favorite_region;
+      yinit.carttype            = CART_ROMSTV;
+      yinit.cartpath            = NULL;
+      yinit.cdcoretype          = CDCORE_DUMMY;
+      yinit.cdpath              = NULL;
+      yinit.biospath            = NULL;
+   }
+   else
+   {
+      yinit.cdcoretype       = CDCORE_ISO;
+      yinit.cdpath           = full_path;
+      yinit.biospath         = (hle_bios_force ? NULL : bios_path);
+      yinit.carttype         = addon_cart_type;
+      yinit.cartpath         = "\0";
+   }
 
    return retro_load_game_common();
 }
@@ -2424,6 +2701,7 @@ size_t retro_get_memory_size(unsigned id)
 void retro_deinit(void)
 {
    libretro_supports_bitmasks = false;
+   all_devices_ready = false;
 }
 
 void retro_reset(void)
@@ -2449,11 +2727,23 @@ void reset_global_gl_state()
    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);   
 }
 
+/* Per-frame trace used to find the FIRST divergence between a run that goes
+ * black and one that does not: the PC sequence up to that point is identical, so
+ * the first differing line is where the machine took a different path. */
+
 void retro_run(void)
 {
    unsigned i;
    bool updated  = false;
    one_frame_rendered = false;
+
+   if (!all_devices_ready)
+   {
+      // Running first frame, so we can assume all devices id were set
+      // Let's send input descriptors
+      all_devices_ready = true;
+      set_descriptors();
+   }
 
    if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE_UPDATE, &updated) && updated)
    {
@@ -2467,6 +2757,7 @@ void retro_run(void)
 #endif
       int prev_resolution_mode = resolution_mode;
       int prev_multitap[2] = {multitap[0],multitap[1]};
+      bool prev_service_enabled = service_enabled;
       check_variables();
       if(prev_resolution_mode != resolution_mode)
          retro_set_resolution();
@@ -2474,7 +2765,8 @@ void retro_run(void)
       //VIDCore->SetSettingValue(VDP_SETTING_POLYGON_MODE, polygon_mode);
       VIDCore->SetSettingValue(VDP_SETTING_RBG_RESOLUTION_MODE, g_rbg_resolution_mode);
       VIDCore->SetSettingValue(VDP_SETTING_RBG_USE_COMPUTESHADER, g_rbg_use_compute_shader);
-      if(PERCore && (prev_multitap[0] != multitap[0] || prev_multitap[1] != multitap[1]))
+      if(PERCore && (prev_multitap[0] != multitap[0] || prev_multitap[1] != multitap[1]
+                     || prev_service_enabled != service_enabled))
          PERCore->Init();
       if(g_frame_skip == 1)
          EnableAutoFrameSkip();
@@ -2504,7 +2796,19 @@ void retro_run(void)
       YK_TRACE("res_pending begin cur_w=%dx%d now=%p", game_width, game_height,
             (void *)(yk.GetCurrentContext ? yk.GetCurrentContext() : NULL));
       VdpRevoke();
-      yk_attach();
+      {
+         int attach_ok = yk_attach();
+         if (yk_dbg_on())
+            printf("[YKDBG] res begin attach=%d ctx=%p game=%dx%d cur=%dx%d "
+                   "mirror_fbo=%u mirror_rb=%u rb=%dx%d front_fbo=%u front_tex=%u tex=%dx%d\n",
+                   attach_ok,
+                   (void *)(yk.GetCurrentContext ? yk.GetCurrentContext() : NULL),
+                   game_width, game_height, current_width, current_height,
+                   (unsigned)yk.mirror_fbo, (unsigned)yk.mirror_rb,
+                   yk.mirror_rb_w, yk.mirror_rb_h,
+                   (unsigned)yk.front_fbo, (unsigned)yk.front_tex,
+                   yk.front_tex_w, yk.front_tex_h);
+      }
       YK_TRACE("res_pending engine-GL start now=%p (sub=%p)", 
             (void *)(yk.GetCurrentContext ? yk.GetCurrentContext() : NULL), (void *)yk.ctx_sub);
       retro_set_resolution();
@@ -2512,6 +2816,18 @@ void retro_run(void)
        * with the engine's context current (a stale, smaller attachment would
        * clip the first hi-res frame) */
       yk_mirror_depth();
+      if (yk_dbg_on() && yk.BindFramebuffer && yk.CheckFramebufferStatus)
+      {
+         YK_Enum st;
+         YK_Uint prev = 0;
+         if (yk.GetIntegerv) yk.GetIntegerv(YK_GL_FRAMEBUFFER_BINDING, (YK_Int *)&prev);
+         yk.BindFramebuffer(YK_GL_FRAMEBUFFER, yk.mirror_fbo);
+         st = yk.CheckFramebufferStatus(YK_GL_FRAMEBUFFER);
+         yk.BindFramebuffer(YK_GL_FRAMEBUFFER, prev);
+         printf("[YKDBG] res mirror fbo=%u status=0x%x (0x8cd5=complete) rb=%u %dx%d cur=%dx%d\n",
+                (unsigned)yk.mirror_fbo, (unsigned)st, (unsigned)yk.mirror_rb,
+                yk.mirror_rb_w, yk.mirror_rb_h, current_width, current_height);
+      }
       YK_TRACE("res_pending engine-GL done now=%p", 
             (void *)(yk.GetCurrentContext ? yk.GetCurrentContext() : NULL));
       yk_detach();

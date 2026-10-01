@@ -201,6 +201,20 @@ struct retro_core_option_v2_definition option_defs_us[] = {
       },
       "disabled"
    },
+{
+      "yabasanshiro_service_enabled",
+      "Service Mode (ST-V)",
+      NULL,
+      "Enable the ST-V cabinet Test/Service/Pause keys.",
+      NULL,
+      "input",
+      {
+         { "disabled", NULL },
+         { "enabled",  NULL },
+         { NULL, NULL },
+      },
+      "disabled"
+   },
    { NULL, NULL, NULL, NULL, NULL, NULL, {{NULL, NULL}}, NULL }
 };
 
