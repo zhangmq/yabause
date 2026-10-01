@@ -1438,15 +1438,20 @@ static int sram_apply_pending = 0; /* push shadow -> BupRam once BupRam exists *
 static void sram_seed_from_backup(const char *path)
 {
    FILE *bf = fopen(path, "rb");
+   size_t n = 0;
    if (bf)
    {
-      size_t n = fread(sram_shadow, 1, sizeof(sram_shadow), bf);
+      n = fread(sram_shadow, 1, sizeof(sram_shadow), bf);
       fclose(bf);
       if (n < sizeof(sram_shadow))
          FormatBackupRam(sram_shadow, sizeof(sram_shadow));
    }
    else
       FormatBackupRam(sram_shadow, sizeof(sram_shadow));
+   /* Which card file is in use, and whether it was found: Saturn shares one
+      internal card, an ST-V board has a per-game SRAM (see the bup_path setup). */
+   log_cb(RETRO_LOG_INFO, "Backup RAM: %s (%s)\n", path,
+          (bf && n == sizeof(sram_shadow)) ? "loaded" : "fresh card");
    sram_apply_pending = 1;
 }
 
@@ -2388,7 +2393,16 @@ bool retro_load_game(const struct retro_game_info *info)
       log_cb(RETRO_LOG_WARN, "HLE bios is enabled, this is for debugging purpose only, expect lots of issues\n");
    }
 
-   snprintf(bup_path, sizeof(bup_path), "%s%cyabasanshiro%cbackup.bin", g_save_dir, slash, slash);
+   /* Backup-RAM path.  A Saturn keeps ONE internal memory card shared by every
+      game, so it stays in the core's shared card file.  An ST-V board has its
+      SRAM on the ROM board, i.e. per game: use Kronos' naming
+      (<save>/stv/<game>.ram, next to the <game>.nv EEPROM).  The file layout is
+      still our classic 64 KB card image (card byte N at offset 2N+1), not
+      Kronos' dense 32 KB one -- see README, "Sega Titan Video (ST-V)". */
+   if (stv_mode && stvgame != NULL)
+      snprintf(bup_path, sizeof(bup_path), "%s%cstv%c%s.ram", g_save_dir, slash, slash, stvgame);
+   else
+      snprintf(bup_path, sizeof(bup_path), "%s%cyabasanshiro%cbackup.bin", g_save_dir, slash, slash);
 
    /* Prime the SAVE_RAM shadow from the core's backup card; the frontend may
     * then overlay its .srm on top before the first frame. */
