@@ -5717,10 +5717,13 @@ void ScspAsynMainRealtime(void * p) {
         }
         pthread_mutex_lock(&sync_mutex);
         int rtn = pthread_cond_timedwait(&sync_cnd,&sync_mutex,&tm);
-        /* A/B: also advance the sound CPU when the SH2 actually asked for it
-         * (matching the non-Android/non-Linux branch), instead of only when the
-         * timed wait happens to be signalled. */
-        if(rtn == 0 || sh2_read_req != 0){
+        /* Match the shipping h700 branch / upstream: advance the sound CPU when
+         * the timed wait is signalled.  The "|| sh2_read_req != 0" that sat here
+         * was an uncommitted A/B; sh2_read_req is never cleared on this Linux
+         * path (only the #else branch clears it), so the OR degenerates into
+         * "always advance" and silently disables the SYNC gating.  Measured
+         * equal in time and audio, so take the upstream form. */
+        if(rtn == 0){
           for (i = 0; i < samplecnt; i += step) {
             MM68KExec(step);
             m68kcycle += base_clock;
