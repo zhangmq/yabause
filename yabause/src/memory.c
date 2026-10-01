@@ -535,10 +535,7 @@ static u8 FASTCALL BupRamMemoryReadByte(u32 addr)
   /* The backup RAM is a 16-bit device with only its high byte wired up, so
      software reaches byte N through the odd address 2N+1; even addresses read
      back 0xFF.  Kronos maps it the same way. */
-  if (addr & 0x1) {
-    return T1ReadByte(BupRam, addr >> 1);
-  }
-  return 0xFF;
+  return T1ReadByte(BupRam, addr);
 }
 
 //////////////////////////////////////////////////////////////////////////////
@@ -595,9 +592,7 @@ static void FASTCALL BupRamMemoryWriteByte(u32 addr, u8 val)
   }
   //printf("BupRamMemoryWriteByte %08X\n",addr);
   /* See BupRamMemoryReadByte: only the odd (high-byte) addresses are stored. */
-  if (addr & 0x1) {
-    T1WriteByte(BupRam, addr >> 1, val);
-  }
+  T1WriteByte(BupRam, addr|0x1, val);
 #ifdef YAB_STV_DEBUG
   { static unsigned int nb=0; if (nb<40) { printf("[BRAMW] addr=%08x val=%02x M=%08x S=%08x\n", addr, val, MSH2?MSH2->regs.PC:0, SSH2?SSH2->regs.PC:0); fflush(stdout); nb++; } }
 #endif
@@ -1520,11 +1515,19 @@ int LoadBackupRam(const char *filename)
    return T123Load(BupRam, 0x10000, 1, filename);
 }
 
-static u8 header[16] = {
-  'B', 'a', 'c', 'k',
-  'U', 'p', 'R', 'a',
-  'm', ' ', 'F', 'o',
-  'r', 'm', 'a', 't'
+/* Classic yabause card layout: the backup RAM is a byte-wide device whose
+   bytes live at ODD offsets, with 0xFF in the even (unconnected) ones, so the
+   header is stored interleaved and the empty fill is 0xFF/0x00 pairs.
+   ac63199e switched this to Kronos' dense layout in the same commit that fixed
+   the ST-V credits, which silently made every card written by an earlier core
+   (and by the shipping h700 core) unreadable: a real BIOS then answers
+   "The System Memory is not ready for use."  The dense layout was never needed
+   for the credit fix -- that was yinit.extend_backup = 0. */
+static u8 header[32] = {
+  0xFF, 'B', 0xFF, 'a', 0xFF, 'c', 0xFF, 'k',
+  0xFF, 'U', 0xFF, 'p', 0xFF, 'R', 0xFF, 'a',
+  0xFF, 'm', 0xFF, ' ', 0xFF, 'F', 0xFF, 'o',
+  0xFF, 'r', 0xFF, 'm', 0xFF, 'a', 0xFF, 't'
 };
 
 int CheckBackupFile(FILE *fp) {
@@ -1533,7 +1536,7 @@ int CheckBackupFile(FILE *fp) {
 
   // Fill in header
   for (i2 = 0; i2 < 4; i2++) {
-    for (i = 0; i < 16; i++) {
+    for (i = 0; i < 32; i++) {
       u8 val = fgetc(fp);
       if ( val != header[i]) {
         return -1;
@@ -1550,8 +1553,9 @@ int ExtendBackupFile(FILE *fp, u32 size ) {
   if (acsize < size) {
     // Clear the rest
     u32 i;
-    for ( i = (acsize&0xFFFFFFFE) ; i < size; i++)
+    for ( i = (acsize&0xFFFFFFFE) ; i < size; i += 2)
     {
+      fputc(0xFF, fp);
       fputc(0x00, fp);
     }
     fflush(fp);
@@ -1570,12 +1574,13 @@ void FormatBackupRamFile(FILE *fp, u32 size) {
 
   // Fill in header
   for (i2 = 0; i2 < 4; i2++)
-    for (i = 0; i < 16; i++)
+    for (i = 0; i < 32; i++)
       fputc(header[i],fp);
 
   // Clear the rest
-  for (i3 = 0x80; i3 < size; i3 ++)
+  for (i3 = 0x80; i3 < size; i3 += 2)
   {
+    fputc(0xFF,fp);
     fputc(0x00,fp);
   }
   fflush(fp);
@@ -1588,13 +1593,14 @@ void FormatBackupRam(void *mem, u32 size)
 
    // Fill in header
    for(i2 = 0; i2 < 4; i2++)
-      for(i = 0; i < 16; i++)
-         T1WriteByte(mem, (i2 * 16) + i, header[i]);
+      for(i = 0; i < 32; i++)
+         T1WriteByte(mem, (i2 * 32) + i, header[i]);
 
    // Clear the rest
-   for(i3 = 0x80; i3 < size; i3++)
+   for(i3 = 0x80; i3 < size; i3+=2)
    {
-      T1WriteByte(mem, i3, 0x00);
+      T1WriteByte(mem, i3, 0xFF);
+      T1WriteByte(mem, i3+1, 0x00);
    }
 }
 
