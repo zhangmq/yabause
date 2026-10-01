@@ -122,8 +122,12 @@ To run an ST-V game, put `stvbios.zip` in the frontend's **system** directory (n
 `saturn_bios.bin`) and the game zips in the ROM directory. The board is recognised from the zip
 entry names + CRC32, so a re-zipped or renamed `stvbios.zip` silently falls back to Saturn mode.
 
-*Known limitation*: the ST-V SRAM lives in one shared `<save>/yabasanshiro/backup.bin` instead of
-Kronos' per-game `<save>/stv/<rom>.ram`.
+The ST-V **SRAM is per game**: `<save>/stv/<game>.ram`, next to the `<game>.nv` EEPROM, matching
+Kronos' naming (the layout is still our classic 64 KB card image, not Kronos' dense 32 KB one). A
+Saturn keeps one shared internal memory card, as on hardware. Making that file actually appear
+re-exposed a latent bug: `bupfilename` was assigned only on the `extend_backup` path, so with the
+`extend_backup = 0` the ST-V credit fix needs, `YabauseDeInit()` called `T123Save(..., NULL)` and
+the core never persisted its card at all — only the frontend's per-ROM `.sav` carried it.
 
 The probes and recorders that the porting effort needed (SMPC/IOGA loggers, black-box recorders,
 per-frame stat dumps, the `autopress.txt` hook) were removed in `09b9f8b8`: the shipping core runs

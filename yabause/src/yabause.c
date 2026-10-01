@@ -231,9 +231,16 @@ int YabauseInit(yabauseinit_struct *init)
       return -1;
 
    yabsys.extend_backup = init->extend_backup;
+   /* bupfilename is what YabauseDeInit() passes to T123Save(), and it used to be
+      assigned only inside the extend_backup branch below.  With extend_backup 0
+      -- the value the ST-V credit fix needs, and what libretro.c passes -- the
+      load worked but the save was called with NULL, so the core never wrote its
+      backup file at all (measured: <save>/stv/<game>.ram and backup.bin stayed
+      absent while the file frontends persist per ROM were the only thing that
+      carried the card). */
+   bupfilename = init->buppath;
    if (yabsys.extend_backup) {
      FILE * pbackup;
-     bupfilename = init->buppath;
      pbackup = fopen(bupfilename, "a+b");
      if (pbackup == NULL) {
        YabSetError(YAB_ERR_CANNOTINIT, _("InternalBackup"));
