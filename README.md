@@ -5,8 +5,8 @@
 pinned at [`a40dace1`](https://github.com/sydarn/yabause/commit/a40dace1)
 (devmiyax `B2_1_11`, standalone 1.11.0 lineage). Branch **`h700`** is the only maintained
 branch here; upstream development on this line has stopped. The **Sega Titan Video (ST-V)**
-support was developed on a `stv` branch and merged into `h700` in `aa20951b` (2026-10-02);
-`stv` is kept on the remote as a historical reference.
+support was developed on a `stv` branch and merged into `h700` in `aa20951b` (2026-10-02); that
+branch was then deleted from the remote and is kept locally only.
 
 It targets low-end ARM handhelds — verified on the **Anbernic RGSP**
 (Allwinner H700, 4× Cortex-A53, Mali-G31 / libmali, glibc 2.35) with the NextUI/minarch-gl
