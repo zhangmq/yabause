@@ -45,7 +45,8 @@ frontend — and is loaded as `yabasanshiro_libretro.so`. It plays **Sega Saturn
   `glMemoryBarrier`) that the RBG compute path calls; without them Virtua Fighter 2's hi-res title
   screen crashed the core about 9 s in (`PC=0`).
 
-**libretro feature parity with the reference core** ([`lr-yabasanshiro`](https://github.com/libretro/yabasanshiro)):
+**libretro feature parity with the reference core** (the `yabasanshiro` branch of
+[`libretro/yabause`](https://github.com/libretro/yabause/tree/yabasanshiro), tip `09ed8e5b`):
 
 * `8d8cab15`, `247ee0f4`, `ea028ee4` — savestates, plus `SAVE_RAM`/`SYSTEM_RAM` and the Saturn
   memory map. `ea028ee4` also fixes *silent audio when loading a state on a cold start*: the SCSP
