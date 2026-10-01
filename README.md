@@ -188,17 +188,18 @@ Anbernic RGSP (Allwinner H700, Mali-G31), minarch-gl hardware render, CPU govern
 off. Values are *fps at frame 3600 / average over the window*; the control is the same tree built
 synchronously (no `YAB_ASYNC_RENDERING`/`YAB_CORE_SHARED_CONTEXT`):
 
-| Build | Golden Axe | Daytona USA | cotton2 (ST-V) | Die Hard Arcade (ST-V) |
-|---|---|---|---|---|
-| synchronous | 50.3 / 54.3 | 33.6 / 39.1 | — | — |
-| async + shared context | **60.2 / 60.4** | **40.4 / 43.6** | **55.3 / 55.7** | **42.7 / 48.9** |
+| Build | Golden Axe | Daytona USA |
+|---|---|---|
+| synchronous | 50.3 / 54.3 | 33.6 / 39.1 |
+| async + shared context | **60.2 / 60.4** | **40.4 / 43.6** |
 
 ⇒ **+19.7 % (Golden Axe)** and **+20.2 % (Daytona USA)** at frame 3600, or +11.2 % / +11.5 % on the
 window average. Whole-process CPU (all threads) measures 1.41 → 1.71 cores on Golden Axe and
 ~1.9 on Daytona, and the async build runs one thread more (9 vs 8): the VDP worker now does the
 rendering the emulation thread used to do inline, so the emulation thread is no longer pinned to a
 single core. (Re-measured 2026-10-02 on the merged `h700`; these numbers supersede the earlier
-58.4 / 40.3, which came from a different sampling point.)
+58.4 / 40.3, which came from a different sampling point.) Both windows are no-input runs, i.e. the
+titles' attract/title screens — treat them as a rendering/threading benchmark, not a gameplay one.
 
 Known costs: the worker performs one `glFinish()` per frame (a whole-pipeline drain on the render
 thread, so the frame is complete in the shared texture before the frontend samples it from its own
