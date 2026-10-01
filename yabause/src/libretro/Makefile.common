@@ -27,9 +27,13 @@ FLAGS += -D__LIBRETRO__ -DHAVE_LIBGL -DVERSION=\"3.4.2\" -DHAVE_LROUND -D_7ZIP_S
 # (hblankin / hblankout / SCSP / vblankin): ~700-900 clock() calls per frame whose
 # results are never printed (PROFILE_PRINT() has no caller).
 # Measured on the RGSP with a 4000-frame window, governor pinned to performance,
-# frameskip disabled, identical frame content and process CPU:
-#   Daytona USA  40.9 / 41.9 fps  ->  44.2 / 44.4 fps   (+6-8 %)
-#   Golden Axe   vsync-capped at 60.4 fps either way, CPU 1.73/1.71 -> 1.72/1.70
+# frameskip disabled, two interleaved passes on an otherwise idle device:
+#   Daytona USA  44.1 / 44.0 fps  ->  44.4 / 44.4 fps   (+0.8 %)
+#   Golden Axe   vsync-capped at 60.4 fps either way, CPU 1.72 -> 1.72
+# (A first A/B showed +6-8 %, but it was run while a game was also being played
+#  on the device: the *baseline* was the part that moved, 40.9/41.9 -> 44.0/44.1
+#  once the device was idle.  Timing numbers are only worth what the idle state
+#  behind them is worth -- check `top`/`/proc/loadavg` first.)
 FLAGS += -DDONT_PROFILE
 FLAGS += -include $(CORE_DIR)/gl_compat_extra.h
 # Windows-ism used by cdbase.c; POSIX spelling exists in glibc/strings.h
