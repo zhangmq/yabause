@@ -3159,11 +3159,6 @@ FASTCALL void SH2DebugInterpreterExec(SH2_struct *context, u32 cycles)
       // Execute it
       opcodes[context->instruction](context);
 
-      /* Per-instruction interrupt check (Kronos does this from decodeInt(),
-         which it installs in its per-address opcode cache).  Checking only
-         once per Exec() call delays dispatch by up to a whole frame. */
-      SH2HandleInterrupts(context);
-
 #ifdef SH2_UBC
 	  if (ubcinterrupt)
 	     SH2UBCInterrupt(context, ubcflag);
@@ -3233,11 +3228,7 @@ FASTCALL void SH2InterpreterExec(SH2_struct *context, u32 cycles)
 #endif
 
       // Execute it
-      opcodes[context->instruction](context);
-
-      /* Same per-instruction interrupt check as above. */
-      SH2HandleInterrupts(context);
-   }
+      opcodes[context->instruction](context);   }
 
    context->pre_cycle = context->cycles - target_cycle;
 }

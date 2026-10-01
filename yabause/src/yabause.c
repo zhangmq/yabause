@@ -362,7 +362,7 @@ int YabauseInit(yabauseinit_struct *init)
    /* Kronos' SmpcInit() takes the SMPC/BIOS-settings path and the boot
       language; this tree has no smpcpath plumbing yet (SmpcSaveBiosSettings()
       simply returns -1 when it is NULL) and defaults to English. */
-   if (SmpcInit(init->regionid, init->basetime, NULL, 0) != 0)
+   if (SmpcInit(init->regionid, init->clocksync, init->basetime) != 0)
    {
       YabSetError(YAB_ERR_CANNOTINIT, _("SMPC"));
       return -1;
@@ -696,8 +696,24 @@ u64 getM68KCounter();
 u64 g_m68K_dec_cycle = 0;
 
 
+int g_dbg_lc_drops = 0;
+
 int YabauseEmulate(void) {
    int oneframeexec = 0;
+   /* Where is the machine stuck?  The dynarec only syncs regs.PC at block
+    * boundaries, so run with YAB_SH2=interp when using this. */
+   if (getenv("YAB_PCDBG") && (yabsys.frame_count % 10) == 0)
+      printf("[PCDBG] f=%u M=%08X S=%08X line=%d smpc(COM=%02X SF=%02X IREG0=%02X DDR=%02X,%02X)\n",
+             (unsigned)yabsys.frame_count,
+             MSH2 ? (unsigned)MSH2->regs.PC : 0,
+             SSH2 ? (unsigned)SSH2->regs.PC : 0,
+             yabsys.LineCount,
+             SmpcRegs ? (unsigned)SmpcRegs->COMREG : 0,
+             SmpcRegs ? (unsigned)SmpcRegs->SF : 0,
+             SmpcRegs ? (unsigned)SmpcRegs->IREG[0] : 0,
+             SmpcRegs ? (unsigned)SmpcRegs->DDR[0] : 0,
+             SmpcRegs ? (unsigned)SmpcRegs->DDR[1] : 0);
+   static int dbg_lc_prev = 0;
    /* Frame end is driven by a frame-local line counter, NOT by yabsys.LineCount:
     * the latter is a global that YabauseChangeTiming() (CLKCHG) and the savestate
     * loader rename, and a mid-frame rewrite used to make a frame 1.5x-4x long --
@@ -782,6 +798,21 @@ int YabauseEmulate(void) {
    while (!oneframeexec)
    {
       PROFILE_START("Total Emulation");
+      /* yabsys.LineCount is rewritten mid-frame by something we have not found
+       * (neither YabauseChangeTiming nor the savestate loader); it drives the
+       * Vdp2Lines[] per-line snapshot index, so a stray write corrupts the
+       * VDP2 register table the render thread draws from.  Log prev -> now. */
+      if (yabsys.LineCount < dbg_lc_prev)
+      {
+         g_dbg_lc_drops++;
+         if (g_dbg_lc_drops <= 40 && getenv("YAB_LCDBG"))
+            printf("[LCDBG] drop#%d f=%u prev=%d now=%d local_line=%d "
+                   "vblank=%d maxline=%d decl=%d\n",
+                   g_dbg_lc_drops, (unsigned)yabsys.frame_count, dbg_lc_prev,
+                   yabsys.LineCount, local_line, yabsys.VBlankLineCount,
+                   yabsys.MaxLineCount, (int)yabsys.DecilineCount);
+      }
+      dbg_lc_prev = yabsys.LineCount;
 
       // Since we run the SCU with half the number of cycles we send
       // to SH2Exec(), we always compute an even number of cycles here
@@ -849,6 +880,13 @@ int YabauseEmulate(void) {
             // VBlankIN
             SmpcINTBACKEnd();
             Vdp2VBlankIN();
+            /* Publish the frame's snapshot table HERE, not at frame end: this
+             * runs right after Vdp2VBlankIN() has synchronised with the VDP
+             * worker (the worker blocks on its event queue until the next
+             * frame), so the publish cannot tear a table the worker is reading.
+             * (Doing it at frame end raced: the worker renders VDPEV_VBLANK_OUT
+             * while the main thread memcpy's over the table it is reading.) */
+            Vdp2LinesSwap();
 #if defined(ASYNC_SCSP)
             SyncCPUtoSCSP();
 #endif
@@ -876,6 +914,13 @@ int YabauseEmulate(void) {
 
       yabsys.UsecFrac += usecinc;
       PROFILE_START("SMPC");
+      /* Kronos' SMPC timing constants are in per-line units where 1 unit = 250 us
+       * (its own comment says "4.5ms => 18"), while this frame loop advances in
+       * microseconds.  Feed it Kronos units so the constants mean what they say. */
+      /* The ported Kronos SMPC constants are ~40x smaller than this tree's
+       * microsecond-calibrated ones (its INTBACK is 400 where the old one is
+       * 16000), so scale the time fed in by 1/40.  (1/250 -- the "1 unit =
+       * 250us" reading -- was far too slow: it silenced the sound CPU.) */
       SmpcExec(yabsys.UsecFrac >> YABSYS_TIMING_BITS);
       PROFILE_STOP("SMPC");
       PROFILE_START("CDB");

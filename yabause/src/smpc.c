@@ -17,14 +17,35 @@
     along with Yabause; if not, write to the Free Software
     Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301  USA
 */
+/*
+        Copyright 2019 devMiyax(smiyaxdev@gmail.com)
+
+This file is part of YabaSanshiro.
+
+        YabaSanshiro is free software; you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation; either version 2 of the License, or
+(at your option) any later version.
+
+YabaSanshiro is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+        You should have received a copy of the GNU General Public License
+along with YabaSanshiro; if not, write to the Free Software
+Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301  USA
+*/
 
 /*! \file smpc.c
     \brief SMPC emulation functions.
 */
 
+#include <unistd.h>
 #include <stdlib.h>
 #include <time.h>
 #include "smpc.h"
+#include "eeprom.h"
 #include "cs2.h"
 #include "debug.h"
 #include "peripheral.h"
@@ -35,7 +56,6 @@
 #include "vdp2.h"
 #include "yabause.h"
 #include "movie.h"
-#include "eeprom.h"
 
 #ifdef _arch_dreamcast
 # include "dreamcast/localtime.h"
@@ -45,34 +65,42 @@
 #endif
 
 Smpc * SmpcRegs;
-SmpcInternal * SmpcInternalVars;
-
 u8 * SmpcRegsT;
-static int intback_wait_for_vblankout = 0;
-static u8 bustmp = 0;
-static const char *smpcfilename = NULL;
+SmpcInternal * SmpcInternalVars = NULL;
+int intback_wait_for_line = 0;
+u8 bustmp = 0;
 
-// #define SMPCLOG printf
+/* ST-V: the 68k sound CPU is started/stopped through PDR2 bit 0x10
+   (ported from libretro/yabause@kronos smpc.c; see critical fact 26). */
+static u8 m_pdr1_readback = 0;
+static u8 m_pdr2_readback = 0;
+#ifdef YAB_STV_DEBUG
+static unsigned int stv_smpc_dbg = 0;
+#endif
 
 //////////////////////////////////////////////////////////////////////////////
 
-int SmpcInit(u8 regionid, u32 basetime, const char *smpcpath, u8 languageid) {
+int SmpcInit(u8 regionid, int clocksync, u32 basetime) {
    if ((SmpcRegsT = (u8 *) calloc(1, sizeof(Smpc))) == NULL)
       return -1;
-
+ 
    SmpcRegs = (Smpc *) SmpcRegsT;
 
    if ((SmpcInternalVars = (SmpcInternal *) calloc(1, sizeof(SmpcInternal))) == NULL)
       return -1;
-
+  
    SmpcInternalVars->regionsetting = regionid;
    SmpcInternalVars->regionid = regionid;
+   SmpcInternalVars->clocksync = clocksync;
    SmpcInternalVars->basetime = basetime ? basetime : time(NULL);
-   SmpcInternalVars->languageid = languageid;
-
-   smpcfilename = smpcpath;
 
    return 0;
+}
+
+int SmpcSetClockSync(int clocksync, u32 basetime) {
+  if (SmpcInternalVars == NULL) return -1;
+  SmpcInternalVars->clocksync = clocksync;
+  SmpcInternalVars->basetime = basetime ? basetime : time(NULL);
 }
 
 //////////////////////////////////////////////////////////////////////////////
@@ -109,54 +137,11 @@ void SmpcRecheckRegion(void) {
 
 //////////////////////////////////////////////////////////////////////////////
 
-static int SmpcSaveBiosSettings(void) {
-   FILE *fp;
-   if (smpcfilename == NULL)
-      return -1;
-   if ((fp = fopen(smpcfilename, "wb")) == NULL)
-      return -1;
-   fwrite(SmpcInternalVars->SMEM, 1, sizeof(SmpcInternalVars->SMEM), fp);
-   fclose(fp);
-   return 0;
-}
-
-//////////////////////////////////////////////////////////////////////////////
-
-static int SmpcLoadBiosSettings(void) {
-   FILE *fp;
-   size_t nbRead = 0;
-   if (smpcfilename == NULL)
-      return -1;
-   if ((fp = fopen(smpcfilename, "rb")) == NULL)
-      return -1;
-   nbRead = fread(SmpcInternalVars->SMEM, 1, sizeof(SmpcInternalVars->SMEM), fp);
-   SmpcInternalVars->languageid = SmpcInternalVars->SMEM[3] & 0xF;
-   fclose(fp);
-   return (nbRead == sizeof(SmpcInternalVars->SMEM))?0:-1;
-}
-
-//////////////////////////////////////////////////////////////////////////////
-
-static void SmpcSetLanguage(void) {
-   SmpcInternalVars->SMEM[3] = (SmpcInternalVars->SMEM[3] & 0xF0) | SmpcInternalVars->languageid;
-}
-
-//////////////////////////////////////////////////////////////////////////////
-
-int SmpcGetLanguage(void) {
-   // TODO : use this in standalone to store currently set language into config
-   return SmpcInternalVars->languageid;
-}
-
-//////////////////////////////////////////////////////////////////////////////
-
 void SmpcReset(void) {
    memset((void *)SmpcRegs, 0, sizeof(Smpc));
    memset((void *)SmpcInternalVars->SMEM, 0, 4);
 
    SmpcRecheckRegion();
-   SmpcLoadBiosSettings();
-   SmpcSetLanguage(); // to (re)apply currently stored languageid
 
    SmpcInternalVars->dotsel = 0;
    SmpcInternalVars->mshnmi = 0;
@@ -167,12 +152,16 @@ void SmpcReset(void) {
    SmpcInternalVars->ste = 0;
    SmpcInternalVars->resb = 0;
 
+   SmpcInternalVars->intback=0;
+   SmpcInternalVars->intbackIreg0=0;
    SmpcInternalVars->firstPeri=0;
 
    SmpcInternalVars->timing=0;
 
    memset((void *)&SmpcInternalVars->port1, 0, sizeof(PortData_struct));
    memset((void *)&SmpcInternalVars->port2, 0, sizeof(PortData_struct));
+   /* Kronos sets this in SmpcReset; without it OREG[31] stays 0 after the
+      memset and the ST-V BIOS never sees the 0xD it polls for. */
    SmpcRegs->OREG[31] = 0xD;
 }
 
@@ -191,42 +180,33 @@ static void SmpcSSHOFF(void) {
 //////////////////////////////////////////////////////////////////////////////
 
 static void SmpcSNDON(void) {
-   if (!yabsys.isSTV) M68KStart(); //C68k wire is controlled by pdr2 on STV
+   if (!yabsys.isSTV) M68KStart(); // C68k wire is controlled by pdr2 on STV
    SmpcRegs->OREG[31] = 0x6;
 }
 
 //////////////////////////////////////////////////////////////////////////////
 
+/* SYSRES: on the Saturn this would reset the console; the SMPC registers
+   themselves survive, so OREG[31] becomes 0x0D and the BIOS's next boot sees
+   it and continues past the check at 0xd24.  Kronos does exactly this
+   (SmpcSYSRES + SF = 0) and it was missing from our port. */
+static void SmpcSYSRES(void) {
+   SmpcRegs->OREG[31] = 0xD;
+}
+
 static void SmpcSNDOFF(void) {
-   if (!yabsys.isSTV) M68KStop(); //C68k wire is controlled by pdr2 on STV
+   if (!yabsys.isSTV) M68KStop(); // C68k wire is controlled by pdr2 on STV
    SmpcRegs->OREG[31] = 0x7;
 }
 
 //////////////////////////////////////////////////////////////////////////////
 
-static void SmpcSYSRES(void) {
-  SmpcRegs->OREG[31] = 0xD;
-}
-
-//////////////////////////////////////////////////////////////////////////////
-
-static void SmpcPreCKCHG(void) {
-  /* Kronos calls ScspHalt() == ScspLockThread() here to park the async SCSP
-     thread before SmpcCKCHG* resets it.  This tree's ScspReset() already does
-     exactly that itself (g_scsp_lock = 1, wait, scsp_reset(), g_scsp_lock = 0),
-     and our ScspLockThread() additionally sleeps a flat 33ms, so calling it
-     here would only add a stall.  Nothing to do. */
-}
-
 void SmpcCKCHG352(void) {
-   // Set DOTSEL
-   SmpcInternalVars->dotsel = 1;
-
    // Reset VDP1, VDP2, SCU, and SCSP
-   ScspReset();
-   Vdp1Reset();
-   Vdp2Reset();
-   ScuReset(0);
+   Vdp1Reset();  
+   Vdp2Reset();  
+   ScuReset(0);  
+   ScspReset();  
 
    // Clear VDP1/VDP2 ram
 
@@ -234,24 +214,22 @@ void SmpcCKCHG352(void) {
 
    // change clock
    YabauseChangeTiming(CLKTYPE_28MHZ);
+
+   // Set DOTSEL
+   SmpcInternalVars->dotsel = 1;
+
    // Send NMI
    SH2NMI(MSH2);
-
 }
 
 //////////////////////////////////////////////////////////////////////////////
 
 void SmpcCKCHG320(void) {
-
-   // Set DOTSEL
-   SmpcInternalVars->dotsel = 0;
-
-
    // Reset VDP1, VDP2, SCU, and SCSP
-   ScspReset();
-   Vdp1Reset();
-   Vdp2Reset();
-   ScuReset(0);
+   Vdp1Reset();  
+   Vdp2Reset();  
+   ScuReset(0);  
+   ScspReset();  
 
    // Clear VDP1/VDP2 ram
 
@@ -259,9 +237,12 @@ void SmpcCKCHG320(void) {
 
    // change clock
    YabauseChangeTiming(CLKTYPE_26MHZ);
+
+   // Set DOTSEL
+   SmpcInternalVars->dotsel = 0;
+
    // Send NMI
    SH2NMI(MSH2);
-
 }
 
 struct movietime {
@@ -290,13 +271,13 @@ static void SmpcINTBACKStatus(void) {
 
    SmpcRegs->OREG[0] = 0x80 | (SmpcInternalVars->resd << 6);   // goto normal startup
    //SmpcRegs->OREG[0] = 0x0 | (SmpcInternalVars->resd << 6);  // goto setclock/setlanguage screen
-
+    
    // write time data in OREG1-7
-   if (yabsys.IsPal)
-         tmp = SmpcInternalVars->basetime + ((u64)yabsys.frame_count * 1000 / 50000);
-   else
-    tmp = SmpcInternalVars->basetime + ((u64)yabsys.frame_count * 1001 / 60000);
-
+   if (SmpcInternalVars->clocksync) {
+      tmp = SmpcInternalVars->basetime + ((u64)yabsys.frame_count * 1001 / 60000);
+   } else {
+      tmp = time(NULL);
+   }
 #ifdef WIN32
    memcpy(&times, localtime(&tmp), sizeof(times));
 #elif defined(_arch_dreamcast) || defined(PSP)
@@ -346,7 +327,7 @@ static void SmpcINTBACKStatus(void) {
 
    // write cartidge data in OREG8
    SmpcRegs->OREG[8] = 0; // FIXME : random value
-
+    
    // write zone data in OREG9 bits 0-7
    // 1 -> japan
    // 2 -> asia/ntsc
@@ -367,37 +348,45 @@ static void SmpcINTBACKStatus(void) {
    // 4   | 1      |
    // 3   | MSHNMI |
    // 2   | 1      |
-   // 1   | SYSRES |
+   // 1   | SYSRES | 
    // 0   | SNDRES |
    SmpcRegs->OREG[10] = 0x34|(SmpcInternalVars->dotsel<<6)|(SmpcInternalVars->mshnmi<<3)|(SmpcInternalVars->sysres<<1)|SmpcInternalVars->sndres;
-
+    
    // system state, second part in OREG11, bit 6
    // bit 6 -> CDRES
    SmpcRegs->OREG[11] = SmpcInternalVars->cdres << 6; // FIXME
-
+    
    // SMEM
    for(i = 0;i < 4;i++)
       SmpcRegs->OREG[12+i] = SmpcInternalVars->SMEM[i];
-
+    
    SmpcRegs->OREG[31] = 0x10; // set to intback command
 }
 
 //////////////////////////////////////////////////////////////////////////////
 
-static u16 m_pmode = 0;
-
 static void SmpcINTBACKPeripheral(void) {
+  {  /* Probe: what the SMPC hands the game (START travels through here). */
+     static int on=-1; static FILE *fp=NULL;
+     if(on<0){ on=(access("/mnt/sdcard/smpc.on",F_OK)==0); if(on) fp=fopen("/mnt/sdcard/smpcresp.log","w"); }
+     if(fp){
+       fprintf(fp,"frame=%u SR=%02X SF=%02X COMREG=%02X OREG=",(unsigned)yabsys.frame_count,
+               SmpcRegs->SR,SmpcRegs->SF,SmpcRegs->COMREG);
+       for(int k=0;k<12;k++) fprintf(fp,"%02X",SmpcRegs->OREG[k]);
+       fprintf(fp," SMEM=");
+       for(int k=0;k<12;k++) fprintf(fp,"%02X",SmpcInternalVars->SMEM[k]);
+       fprintf(fp,"\n"); fflush(fp);
+     }
+  }
   int oregoffset;
   PortData_struct *port1, *port2;
-  if(PERCore)
-       PERCore->HandleEvents();
-  if (SmpcInternalVars->firstPeri == 2) {
-    SmpcRegs->SR = 0x80 | m_pmode;
-    SmpcInternalVars->firstPeri = 0;
-  } else {
-    SmpcRegs->SR = 0xC0 | m_pmode;
-    SmpcInternalVars->firstPeri++;
-  }
+
+  if (SmpcInternalVars->firstPeri)
+    SmpcRegs->SR = 0xC0 | (SmpcRegs->IREG[1] >> 4);
+  else
+    SmpcRegs->SR = 0x80 | (SmpcRegs->IREG[1] >> 4);
+
+  SmpcInternalVars->firstPeri = 0;
 
   /* Port Status:
   0x04 - Sega-tap is connected
@@ -497,38 +486,55 @@ static void SmpcINTBACKPeripheral(void) {
 //////////////////////////////////////////////////////////////////////////////
 
 static void SmpcINTBACK(void) {
-    if (SmpcInternalVars->firstPeri == 1) {
-     //in a continous mode.
-      SMPCLOG("Continue on command SF %d\n", SmpcRegs->SF);
+  {  /* Probe: every INTBACK request the game makes (which branch is chosen and
+      * with what arguments).  Enabled while /mnt/sdcard/smpc.on exists. */
+     static int on=-1; static FILE *fp=NULL;
+     if(on<0){ on=(access("/mnt/sdcard/smpc.on",F_OK)==0); if(on) fp=fopen("/mnt/sdcard/smpcreq.log","w"); }
+     if(fp){
+       fprintf(fp,"frame=%u IREG=%02X%02X%02X%02X SR=%02X SF=%02X firstPeri=%d\n",
+               (unsigned)yabsys.frame_count,SmpcRegs->IREG[0],SmpcRegs->IREG[1],
+               SmpcRegs->IREG[2],SmpcRegs->IREG[3],SmpcRegs->SR,SmpcRegs->SF,
+               (int)SmpcInternalVars->firstPeri); fflush(fp);
+     }
+  }
+   SmpcRegs->SF = 1;
+   /* Peripheral (pad) data must be available in a CONTINUOUS mode: Kronos keeps
+    * returning it while firstPeri == 1, whereas this tree cleared "intback" at
+    * every INTBACK end and then went silent for requests that ask for neither
+    * status bit 0 nor peripheral data -- measured: ZERO peripheral responses in
+    * a whole run, which is why the pad (and START) never reached the game. */
+   if (SmpcInternalVars->firstPeri == 1) {
       SmpcINTBACKPeripheral();
-      SmpcRegs->SF = (SmpcRegs->SR & 0x20)!=0;
-      SMPCLOG("Continue on command now SF is %d\n", SmpcRegs->SF);
       ScuSendSystemManager();
       return;
-  }
-  if (SmpcRegs->IREG[0] != 0x0) {
+   }
+
+   //we think rayman sets 0x40 so that it breaks the intback command immediately when it blocks, 
+   //rather than having to set 0x40 in response to an interrupt
+   if ((SmpcInternalVars->intbackIreg0 = (SmpcRegs->IREG[0] & 1))) {
       // Return non-peripheral data
-      SMPCLOG("non peripheral require controlers %d\n", (SmpcRegs->IREG[1]&0x8)!=0);
-      SmpcInternalVars->firstPeri = ((SmpcRegs->IREG[1] & 0x8) >> 3);
-      for(int i=0;i<31;i++) SmpcRegs->OREG[i] = 0xff;
-      m_pmode = (SmpcRegs->IREG[0]>>4);
+      SmpcInternalVars->firstPeri = (SmpcRegs->IREG[1] & 0x8) >> 3; // only if the program wants peripheral data
+      SmpcInternalVars->intback = (SmpcRegs->IREG[1] & 0x8) >> 3;
       SmpcINTBACKStatus();
-      SmpcRegs->SR = 0x40 | (SmpcInternalVars->firstPeri << 5); // the low nibble is undefined(or 0xF)
-      SmpcRegs->SF = (SmpcRegs->IREG[1]&0x8)!=0;
+      SmpcRegs->SR = 0x4F | (SmpcInternalVars->intback << 5); // the low nibble is undefined(or 0xF)
       ScuSendSystemManager();
       return;
-  }
-  if (SmpcRegs->IREG[1] & 0x8) {
-      SMPCLOG("controlers only\n");
-      SmpcInternalVars->firstPeri = ((SmpcRegs->IREG[1] & 0x8) >> 3);
+   }
+   if (SmpcRegs->IREG[1] & 0x8) {
+      SmpcInternalVars->firstPeri = 1;
+      SmpcInternalVars->intback = 1;
+      SmpcRegs->SR = 0x40;
       SmpcINTBACKPeripheral();
+      SmpcRegs->OREG[31] = 0x10; // may need to be changed
       ScuSendSystemManager();
-      SmpcRegs->SF = (SmpcRegs->SR & 0x20)!=0;
-  }
-  else {
-    SMPCLOG("Nothing to do\n");
-    SmpcRegs->SF = 0;
-  }
+      return;
+   }
+}
+
+//////////////////////////////////////////////////////////////////////////////
+
+void SmpcINTBACKEnd(void) {
+   SmpcInternalVars->intback = 0;
 }
 
 //////////////////////////////////////////////////////////////////////////////
@@ -539,17 +545,13 @@ static void SmpcSETSMEM(void) {
    for(i = 0;i < 4;i++)
       SmpcInternalVars->SMEM[i] = SmpcRegs->IREG[i];
 
-   // language might have changed, let's store the new id
-   SmpcInternalVars->languageid = SmpcInternalVars->SMEM[3] & 0xF;
-   SmpcSaveBiosSettings();
-
    SmpcRegs->OREG[31] = 0x17;
 }
 
 //////////////////////////////////////////////////////////////////////////////
 
 static void SmpcNMIREQ(void) {
-   SH2NMI(MSH2);
+   SH2SendInterrupt(MSH2, 0xB, 16);
    SmpcRegs->OREG[31] = 0x18;
 }
 
@@ -560,7 +562,7 @@ void SmpcResetButton(void) {
    if (SmpcInternalVars->resd)
       return;
 
-   SH2NMI(MSH2);
+   SH2SendInterrupt(MSH2, 0xB, 16);
 }
 
 //////////////////////////////////////////////////////////////////////////////
@@ -578,150 +580,147 @@ static void SmpcRESDISA(void) {
 }
 
 //////////////////////////////////////////////////////////////////////////////
-static void processCommand(void) {
-    switch(SmpcRegs->COMREG) {
-     case 0x0:
-        SMPCLOG("smpc\t: MSHON not implemented\n");
-        SmpcRegs->OREG[31]=0x0;
-        SmpcRegs->SF = 0;
-        break;
-     case 0x2:
-        SMPCLOG("smpc\t: SSHON\n");
-        SmpcSSHON();
-        SmpcRegs->SF = 0;
-        break;
-     case 0x3:
-        SMPCLOG("smpc\t: SSHOFF\n");
-        SmpcSSHOFF();
-        SmpcRegs->SF = 0;
-        break;
-     case 0x6:
-        SMPCLOG("smpc\t: SNDON\n");
-        SmpcSNDON();
-        SmpcRegs->SF = 0;
-        break;
-     case 0x7:
-        SMPCLOG("smpc\t: SNDOFF\n");
-        SmpcSNDOFF();
-        SmpcRegs->SF = 0;
-        break;
-     case 0x8:
-        SMPCLOG("smpc\t: CDON not implemented\n");
-        SmpcRegs->SF = 0;
-        break;
-     case 0x9:
-        SMPCLOG("smpc\t: CDOFF not implemented\n");
-        SmpcRegs->SF = 0;
-        break;
-     case 0xD:
-        SMPCLOG("smpc\t: SYSRES not implemented\n");
-        SmpcSYSRES();
-        SmpcRegs->SF = 0;
-        break;
-     case 0xE:
-        SMPCLOG("smpc\t: CKCHG352\n");
-        SmpcCKCHG352();
-        SmpcRegs->SF = 0;
-        break;
-     case 0xF:
-        SMPCLOG("smpc\t: CKCHG320\n");
-        SmpcCKCHG320();
-        SmpcRegs->SF = 0;
-        break;
-     case 0x10:
-        SMPCLOG("smpc\t: INTBACK\n");
-        SmpcINTBACK();
-        break;
-     case 0x17:
-        SMPCLOG("smpc\t: SETSMEM\n");
-        SmpcSETSMEM();
-        SmpcRegs->SF = 0;
-        break;
-     case 0x18:
-        SMPCLOG("smpc\t: NMIREQ\n");
-        SmpcNMIREQ();
-        SmpcRegs->SF = 0;
-        break;
-     case 0x19:
-        SMPCLOG("smpc\t: RESENAB\n");
-        SmpcRESENAB();
-        SmpcRegs->SF = 0;
-        break;
-     case 0x1A:
-        SMPCLOG("smpc\t: RESDISA\n");
-        SmpcRESDISA();
-        SmpcRegs->SF = 0;
-        break;
-     default:
-        printf("smpc\t: Command %02X not implemented\n", SmpcRegs->COMREG);
-        break;
-  }
-}
 
 void SmpcExec(s32 t) {
-  if (intback_wait_for_vblankout != 0)
-  {
-        if (yabsys.LineCount == yabsys.MaxLineCount - 1)
-    {
-      intback_wait_for_vblankout = 0;
-      SmpcInternalVars->timing = 1;
-      SMPCLOG("Intback after vblank out\n");
-    }
-  }
-  if (SmpcInternalVars->timing > 0) {
-    SmpcInternalVars->timing -= t;
-    if (SmpcInternalVars->timing <= 0) {
-        SMPCLOG("Command due to timing %d (%d)\n", SmpcInternalVars->timing, yabsys.LineCount);
-        processCommand();
-    }
-  }
+   if (SmpcInternalVars->timing > 0) {
+
+      if (intback_wait_for_line)
+      {
+         if (yabsys.LineCount == 207)
+         {
+            SmpcInternalVars->timing = -1;
+            intback_wait_for_line = 0;
+         }
+      }
+
+      SmpcInternalVars->timing -= t;
+      if (SmpcInternalVars->timing <= 0) {
+#ifdef YAB_STV_DEBUG
+         if (yabsys.isSTV) printf("[SMPCDBG] exec COMREG=%02x\n", SmpcRegs->COMREG);
+#endif
+         switch(SmpcRegs->COMREG) {
+            case 0x0:
+               SMPCLOG("smpc\t: MSHON not implemented\n");
+               SmpcRegs->OREG[31] = 0x0;
+               SmpcRegs->SF = 0;
+               break;
+            case 0x2:
+               SMPCLOG("smpc\t: SSHON\n");
+               SmpcSSHON();
+               break;
+            case 0x3:
+               SMPCLOG("smpc\t: SSHOFF\n");
+               SmpcSSHOFF();
+               break;
+            case 0x6:
+               SMPCLOG("smpc\t: SNDON\n");
+               SmpcSNDON();
+               break;
+            case 0x7:
+               SMPCLOG("smpc\t: SNDOFF\n");
+               SmpcSNDOFF();
+               break;
+            case 0x8:
+               SMPCLOG("smpc\t: CDON not implemented\n");
+               SmpcRegs->SF = 0;
+               break;
+            case 0x9:
+               SMPCLOG("smpc\t: CDOFF not implemented\n");
+               SmpcRegs->SF = 0;
+               break;
+            case 0xD:
+               SMPCLOG("smpc\t: SYSRES not implemented\n");
+               SmpcSYSRES();
+               SmpcRegs->SF = 0;
+               break;
+            case 0xE:
+               SMPCLOG("smpc\t: CKCHG352\n");
+               SmpcCKCHG352();
+               break;
+            case 0xF:
+               SMPCLOG("smpc\t: CKCHG320\n");
+               SmpcCKCHG320();
+               break;
+            case 0x10:
+               SMPCLOG("smpc\t: INTBACK\n");
+               SmpcINTBACK();
+               break;
+            case 0x17:
+               SMPCLOG("smpc\t: SETSMEM\n");
+               SmpcSETSMEM();
+               break;
+            case 0x18:
+               SMPCLOG("smpc\t: NMIREQ\n");
+               SmpcNMIREQ();
+               break;
+            case 0x19:
+               SMPCLOG("smpc\t: RESENAB\n");
+               SmpcRESENAB();
+               break;
+            case 0x1A:
+               SMPCLOG("smpc\t: RESDISA\n");
+               SmpcRESDISA();
+               break;
+            default:
+               SMPCLOG("smpc\t: Command %02X not implemented\n", SmpcRegs->COMREG);
+               break;
+         }
+  
+         SmpcRegs->SF = 0;
+      }
+   }
 }
 
 //////////////////////////////////////////////////////////////////////////////
 
-
-
-void SmpcINTBACKEnd(void) {
-  if ((SmpcRegs->COMREG == 0x10) && ((SmpcRegs->SF != 0) || (SmpcInternalVars->timing>0))) {
-      SMPCLOG("Intback Abort %d\n", SmpcInternalVars->timing);
-      SmpcRegs->SF = 0; //End command without interrupt - not enough time
-      SmpcInternalVars->timing = -1;
-  }
-}
-
-//////////////////////////////////////////////////////////////////////////////
-static u8 m_pdr2_readback = 0;
-static u8 m_pdr1_readback = 0;
-
-
+/* Probe wrapper: log every SMPC register read (which registers the game polls
+ * and what it gets).  Enabled while /mnt/sdcard/smpc.on exists. */
+static u8 FASTCALL SmpcReadByte_inner(u32 addr);
 u8 FASTCALL SmpcReadByte(u32 addr) {
+   u8 v = SmpcReadByte_inner(addr);
+   {
+      static int on=-1; static FILE *fp=NULL;
+      if(on<0){ on=(access("/mnt/sdcard/smpc.on",F_OK)==0); if(on) fp=fopen("/mnt/sdcard/smpcread.log","w"); }
+      if(fp){ fprintf(fp,"frame=%u addr=%02X val=%02X\n",(unsigned)yabsys.frame_count,addr,v); fflush(fp); }
+   }
+   return v;
+}
+static u8 FASTCALL SmpcReadByte_inner(u32 addr) {
    addr &= 0x7F;
+   if (addr == 0x05F && yabsys.isSTV) {
+      /* Return the real OREG[31].  A hardcoded 0xF0 here (the old hack) made
+         the BIOS boot but also masked every handshake value the game polls
+         for (0x10/0x17/0x18/0x19/0x1A), so coin credits never updated. */
+      return SmpcRegs->OREG[31];
+   }
+     if (addr == 0x077) {
+        /* PDR2 read-back.  Kronos reads the EEPROM DO bit here (not from PDR1):
+           when DDR2 is 0x18 the byte carries eeprom_do_read() in bit 0.  The ST-V
+           BIOS bit-bangs the EEPROM through PDR1 and polls the DO line through
+           PDR2, so without this it never sees a 1. */
+        if ((SmpcRegs->DDR[1] & 0x7F) == 0x18) {
+           return (u8)((((0x67 & ~0x19) | 0x18 | (eeprom_do_read() << 0)) & ~SmpcRegs->DDR[1]) | m_pdr2_readback);
+        }
+        return SmpcRegsT[addr >> 1];
+     }
+     if (addr == 0x075) {
+        /* PDR1 read-back: the ST-V BIOS polls this for the EEPROM DO bit (bit 0).
+           Ported from Kronos -- without it the poll at 0x4ed8 never sees a 1. */
+        if ((SmpcRegs->DDR[0] & 0x7F) == 0x3f) {
+           return (u8)((((0x40 & 0x40) | 0x3f) & ~SmpcRegs->DDR[0]) | m_pdr1_readback);
+        }
+        return SmpcRegsT[addr >> 1];
+     }
    if (addr == 0x063) {
+     /* Kronos semantics: the 0x63 read returns the register array byte with the
+        SF flag in bit 0, NOT the last written byte.  Measured at frame 8: the
+        two builds hand the BIOS completely different handshake values here
+        (old: 10 01 02 02 01 1A 0E ... ; ported: 00 01 00 00 01 00 ...), and that
+        first divergence is where the game decides whether to use INTBACK. */
      bustmp = SmpcRegsT[addr >> 1] & 0xFE;
      bustmp |= SmpcRegs->SF;
-     SMPCLOG("Read SMPC[0x63] 0x%x %d\n", bustmp, yabsys.LineCount);
      return bustmp;
    }
-   if (addr == 0x77){
-     //PDR2
-    if((SmpcRegs->DDR[1] & 0x7F) == 0x18) {
-     u8 val = (((0x67 & ~0x19) | 0x18 | (eeprom_do_read()<<0)) & ~SmpcRegs->DDR[1]) | m_pdr2_readback;
-     return val; //Shall use eeprom normally look at mame stv driver
-   } else {
-     return SmpcRegsT[addr >> 1];
-   }
-   }
-   if (addr == 0x75){
-     //PDR1
-     if ((SmpcRegs->DDR[0] & 0x7F) == 0x3f) {
-       u8 val = (((0x40 & 0x40) | 0x3f) & ~SmpcRegs->DDR[0]) | m_pdr1_readback;
-       return val;
-     } else {
-       return SmpcRegsT[addr >> 1];
-     }
-   }
-
-   SMPCLOG("Read SMPC[0x%x] = 0x%x (%d %d)\n",addr, SmpcRegsT[addr >> 1], yabsys.LineCount, yabsys.DecilineCount);
    return SmpcRegsT[addr >> 1];
 }
 
@@ -760,54 +759,50 @@ static void SmpcSetTiming(void) {
       case 0xD:
       case 0xE:
       case 0xF:
-        //CLKCHG => 100ms (64 cycles/16ms) => 64*100/16 = 400
-         SmpcPreCKCHG();
-         SmpcInternalVars->timing = 400; // this has to be tested on a real saturn
+         SmpcInternalVars->timing = 1; // this has to be tested on a real saturn
          return;
       case 0x10:
-                    if (SmpcInternalVars->firstPeri == 1) {
-            //Continue
-            if (yabsys.LineCount >= yabsys.VBlankLineCount) {
-              SMPCLOG("Continue on read for peri 1 - wait for vblankout\n");
-              SmpcInternalVars->timing = 0;
-              intback_wait_for_vblankout = 1;
-              SmpcRegs->SF = 1;
-            }
-            else {
-              SmpcInternalVars->timing = 15;
-            }
-          } else {
+         if (SmpcInternalVars->intback)//continue was issued
+         {
+            SmpcInternalVars->timing = 16000;
+            intback_wait_for_line = 1;
+         }
+         else {
             // Calculate timing based on what data is being retrieved
 
             if ((SmpcRegs->IREG[0] == 0x01) && (SmpcRegs->IREG[1] & 0x8))
             {
                //status followed by peripheral data
-               // A voir s'il faut attendre Vblankout
-               SmpcInternalVars->timing = 18; //4.5ms => 18
+               SmpcInternalVars->timing = 250;
             }
             else if ((SmpcRegs->IREG[0] == 0x01) && ((SmpcRegs->IREG[1] & 0x8) == 0))
             {
                //status only
-               //Pas de lecture des periph, peut se faire tout le temps
-               SmpcInternalVars->timing = 18;
+               SmpcInternalVars->timing = 250;
             }
             else if ((SmpcRegs->IREG[0] == 0) && (SmpcRegs->IREG[1] & 0x8))
             {
                //peripheral only
-               //In case of Vblank - wait for Vblankout
-               if (yabsys.LineCount >= yabsys.VBlankLineCount) {
-                 SMPCLOG("Peripheral only - wait for vblankout\n");
-                 SmpcInternalVars->timing = 0;
-                 intback_wait_for_vblankout = 1;
-                 SmpcRegs->SF = 1;
-               }
-               else {
-                 SmpcInternalVars->timing = 272;
-               }
+               SmpcInternalVars->timing = 16000;
+               intback_wait_for_line = 1;
             }
-            else SmpcInternalVars->timing = 10;
+            else {
+              /* Any other IREG[0] still has to be given a timing.  cotton2 asks
+                 for INTBACK with IREG[0] = 0xFF / 0x80 (bit 0 = the status
+                 request, the high nibble = the port mode), which matches
+                 neither "0x01" nor "0" above.  The old code fell through here
+                 and left `timing` at 0, so SmpcExec never ran the command:
+                 SmpcINTBACK() was never called, SR stayed 0, and the game span
+                 forever on SR(0x61) instead of reading the INTBACK payload --
+                 which is exactly why the pad data (and START) never arrived.
+                 Kronos gives this branch `timing = 10` in its own 250us unit,
+                 i.e. ~2.5ms; we use our status-path value (250us) so the
+                 command always completes well inside the frame the game polls. */
+              SMPCLOG("smpc\t: unimplemented command: %02X\n", SmpcRegs->COMREG);
+              SmpcInternalVars->timing = 250;
+              SmpcRegs->SF = 0;
+            }
          }
-         SmpcRegs->OREG[31] = 0x10;
          return;
       case 0x17:
          SmpcInternalVars->timing = 1;
@@ -816,7 +811,7 @@ static void SmpcSetTiming(void) {
          SmpcInternalVars->timing = 1;
          return;
       case 0x3:
-         SmpcInternalVars->timing = 1;
+         SmpcInternalVars->timing = 1;                        
          return;
       case 0x6:
       case 0x7:
@@ -837,24 +832,14 @@ static void SmpcSetTiming(void) {
 //acquiring megadrive id
 //world heroes perfect wants to find a saturn pad
 //id = 0xb
-u8 do_th_mode(u8 val, PortData_struct* port)
+u8 do_th_mode(u8 val)
 {
-  u8 id;
-
-  switch (port->data[1]) {
-    default:
-      id = 0xCF;
-    break;
-    case PERGUN:
-      id = 0xCC;
-    break;
-  }
    switch (val & 0x40) {
    case 0x40:
-      return 0x70 | (id>>4);
+      return 0x70 | ((PORTDATA1.data[3] & 0xF) & 0xc);
       break;
    case 0x00:
-      return 0x30 | (id&0xF);
+      return 0x30 | ((PORTDATA1.data[2] >> 4) & 0xf);
       break;
    }
 
@@ -864,52 +849,48 @@ u8 do_th_mode(u8 val, PortData_struct* port)
 
 //////////////////////////////////////////////////////////////////////////////
 
+static void FASTCALL SmpcWriteByte_inner(u32 addr, u8 val);
 void FASTCALL SmpcWriteByte(u32 addr, u8 val) {
-   u8 oldVal;
-   if(!(addr & 0x1)) return;
+   { static int on=-1; static FILE *fp=NULL;
+     if(on<0){ on=(access("/mnt/sdcard/smpc.on",F_OK)==0); if(on) fp=fopen("/mnt/sdcard/smpcwrite.log","w"); }
+     if(fp){ fprintf(fp,"frame=%u addr=%02X val=%02X\n",(unsigned)yabsys.frame_count,addr&0x7F,val); fflush(fp); } }
+   SmpcWriteByte_inner(addr, val);
+}
+static void FASTCALL SmpcWriteByte_inner(u32 addr, u8 val) {
+#ifdef YAB_STV_DEBUG
+   if (yabsys.isSTV && stv_smpc_dbg < 300) {
+      printf("[SMPCDBG] w %02x = %02x (COMREG=%02x SF=%02x DDR=%02x,%02x PDR=%02x,%02x)\n",
+             addr & 0x7F, val, SmpcRegs->COMREG, SmpcRegs->SF,
+             SmpcRegs->DDR[0], SmpcRegs->DDR[1], SmpcRegs->PDR[0], SmpcRegs->PDR[1]);
+      stv_smpc_dbg++;
+   }
+#endif
    addr &= 0x7F;
-   oldVal = SmpcRegsT[addr >> 1];
    bustmp = val;
-   if (addr == 0x1F) {
-      //COMREG
-      SmpcRegsT[0xF] = val&0x1F;
-   } else
-     SmpcRegsT[addr >> 1] = val;
-      SMPCLOG("Write SMPC[0x%x] = 0x%x SF = 0x%x (%d %d) %d \n",addr, SmpcRegsT[addr >> 1], SmpcRegs->SF, yabsys.LineCount, yabsys.DecilineCount, yabsys.VBlankLineCount);
+   SmpcRegsT[addr >> 1] = val;
 
    switch(addr) {
       case 0x01: // Maybe an INTBACK continue/break request
-                  if ((SmpcInternalVars->firstPeri != 0) && (SmpcInternalVars->timing <= 0))
+         /* Aligned with Kronos (see .notes/smpc-port/smpc.c.kronos-ported).
+            The old gate was "if (intback)", and intback is cleared at every
+            INTBACK end, so cotton2's continue/break writes were dropped; the
+            game then stopped using INTBACK altogether (measured: ZERO INTBACK
+            requests in a whole run) and fell back to register polling, where
+            START never arrives.  Gate on firstPeri/timing as Kronos does, clear
+            SF on break, and do not rewrite COMREG on continue. */
+         if ((SmpcInternalVars->firstPeri != 0) && (SmpcInternalVars->timing <= 0))
          {
-            /* SMPC doc Table 3.2: continue/break is coded in the top two bits
-               of IREG[0] -- 01xxxxxx = break, 10xxxxxx = continue.  Testing a
-               single bit misclassifies 11xxxxxx and makes several ST-V games
-               (Cotton 2/Boomerang, Radiant Silvergun) ignore START.
-               Ported from FCare/Kronos b07079bf35a3a3cefd6f8e768e40d486c28e50fc. */
-            if ((SmpcRegs->IREG[0] & 0xC0) == 0x40) {
+            if (SmpcRegs->IREG[0] & 0x40) {
                // Break
-               SMPCLOG("INTBACK Break\n");
                SmpcInternalVars->firstPeri = 0;
                SmpcRegs->SR &= 0x0F;
                SmpcRegs->SF = 0;
                break;
             }
-            else if ((SmpcRegs->IREG[0] & 0xC0) == 0x80) {
+            else if (SmpcRegs->IREG[0] & 0x80) {
                // Continue
-               SMPCLOG("INTBACK Continue\n");
                SmpcSetTiming();
                SmpcRegs->SF = 1;
-            }
-            else {
-               /* 11xxxxxx (e.g. 0xFF, which cotton2 writes).  The two-bit test
-                * above leaves it unhandled, so the request is silently dropped
-                * and SF stays 1 forever -- the game then spins on SF.  The old
-                * single-bit test (IREG[0] & 0x40) classified 11xxxxxx as a
-                * Break, which is what the hardware does: treat it as a break. */
-                              SmpcInternalVars->firstPeri = 0;
-               SmpcRegs->SR &= 0x0F;
-               SmpcRegs->SF = 0;
-               break;
             }
          }
          return;
@@ -918,22 +899,17 @@ void FASTCALL SmpcWriteByte(u32 addr, u8 val) {
          return;
       case 0x63:
          SmpcRegs->SF &= val;
-         SMPCLOG("Limit SF = 0%x (0%x)\n", SmpcRegs->SF, val);
          return;
       case 0x75: // PDR1
          // FIX ME (should support other peripherals)
          switch (SmpcRegs->DDR[0] & 0x7F) { // Which Control Method do we use?
             case 0x00:
-               if (PORTDATA1.data[1] == PERGUN && (val & 0x7F) == 0x7F){
-                 SmpcRegs->PDR[0] = PORTDATA1.data[2];
-               }
+               if (PORTDATA1.data[1] == PERGUN && (val & 0x7F) == 0x7F)
+                  SmpcRegs->PDR[0] = PORTDATA1.data[2];
                break;
             //th control mode (acquire id)
             case 0x40:
-              if(PERCore)
-                   PERCore->HandleEvents();
-               SmpcRegs->PDR[0] = do_th_mode(val, &PORTDATA1);
-               SMPCLOG("PDR 0 %x %x %x => %x\n", val, PORTDATA1.data[2], PORTDATA1.data[3], SmpcRegs->PDR[0]);
+               SmpcRegs->PDR[0] = do_th_mode(val);
                break;
             //th tr control mode
             case 0x60:
@@ -955,19 +931,21 @@ void FASTCALL SmpcWriteByte(u32 addr, u8 val) {
 
                SmpcRegs->PDR[0] = val;
                break;
-            case 0x3f:
+            case 0x3f: /* EEPROM bit-bang.  ST-V needs it: the BIOS polls the DO line
+                          at 0x4ed8 and spins forever when it never reads 1.  Kronos
+                          drives the eeprom here and reads it back in SmpcReadByte(0x75). */
                m_pdr1_readback = (val & SmpcRegs->DDR[0]) & 0x7f;
-	       eeprom_set_clk((val & 0x08) ? 1 : 0);
-	       eeprom_set_di((val >> 4) & 1);
-	       eeprom_set_cs((val & 0x04) ? 1 : 0);
+               eeprom_set_clk((val & 0x08) ? 1 : 0);
+               eeprom_set_di((val >> 4) & 1);
+               eeprom_set_cs((val & 0x04) ? 1 : 0);
                SmpcRegs->PDR[0] = m_pdr1_readback;
                m_pdr1_readback |= (val & 0x80);
                break;
             default:
-               SMPCLOG("smpc\t: PDR1 Peripheral Unknown Control Method not implemented 0x%x\n", SmpcRegs->DDR[0] & 0x7F);
+               SMPCLOG("smpc\t: Peripheral Unknown Control Method not implemented\n");
                break;
          }
-	break;
+			break;
 	  case 0x77: // PDR2
 		  // FIX ME (should support other peripherals)
 		  switch (SmpcRegs->DDR[1] & 0x7F) { // Which Control Method do we use?
@@ -975,13 +953,16 @@ void FASTCALL SmpcWriteByte(u32 addr, u8 val) {
 			  if (PORTDATA2.data[1] == PERGUN && (val & 0x7F) == 0x7F)
 				  SmpcRegs->PDR[1] = PORTDATA2.data[2];
 			  break;
-        //th control mode (acquire id)
-      case 0x40:
-        if(PERCore)
-             PERCore->HandleEvents();
-         SmpcRegs->PDR[1] = do_th_mode(val, &PORTDATA2);
-         SMPCLOG("PDR 1 %x %x %x => %x\n", val, PORTDATA2.data[2], PORTDATA2.data[3], SmpcRegs->PDR[1]);
-         break;
+		  case 0x18: /* ST-V sound-CPU wire: PDR2 bit 0x10 stops the 68k */
+			  m_pdr2_readback = (val & SmpcRegs->DDR[1]) & 0x7F;
+			  if (m_pdr2_readback & 0x10) {
+				  M68KStop();
+			  } else {
+				  M68KStart();
+			  }
+			  SmpcRegs->PDR[1] = m_pdr2_readback;
+			  m_pdr2_readback |= val & 0x80;
+			  break;
 		  case 0x60:
 			  switch (val & 0x60) {
 			  case 0x60: // 1st Data
@@ -1001,18 +982,8 @@ void FASTCALL SmpcWriteByte(u32 addr, u8 val) {
 
 			  SmpcRegs->PDR[1] = val;
 			  break;
-                  case 0x18:
-                          m_pdr2_readback = ((val & SmpcRegs->DDR[1] ) & 0x7F);
-	                  if (m_pdr2_readback & 0x10){
-                            M68KStop();
-                          } else {
-                            M68KStart();
-                          }
-                          SmpcRegs->PDR[1] = m_pdr2_readback;
-	                  m_pdr2_readback |= val & 0x80;
-                          break;
 		  default:
-			  SMPCLOG("smpc\t: PDR2 Peripheral Unknown Control Method not implemented 0x%x\n", SmpcRegs->DDR[1] & 0x7F);
+			  SMPCLOG("smpc\t: Peripheral Unknown Control Method not implemented\n");
 			  break;
 		  }
 		  break;
@@ -1048,13 +1019,13 @@ void FASTCALL SmpcWriteByte(u32 addr, u8 val) {
                         case PERWHEEL:
                         case PERMISSIONSTICK:
                         case PERTWINSTICKS:
-                        default:
+                        default: 
                            SMPCLOG("smpc\t: Peripheral TH Control Method not supported for peripherl id %02X\n", PORTDATA1.data[1]);
                            break;
                      }
                      break;
                   }
-                  default:
+                  default: 
                      SmpcRegs->PDR[0] = 0x71;
                      break;
                }
@@ -1062,58 +1033,6 @@ void FASTCALL SmpcWriteByte(u32 addr, u8 val) {
                break;
             default: break;
          }
-         SmpcRegs->DDR[0] = (val & 0x7F);
-         break;
-         case 0x7B: // DDR2
-         switch (SmpcRegs->DDR[1] & 0x7F) { // Which Control Method do we use?
-            case 0x00: // Low Nibble of Peripheral ID
-            case 0x40: // High Nibble of Peripheral ID
-               switch (PORTDATA2.data[0])
-               {
-                  case 0xA0:
-                  {
-                    SMPCLOG("value 0x%x\n", PORTDATA2.data[1]);
-                     if (PORTDATA2.data[1] == PERGUN)
-                        SmpcRegs->PDR[1] = 0x7C;
-                           break;
-                  }
-                  case 0xF0:
-                     SmpcRegs->PDR[1] = 0x7F;
-                     break;
-                  case 0xF1:
-                  {
-                     switch(PORTDATA2.data[1])
-                     {
-                        case PERPAD:
-                           SmpcRegs->PDR[1] = 0x7C;
-                           break;
-                        case PER3DPAD:
-                        case PERKEYBOARD:
-                           SmpcRegs->PDR[1] = 0x71;
-                           break;
-                        case PERMOUSE:
-                           SmpcRegs->PDR[1] = 0x70;
-                           break;
-                        case PERWHEEL:
-                        case PERMISSIONSTICK:
-                        case PERTWINSTICKS:
-                        case PERGUN:
-                        default:
-                           SmpcRegs->PDR[1] = 0xA0;
-                           SMPCLOG("smpc\t: Peripheral TH Control Method not supported for peripherl id %02X\n", PORTDATA1.data[1]);
-                           break;
-                     }
-                     break;
-                  }
-                  default:
-                     SmpcRegs->PDR[1] = 0x71;
-                     break;
-               }
-
-               break;
-            default: break;
-         }
-        SmpcRegs->DDR[1] = (val & 0x7F);
          break;
 	  case 0x7D: // IOSEL
 		  SmpcRegs->IOSEL = val;
@@ -1209,4 +1128,5 @@ int SmpcLoadState(FILE *fp, int version, int size)
 }
 
 //////////////////////////////////////////////////////////////////////////////
-
+u32 g_pdr2_writes = 0, g_pdr2_stops = 0, g_pdr2_starts = 0;
+u8 g_pdr2_last = 0, g_ddr1_last = 0;

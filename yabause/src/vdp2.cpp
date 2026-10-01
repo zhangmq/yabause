@@ -74,7 +74,21 @@ u8 B0_Updated = 0;
 u8 B1_Updated = 0;
 
 struct CellScrollData cell_scroll_data[270];
-Vdp2 Vdp2Lines[270];
+Vdp2 Vdp2Lines[270];      /* FRONT: what the render thread reads */
+Vdp2 Vdp2LinesWork[270];  /* BACK: written per line by the main thread */
+static Vdp2 *Vdp2LinesW = Vdp2LinesWork;
+
+/* Publish the frame's snapshot table.  The main thread fills the back table
+ * line by line while the VDP worker renders the previous frame from the front
+ * table, so the worker always sees one complete, self-consistent frame.  With a
+ * single table the two threads share it and, when they settle into a fixed
+ * relative phase, the worker can render a half-updated table forever -- which
+ * is exactly the intermittent all-black frame we have been chasing (a fully
+ * black, back-screen-less frame means the layer loop drew nothing). */
+void Vdp2LinesSwap(void)
+{
+   memcpy(Vdp2Lines, Vdp2LinesWork, sizeof(Vdp2Lines));
+}
 
 
 u32 skipped_frame = 0;
@@ -899,10 +913,19 @@ using std::atomic;
 extern atomic<int> vdp1_clock;
 
 
+int g_dbg_v2lines_n = 0, g_dbg_v2lines_max = -1, g_dbg_v2lines_frame_n = 0;
+int g_dbg_v2lines_last_frame = -1;
+
 void Vdp2HBlankOUT(void) {
   int i;
   if (yabsys.LineCount < yabsys.VBlankLineCount)
   {
+    if ((int)yabsys.frame_count != g_dbg_v2lines_last_frame) {
+      g_dbg_v2lines_last_frame = (int)yabsys.frame_count;
+      g_dbg_v2lines_frame_n = g_dbg_v2lines_n;   /* rows written this frame, at frame start */
+    }
+    g_dbg_v2lines_n++;
+    if (yabsys.LineCount > g_dbg_v2lines_max) g_dbg_v2lines_max = yabsys.LineCount;
     ScuRemoveHBlankIN();
     
     Vdp2Regs->TVSTAT &= ~0x0004;
@@ -914,72 +937,72 @@ void Vdp2HBlankOUT(void) {
     }
 
 
-    if ((Vdp2Lines[0].BGON & 0x01) != (Vdp2Lines[yabsys.LineCount].BGON & 0x01)){
+    if ((Vdp2LinesW[0].BGON & 0x01) != (Vdp2LinesW[yabsys.LineCount].BGON & 0x01)){
       *Vdp2External.perline_alpha |= 0x1;
     }
-    else if ((Vdp2Lines[0].CCRNA & 0x00FF) != (Vdp2Lines[yabsys.LineCount].CCRNA & 0x00FF)){
+    else if ((Vdp2LinesW[0].CCRNA & 0x00FF) != (Vdp2LinesW[yabsys.LineCount].CCRNA & 0x00FF)){
       *Vdp2External.perline_alpha |= 0x1;
     }
 
-    if ((Vdp2Lines[0].BGON & 0x02) != (Vdp2Lines[yabsys.LineCount].BGON & 0x02)){
+    if ((Vdp2LinesW[0].BGON & 0x02) != (Vdp2LinesW[yabsys.LineCount].BGON & 0x02)){
       *Vdp2External.perline_alpha |= 0x2;
     }
-    else if ((Vdp2Lines[0].CCRNA & 0xFF00) != (Vdp2Lines[yabsys.LineCount].CCRNA & 0xFF00)){
+    else if ((Vdp2LinesW[0].CCRNA & 0xFF00) != (Vdp2LinesW[yabsys.LineCount].CCRNA & 0xFF00)){
       *Vdp2External.perline_alpha |= 0x2;
     }
 
-    if ((Vdp2Lines[0].BGON & 0x04) != (Vdp2Lines[yabsys.LineCount].BGON & 0x04)){
+    if ((Vdp2LinesW[0].BGON & 0x04) != (Vdp2LinesW[yabsys.LineCount].BGON & 0x04)){
       *Vdp2External.perline_alpha |= 0x4;
     }
-    else if ((Vdp2Lines[0].CCRNB & 0xFF00) != (Vdp2Lines[yabsys.LineCount].CCRNB & 0xFF00)){
+    else if ((Vdp2LinesW[0].CCRNB & 0xFF00) != (Vdp2LinesW[yabsys.LineCount].CCRNB & 0xFF00)){
       *Vdp2External.perline_alpha |= 0x4;
     }
 
-    if ((Vdp2Lines[0].BGON & 0x08) != (Vdp2Lines[yabsys.LineCount].BGON & 0x08)){
+    if ((Vdp2LinesW[0].BGON & 0x08) != (Vdp2LinesW[yabsys.LineCount].BGON & 0x08)){
       *Vdp2External.perline_alpha |= 0x8;
     }
-    else if ((Vdp2Lines[0].CCRNB & 0x00FF) != (Vdp2Lines[yabsys.LineCount].CCRNB & 0x00FF)){
+    else if ((Vdp2LinesW[0].CCRNB & 0x00FF) != (Vdp2LinesW[yabsys.LineCount].CCRNB & 0x00FF)){
       *Vdp2External.perline_alpha |= 0x8;
     }
 
-    if ((Vdp2Lines[0].BGON & 0x10) != (Vdp2Lines[yabsys.LineCount].BGON & 0x10)){
+    if ((Vdp2LinesW[0].BGON & 0x10) != (Vdp2LinesW[yabsys.LineCount].BGON & 0x10)){
       *Vdp2External.perline_alpha |= 0x10;
     }
-    else if (Vdp2Lines[0].CCRR != Vdp2Lines[yabsys.LineCount].CCRR){
+    else if (Vdp2LinesW[0].CCRR != Vdp2LinesW[yabsys.LineCount].CCRR){
       *Vdp2External.perline_alpha |= 0x10;
     }
 
-    if (Vdp2Lines[0].COBR != Vdp2Lines[yabsys.LineCount].COBR){
+    if (Vdp2LinesW[0].COBR != Vdp2LinesW[yabsys.LineCount].COBR){
 
-      *Vdp2External.perline_alpha |= Vdp2Lines[yabsys.LineCount].CLOFEN;
+      *Vdp2External.perline_alpha |= Vdp2LinesW[yabsys.LineCount].CLOFEN;
     }
-    if (Vdp2Lines[0].COAR != Vdp2Lines[yabsys.LineCount].COAR){
+    if (Vdp2LinesW[0].COAR != Vdp2LinesW[yabsys.LineCount].COAR){
 
-      *Vdp2External.perline_alpha |= Vdp2Lines[yabsys.LineCount].CLOFEN;
-    }
-
-    if (Vdp2Lines[0].CLOFSL != Vdp2Lines[yabsys.LineCount].CLOFSL) {
-
-      *Vdp2External.perline_alpha |= Vdp2Lines[yabsys.LineCount].CLOFEN;
+      *Vdp2External.perline_alpha |= Vdp2LinesW[yabsys.LineCount].CLOFEN;
     }
 
-    if (Vdp2Lines[0].PRISA != Vdp2Lines[yabsys.LineCount].PRISA) {
+    if (Vdp2LinesW[0].CLOFSL != Vdp2LinesW[yabsys.LineCount].CLOFSL) {
+
+      *Vdp2External.perline_alpha |= Vdp2LinesW[yabsys.LineCount].CLOFEN;
+    }
+
+    if (Vdp2LinesW[0].PRISA != Vdp2LinesW[yabsys.LineCount].PRISA) {
 
       *Vdp2External.perline_alpha |= 0x40;
     }
 
-    if ( Vdp2Lines[0].SCYN2 != Vdp2Lines[yabsys.LineCount].SCYN2  ||  Vdp2Lines[0].SCXN2 != Vdp2Lines[yabsys.LineCount].SCXN2 ) {
+    if ( Vdp2LinesW[0].SCYN2 != Vdp2LinesW[yabsys.LineCount].SCYN2  ||  Vdp2LinesW[0].SCXN2 != Vdp2LinesW[yabsys.LineCount].SCXN2 ) {
 
       *Vdp2External.perline_alpha |= 0x100;
     }
 
-    if ( Vdp2Lines[0].SCYN3 != Vdp2Lines[yabsys.LineCount].SCYN3  ||  Vdp2Lines[0].SCXN3 != Vdp2Lines[yabsys.LineCount].SCXN3 ) {
+    if ( Vdp2LinesW[0].SCYN3 != Vdp2LinesW[yabsys.LineCount].SCYN3  ||  Vdp2LinesW[0].SCXN3 != Vdp2LinesW[yabsys.LineCount].SCXN3 ) {
 
       *Vdp2External.perline_alpha |= 0x80;
     }
 
 
-    if (Vdp2Lines[0].PRINA != Vdp2Lines[yabsys.LineCount].PRINA) {
+    if (Vdp2LinesW[0].PRINA != Vdp2LinesW[yabsys.LineCount].PRINA) {
       //printf("Perline priority");
     }
   }

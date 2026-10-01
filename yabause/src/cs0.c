@@ -1052,9 +1052,14 @@ static void FASTCALL ROM16MBITCs0WriteLong(u32 addr, u32 val)
    libretro/yabause@kronos yabause/src/sys/memory/src/cs0.c. */
 static u8 decryptOn = 0;
 
+unsigned g_p63_reads = 0, g_p63_writes = 0, g_p63_whi = 0;
+unsigned char g_p63_val = 0, g_p63_lastw = 0;
+
 static u8 FASTCALL ROMSTVCs0ReadByte(u32 addr)
 {
-   return T1ReadByte(CartridgeArea->rom, addr & 0x1FFFFFF);
+   u8 v = T1ReadByte(CartridgeArea->rom, addr & 0x1FFFFFF);
+   if ((addr & 0x1FFFFFF) == 0x100063) { g_p63_reads++; g_p63_val = v; }
+   return v;
 }
 
 static u16 FASTCALL ROMSTVCs0ReadWord(u32 addr)
@@ -1069,6 +1074,10 @@ static u32 FASTCALL ROMSTVCs0ReadLong(u32 addr)
 
 static void FASTCALL ROMSTVCs0WriteByte(u32 addr, u8 val)
 {
+   if ((addr & 0x1FFFFFF) == 0x100063)
+   {
+      g_p63_writes++; g_p63_lastw = val;
+   }
    T1WriteByte(CartridgeArea->rom, addr & 0x1FFFFFF, val);
 }
 

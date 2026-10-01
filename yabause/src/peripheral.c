@@ -22,6 +22,7 @@
     \brief Peripheral shared functions.
 */
 
+#include <unistd.h>
 #include "debug.h"
 #include "peripheral.h"
 #include "stv.h"
@@ -82,19 +83,62 @@ int IOPortAdd(int key, ioPort port, u8 index) {
    return 0;
 }
 
+/* Probe: the ST-V JAMMA input path (which IOGA port the game reads, and
+ * whether a key press actually clears a bit).  Test-only; enabled while
+ * /mnt/sdcard/ioga.on exists. */
+static FILE *yk_ioga_log(void) {
+   static int on = -1;
+   static FILE *fp = NULL;
+   if (on < 0) {
+      on = (access("/mnt/sdcard/ioga.on", F_OK) == 0);
+      if (on) fp = fopen("/mnt/sdcard/ioga.log", "w");
+   }
+   return fp;
+}
+
 static void IOPortPressed(int key) {
+   FILE *fp = yk_ioga_log();
    if (IOkeys[(key & 0xFF)] != NULL) {
       (*IOkeys[(key & 0xFF)]->port) &= ~IOkeys[(key & 0xFF)]->mask;
+      if (fp) { fprintf(fp, "frame=%u key=%02X DOWN mask=%02X -> A=%02X B=%02X C=%02X\n",
+                        (unsigned)yabsys.frame_count, key & 0xFF, IOkeys[(key & 0xFF)]->mask,
+                        IOPORT[PORT_A], IOPORT[PORT_B], IOPORT[PORT_C]); fflush(fp); }
+   } else if (fp) {
+      fprintf(fp, "frame=%u key=%02X DOWN (no binding)\n", (unsigned)yabsys.frame_count, key & 0xFF); fflush(fp);
    }
 }
 static void IOPortReleased(int key) {
+   FILE *fp = yk_ioga_log();
    if (IOkeys[(key & 0xFF)] != NULL) {
       (*IOkeys[(key & 0xFF)]->port) |= IOkeys[(key & 0xFF)]->mask;
+      if (fp) { fprintf(fp, "frame=%u key=%02X UP   mask=%02X -> A=%02X B=%02X C=%02X\n",
+                        (unsigned)yabsys.frame_count, key & 0xFF, IOkeys[(key & 0xFF)]->mask,
+                        IOPORT[PORT_A], IOPORT[PORT_B], IOPORT[PORT_C]); fflush(fp); }
    }
 }
 
 u8 IOPortReadByte(u32 addr) {
    addr = addr & 0x1F;
+   {  /* Probe: every IOGA register read the game makes. */
+      FILE *fp = yk_ioga_log();
+      if (fp) { fprintf(fp, "frame=%u rd addr=%02X A=%02X B=%02X C=%02X mode=%02X\n",
+                        (unsigned)yabsys.frame_count, addr, IOPORT[PORT_A], IOPORT[PORT_B],
+                        IOPORT[PORT_C], m_ioga_mode); fflush(fp); }
+      /* Probe-mode only: return every player port with the union of ALL cleared
+         bits, so we can tell whether the game watches the IOGA at all. */
+      if (fp) {
+         u8 cleared = (u8)~(IOPORT[PORT_A] & IOPORT[PORT_B] & IOPORT[PORT_C] &
+                            IOPORT[PORT_E] & IOPORT[PORT_F]);
+         switch (addr) {
+            case 0x01: return (u8)(IOPORT[PORT_A] & ~cleared);
+            case 0x03: return (u8)(IOPORT[PORT_B] & ~cleared);
+            case 0x05: return (u8)(IOPORT[PORT_C] & ~cleared);
+            case 0x09: return (u8)(IOPORT[PORT_E] & ~cleared);
+            case 0x0b: return (u8)(IOPORT[PORT_F] & ~cleared);
+            default: break;
+         }
+      }
+   }
 #ifdef YAB_STV_DEBUG
    { static unsigned int r=0; if ((IOPORT[PORT_A]!=0xff || IOPORT[PORT_C]!=0xff) && r<80) { printf("[IOGA] rd addr=%02x A=%02x C=%02x\n", addr & 0x1F, IOPORT[PORT_A], IOPORT[PORT_C]); r++; } }
 #endif
