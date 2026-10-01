@@ -21,6 +21,16 @@ INCLUDE_DIRS := $(CORE_DIR) \
 FLAGS += -D__LIBRETRO__ -DHAVE_LIBGL -DVERSION=\"3.4.2\" -DHAVE_LROUND -D_7ZIP_ST -DFLAC__HAS_OGG=0 -DFLAC__NO_DLL \
 	-DNO_CLI -DHAVE_BUILTIN_BSWAP16=1 -DHAVE_BUILTIN_BSWAP32=1 -DHAVE_C99_VARIADIC_MACROS=1 -DHAVE_FLOORF=1 \
 	-DHAVE_GETTIMEOFDAY=1 -DHAVE_STDINT_H=1 -DHAVE_SYS_TIME_H=1 -DIMPROVED_SAVESTATES -DPACKAGE_VERSION=\"1.3.3\"
+# Turn off yabause's light profiler.  Without this the PROFILE_START/STOP macros
+# expand to ProfileStart/ProfileStop, which do a tag lookup (linear scan + strcmp)
+# and a clock() on every call, and they wrap the per-line paths in yabause.c
+# (hblankin / hblankout / SCSP / vblankin): ~700-900 clock() calls per frame whose
+# results are never printed (PROFILE_PRINT() has no caller).
+# Measured on the RGSP with a 4000-frame window, governor pinned to performance,
+# frameskip disabled, identical frame content and process CPU:
+#   Daytona USA  40.9 / 41.9 fps  ->  44.2 / 44.4 fps   (+6-8 %)
+#   Golden Axe   vsync-capped at 60.4 fps either way, CPU 1.73/1.71 -> 1.72/1.70
+FLAGS += -DDONT_PROFILE
 FLAGS += -include $(CORE_DIR)/gl_compat_extra.h
 # Windows-ism used by cdbase.c; POSIX spelling exists in glibc/strings.h
 FLAGS += -Dstricmp=strcasecmp -Dstrnicmp=strncasecmp
