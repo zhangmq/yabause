@@ -366,18 +366,6 @@ static void SmpcINTBACKStatus(void) {
 //////////////////////////////////////////////////////////////////////////////
 
 static void SmpcINTBACKPeripheral(void) {
-  {  /* Probe: what the SMPC hands the game (START travels through here). */
-     static int on=-1; static FILE *fp=NULL;
-     if(on<0){ on=(access("/mnt/sdcard/smpc.on",F_OK)==0); if(on) fp=fopen("/mnt/sdcard/smpcresp.log","w"); }
-     if(fp){
-       fprintf(fp,"frame=%u SR=%02X SF=%02X COMREG=%02X OREG=",(unsigned)yabsys.frame_count,
-               SmpcRegs->SR,SmpcRegs->SF,SmpcRegs->COMREG);
-       for(int k=0;k<12;k++) fprintf(fp,"%02X",SmpcRegs->OREG[k]);
-       fprintf(fp," SMEM=");
-       for(int k=0;k<12;k++) fprintf(fp,"%02X",SmpcInternalVars->SMEM[k]);
-       fprintf(fp,"\n"); fflush(fp);
-     }
-  }
   int oregoffset;
   PortData_struct *port1, *port2;
 
@@ -486,17 +474,6 @@ static void SmpcINTBACKPeripheral(void) {
 //////////////////////////////////////////////////////////////////////////////
 
 static void SmpcINTBACK(void) {
-  {  /* Probe: every INTBACK request the game makes (which branch is chosen and
-      * with what arguments).  Enabled while /mnt/sdcard/smpc.on exists. */
-     static int on=-1; static FILE *fp=NULL;
-     if(on<0){ on=(access("/mnt/sdcard/smpc.on",F_OK)==0); if(on) fp=fopen("/mnt/sdcard/smpcreq.log","w"); }
-     if(fp){
-       fprintf(fp,"frame=%u IREG=%02X%02X%02X%02X SR=%02X SF=%02X firstPeri=%d\n",
-               (unsigned)yabsys.frame_count,SmpcRegs->IREG[0],SmpcRegs->IREG[1],
-               SmpcRegs->IREG[2],SmpcRegs->IREG[3],SmpcRegs->SR,SmpcRegs->SF,
-               (int)SmpcInternalVars->firstPeri); fflush(fp);
-     }
-  }
    SmpcRegs->SF = 1;
    /* Peripheral (pad) data must be available in a CONTINUOUS mode: Kronos keeps
     * returning it while firstPeri == 1, whereas this tree cleared "intback" at
@@ -673,19 +650,7 @@ void SmpcExec(s32 t) {
 
 //////////////////////////////////////////////////////////////////////////////
 
-/* Probe wrapper: log every SMPC register read (which registers the game polls
- * and what it gets).  Enabled while /mnt/sdcard/smpc.on exists. */
-static u8 FASTCALL SmpcReadByte_inner(u32 addr);
 u8 FASTCALL SmpcReadByte(u32 addr) {
-   u8 v = SmpcReadByte_inner(addr);
-   {
-      static int on=-1; static FILE *fp=NULL;
-      if(on<0){ on=(access("/mnt/sdcard/smpc.on",F_OK)==0); if(on) fp=fopen("/mnt/sdcard/smpcread.log","w"); }
-      if(fp){ fprintf(fp,"frame=%u addr=%02X val=%02X\n",(unsigned)yabsys.frame_count,addr,v); fflush(fp); }
-   }
-   return v;
-}
-static u8 FASTCALL SmpcReadByte_inner(u32 addr) {
    addr &= 0x7F;
    if (addr == 0x05F && yabsys.isSTV) {
       /* Return the real OREG[31].  A hardcoded 0xF0 here (the old hack) made
@@ -849,14 +814,7 @@ u8 do_th_mode(u8 val)
 
 //////////////////////////////////////////////////////////////////////////////
 
-static void FASTCALL SmpcWriteByte_inner(u32 addr, u8 val);
 void FASTCALL SmpcWriteByte(u32 addr, u8 val) {
-   { static int on=-1; static FILE *fp=NULL;
-     if(on<0){ on=(access("/mnt/sdcard/smpc.on",F_OK)==0); if(on) fp=fopen("/mnt/sdcard/smpcwrite.log","w"); }
-     if(fp){ fprintf(fp,"frame=%u addr=%02X val=%02X\n",(unsigned)yabsys.frame_count,addr&0x7F,val); fflush(fp); } }
-   SmpcWriteByte_inner(addr, val);
-}
-static void FASTCALL SmpcWriteByte_inner(u32 addr, u8 val) {
 #ifdef YAB_STV_DEBUG
    if (yabsys.isSTV && stv_smpc_dbg < 300) {
       printf("[SMPCDBG] w %02x = %02x (COMREG=%02x SF=%02x DDR=%02x,%02x PDR=%02x,%02x)\n",

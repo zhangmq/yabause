@@ -696,7 +696,6 @@ u64 getM68KCounter();
 u64 g_m68K_dec_cycle = 0;
 
 
-int g_dbg_lc_drops = 0;
 
 int YabauseEmulate(void) {
    int oneframeexec = 0;
@@ -798,22 +797,6 @@ int YabauseEmulate(void) {
    while (!oneframeexec)
    {
       PROFILE_START("Total Emulation");
-      /* yabsys.LineCount is rewritten mid-frame by something we have not found
-       * (neither YabauseChangeTiming nor the savestate loader); it drives the
-       * Vdp2Lines[] per-line snapshot index, so a stray write corrupts the
-       * VDP2 register table the render thread draws from.  Log prev -> now. */
-      if (yabsys.LineCount < dbg_lc_prev)
-      {
-         g_dbg_lc_drops++;
-         if (g_dbg_lc_drops <= 40 && getenv("YAB_LCDBG"))
-            printf("[LCDBG] drop#%d f=%u prev=%d now=%d local_line=%d "
-                   "vblank=%d maxline=%d decl=%d\n",
-                   g_dbg_lc_drops, (unsigned)yabsys.frame_count, dbg_lc_prev,
-                   yabsys.LineCount, local_line, yabsys.VBlankLineCount,
-                   yabsys.MaxLineCount, (int)yabsys.DecilineCount);
-      }
-      dbg_lc_prev = yabsys.LineCount;
-
       // Since we run the SCU with half the number of cycles we send
       // to SH2Exec(), we always compute an even number of cycles here
       // and leave any odd remainder in SH2CycleFrac.

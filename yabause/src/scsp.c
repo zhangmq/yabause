@@ -4895,7 +4895,6 @@ SoundRamReadByte (u32 addr)
 void FASTCALL
 SoundRamWriteByte (u32 addr, u8 val)
 {
-  g_sram_writes++; g_sram_last = addr;
   addr &= 0xFFFFF;
 
   // If mem4b is set, mirror ram every 256k
@@ -4970,7 +4969,6 @@ SoundRamReadWord (u32 addr)
 void FASTCALL
 SoundRamWriteWord (u32 addr, u16 val)
 {
-  g_sram_writes++; g_sram_last = addr;
   addr &= 0xFFFFF;
 
   // If mem4b is set, mirror ram every 256k
@@ -5016,7 +5014,6 @@ SoundRamReadLong (u32 addr)
 void FASTCALL
 SoundRamWriteLong (u32 addr, u32 val)
 {
-  g_sram_writes++; g_sram_last = addr;
   addr &= 0xFFFFF;
   //u32 pre_cycle = m68kcycle;
 
@@ -7140,10 +7137,5 @@ ScspSlotDebugAudioSaveWav (u8 slotnum, const char *filename)
 //////////////////////////////////////////////////////////////////////////////
 
 /* Diagnostic accessors (test builds only). */
-u32 g_sram_writes = 0, g_sram_last = 0;
 
-u32 ScspDbgScipd(void) { return scsp.scipd; }
-u32 ScspDbgMcipd(void) { return (u32)scsp.mcipd; }
-u32 ScspDbgScieb(void) { return scsp.scieb; }
-u32 ScspDbgMcieb(void) { return scsp.mcieb; }
 

@@ -913,19 +913,11 @@ using std::atomic;
 extern atomic<int> vdp1_clock;
 
 
-int g_dbg_v2lines_n = 0, g_dbg_v2lines_max = -1, g_dbg_v2lines_frame_n = 0;
-int g_dbg_v2lines_last_frame = -1;
 
 void Vdp2HBlankOUT(void) {
   int i;
   if (yabsys.LineCount < yabsys.VBlankLineCount)
   {
-    if ((int)yabsys.frame_count != g_dbg_v2lines_last_frame) {
-      g_dbg_v2lines_last_frame = (int)yabsys.frame_count;
-      g_dbg_v2lines_frame_n = g_dbg_v2lines_n;   /* rows written this frame, at frame start */
-    }
-    g_dbg_v2lines_n++;
-    if (yabsys.LineCount > g_dbg_v2lines_max) g_dbg_v2lines_max = yabsys.LineCount;
     ScuRemoveHBlankIN();
     
     Vdp2Regs->TVSTAT &= ~0x0004;

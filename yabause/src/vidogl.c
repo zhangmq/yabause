@@ -52,86 +52,8 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301  USA
 #include "debug.h"
 #include "vdp2.h"
 #include "yabause.h"
-int g_dbg_colormask_off = 0, g_dbg_depthtest_off = 0, g_dbg_state_probes = 0;
-int g_dbg_vp_x = 0, g_dbg_vp_y = 0, g_dbg_vp_w = 0, g_dbg_vp_h = 0;
-int g_dbg_sc_on = 0, g_dbg_sc_x = 0, g_dbg_sc_y = 0, g_dbg_sc_w = 0, g_dbg_sc_h = 0;
-int g_dbg_vp_empty = 0;
-int g_dbg_mtx_nan = 0;
-float g_dbg_mtx_maxabs = 0.0f;
-int g_dbg_ygl_w = 0, g_dbg_ygl_h = 0, g_dbg_ygl_rw = 0, g_dbg_ygl_rh = 0, g_dbg_ygl_density = 0;
-int g_dbg_blend_on = 0, g_dbg_blend_srca = 0, g_dbg_blend_dsta = 0, g_dbg_blend_srcr = 0;
-int g_dbg_prog_min = -1, g_dbg_prog_zero = 0, g_dbg_prog_last = -1;
-int g_dbg_vbo_last = -1, g_dbg_vbo_zero = 0, g_dbg_texbind_last = -1, g_dbg_texbind_zero = 0;
-int g_dbg_en_seen = 0, g_dbg_en_nonzero = 0, g_dbg_last_en = -1;
-int g_dbg_pri_seen = 0, g_dbg_last_pri = -1;
 #include "ygl.h"
-/* Sampled exactly at the layer-draw entry: if the colour write mask is left
- * all-false by the VDP2 window pass, every layer still issues its draw calls
- * but cannot write a single pixel -- which is precisely a run that renders a
- * pure (0,0,0) frame while every counter we have stays identical. */
-static void yk_state_probe(void)
-{
-   extern int yk_dbg_enabled(void);
-   GLboolean m[4];
-   return; /* probe disabled for this experiment */
-   g_dbg_state_probes++;
-   glGetBooleanv(GL_COLOR_WRITEMASK, m);
-   if (!m[0] && !m[1] && !m[2] && !m[3]) g_dbg_colormask_off++;
-   if (!glIsEnabled(GL_DEPTH_TEST)) g_dbg_depthtest_off++;
-   {
-      GLint vp[4], sc[4];
-      glGetIntegerv(0x0BA2 /*GL_VIEWPORT*/, vp);
-      glGetIntegerv(0x0C10 /*GL_SCISSOR_BOX*/, sc);
-      g_dbg_vp_x = vp[0]; g_dbg_vp_y = vp[1]; g_dbg_vp_w = vp[2]; g_dbg_vp_h = vp[3];
-      g_dbg_sc_x = sc[0]; g_dbg_sc_y = sc[1]; g_dbg_sc_w = sc[2]; g_dbg_sc_h = sc[3];
-      g_dbg_sc_on = glIsEnabled(0x0C11 /*GL_SCISSOR_TEST*/) ? 1 : 0;
-      if (vp[2] <= 0 || vp[3] <= 0) g_dbg_vp_empty++;
-   }
-   {
-      /* Geometry data: a NaN or all-zero model-view matrix collapses every
-       * triangle to zero area -- draws still happen, every state and counter
-       * looks right, and the frame comes out pure black. */
-      const float *mm = (const float *)&_Ygl->mtxModelView.m[0][0];
-      int q;
-      float mx = 0.0f;
-      for (q = 0; q < 16; q++)
-      {
-         float v = mm[q];
-         if (v != v) g_dbg_mtx_nan++;
-         if (v < 0.0f) v = -v;
-         if (v > mx) mx = v;
-      }
-      g_dbg_mtx_maxabs = mx;
-      g_dbg_ygl_w  = (int)_Ygl->width;
-      g_dbg_ygl_h  = (int)_Ygl->height;
-      g_dbg_ygl_rw = (int)_Ygl->rwidth;
-      g_dbg_ygl_rh = (int)_Ygl->rheight;
-      g_dbg_ygl_density = (int)_Ygl->density;
-      /* Never measured before: with blending on and src_alpha == 0 the layers
-       * issue their draws but cannot change a pixel -- black frame, all state
-       * and every counter normal. */
-      g_dbg_blend_on  = glIsEnabled(0x0BE2 /*GL_BLEND*/) ? 1 : 0;
-      glGetIntegerv(0x80CB /*GL_BLEND_SRC_ALPHA*/, &g_dbg_blend_srca);
-      glGetIntegerv(0x80CA /*GL_BLEND_DST_ALPHA*/, &g_dbg_blend_dsta);
-      glGetIntegerv(0x80C9 /*GL_BLEND_SRC_RGB*/,   &g_dbg_blend_srcr);
-      {
-         /* Command-stream inputs: if the current program is 0 (or another
-          * program) every draw is a no-op or produces fixed output, while all
-          * state we sample still looks correct. */
-         GLint prog = 0, vbo = 0, tex = 0;
-         glGetIntegerv(0x8B8D /*GL_CURRENT_PROGRAM*/, &prog);
-         glGetIntegerv(0x8892 /*GL_ARRAY_BUFFER_BINDING*/, &vbo);
-         glGetIntegerv(0x8069 /*GL_TEXTURE_BINDING_2D*/, &tex);
-         if (prog == 0) g_dbg_prog_zero++;
-         if (g_dbg_prog_min < 0 || prog < g_dbg_prog_min) g_dbg_prog_min = prog;
-         g_dbg_prog_last = prog;
-         if (vbo == 0) g_dbg_vbo_zero++;
-         g_dbg_vbo_last = vbo;
-         if (tex == 0) g_dbg_texbind_zero++;
-         g_dbg_texbind_last = tex;
-      }
-   }
-}
+
 
 #include "yui.h"
 #include "frameprofile.h"
@@ -6804,7 +6726,7 @@ static void Vdp2DrawNBG0(void)
   info.linecheck_mask = 0x01;
   info.priority = fixVdp2Regs->PRINA & 0x7;
 
-  if (!((yk_state_probe(), g_dbg_en_seen++, g_dbg_last_en = info.enable, info.enable & Vdp2External.disptoggle)) || ((g_dbg_pri_seen++, g_dbg_last_pri = info.priority, info.priority == 0)))
+  if (!(info.enable & Vdp2External.disptoggle) || (info.priority == 0))
     return;
 
   // Window Mode
@@ -7111,7 +7033,7 @@ static void Vdp2DrawNBG1(void)
   info.priority = (fixVdp2Regs->PRINA >> 8) & 0x7;;
   info.PlaneAddr = (void FASTCALL(*)(void *, int, Vdp2*))&Vdp2NBG1PlaneAddr;
 
-  if (!((yk_state_probe(), g_dbg_en_seen++, g_dbg_last_en = info.enable, info.enable & Vdp2External.disptoggle)) || ((g_dbg_pri_seen++, g_dbg_last_pri = info.priority, info.priority == 0)) ||
+  if (!(info.enable & Vdp2External.disptoggle) || (info.priority == 0) ||
     (fixVdp2Regs->BGON & 0x1 && (fixVdp2Regs->CHCTLA & 0x70) >> 4 == 4)) // If NBG0 16M mode is enabled, don't draw
     return;
 
@@ -7357,7 +7279,7 @@ static void Vdp2DrawNBG2(void)
   info.priority = fixVdp2Regs->PRINB & 0x7;;
   info.PlaneAddr = (void FASTCALL(*)(void *, int, Vdp2*))&Vdp2NBG2PlaneAddr;
 
-  if (/*!((yk_state_probe(), g_dbg_en_seen++, g_dbg_last_en = info.enable, info.enable & Vdp2External.disptoggle)) ||*/ ((g_dbg_pri_seen++, g_dbg_last_pri = info.priority, info.priority == 0)) ||
+  if (/*!(info.enable & Vdp2External.disptoggle) ||*/ (info.priority == 0) ||
     (fixVdp2Regs->BGON & 0x1 && (fixVdp2Regs->CHCTLA & 0x70) >> 4 >= 2)) // If NBG0 2048/32786/16M mode is enabled, don't draw
     return;
 
@@ -7521,7 +7443,7 @@ static void Vdp2DrawNBG3(void)
   info.priority = (fixVdp2Regs->PRINB >> 8) & 0x7;
   info.PlaneAddr = (void FASTCALL(*)(void *, int, Vdp2*))&Vdp2NBG3PlaneAddr;
 
-  if (!((yk_state_probe(), g_dbg_en_seen++, g_dbg_last_en = info.enable, info.enable & Vdp2External.disptoggle)) || ((g_dbg_pri_seen++, g_dbg_last_pri = info.priority, info.priority == 0)) ||
+  if (!(info.enable & Vdp2External.disptoggle) || (info.priority == 0) ||
     (fixVdp2Regs->BGON & 0x1 && (fixVdp2Regs->CHCTLA & 0x70) >> 4 == 4) || // If NBG0 16M mode is enabled, don't draw
     (fixVdp2Regs->BGON & 0x2 && (fixVdp2Regs->CHCTLA & 0x3000) >> 12 >= 2)) // If NBG1 2048/32786 is enabled, don't draw
     return;
@@ -7612,7 +7534,7 @@ static void Vdp2DrawRBG0(void)
   info->enable = fixVdp2Regs->BGON & 0x10;
   if (!info->enable) return;
   info->priority = fixVdp2Regs->PRIR & 0x7;
-  if (!((yk_state_probe(), g_dbg_en_seen++, g_dbg_last_en = info->enable, info->enable & Vdp2External.disptoggle)) || ((g_dbg_pri_seen++, g_dbg_last_pri = info->priority, info->priority == 0))) {
+  if (!(info->enable & Vdp2External.disptoggle) || (info->priority == 0)) {
 
     if (Vdp1Regs->TVMR & 0x02) {
       Vdp2ReadRotationTable(0, &paraA, fixVdp2Regs, Vdp2Ram);

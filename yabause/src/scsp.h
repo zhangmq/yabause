@@ -199,8 +199,3 @@ extern int use_new_scsp;
 #endif
 
 /* Diagnostic accessors for the black-box recorder (test builds only). */
-u32 ScspDbgScipd(void);
-extern u32 g_sram_writes, g_sram_last;
-u32 ScspDbgMcipd(void);
-u32 ScspDbgScieb(void);
-u32 ScspDbgMcieb(void);

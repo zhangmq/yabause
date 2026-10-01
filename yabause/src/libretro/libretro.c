@@ -35,31 +35,7 @@
 #include "m68kcore.h"
 #include "vidogl.h"
 #include "vidsoft.h"
-int g_dbg_stencil_bad = 0, g_dbg_fbo_incomplete = 0;
 
-/* Every black-screen diagnostic is gated on the existence of one file.  Without
- * it this build behaves like a shipping build: the probes' own I/O was slowing
- * the emulator down, and "slower" is exactly what drives the failure (measured:
- * ~30% black with no probes, 75% with the stat/dump probes, 100% with a per
- * frame trace).  Create /mnt/sdcard/yabdbg.on to switch them back on. */
-/* On-device capture, switched on by creating /mnt/sdcard/audio.on: the core
- * writes what it feeds the frontend to /mnt/sdcard/cap.raw (s16 stereo 44.1k)
- * and logs real gamepad button edges to /mnt/sdcard/cap.log.  Lets a recording
- * made while the user plays through the normal NextUI menu be aligned with the
- * exact frame a button was pressed. */
-int yk_cap_enabled(void)
-{
-   static int on = -1;
-   if (on < 0) on = (access("/mnt/sdcard/audio.on", F_OK) == 0) ? 1 : 0;
-   return on;
-}
-
-int yk_dbg_enabled(void)
-{
-   static int on = -1;
-   if (on < 0) on = (access("/mnt/sdcard/yabdbg.on", F_OK) == 0) ? 1 : 0;
-   return on;
-}
 #include "ygl.h"
 
 /* Core options v2 table ported from the reference libretro core
@@ -350,55 +326,9 @@ int PERLIBRETROInit(void)
    return 0;
 }
 
-/* Scripted test presses, keyed on the emulated frame counter so that the
- * timing is deterministic in EVERY launch path (the frontend cannot pass us an
- * environment variable, but it can leave a file).  Format, one per line:
- *     <button> <from-frame> <to-frame>
- * with <button> in {a,b,x,y,select,start}.  Read once from
- * /mnt/sdcard/autopress.txt; absent file = feature off. */
-static unsigned yk_autopress_mask(void)
-{
-   static int init = -1;
-   static struct { int id, from, to; } ap[8];
-   static int nap = 0;
-   unsigned m = 0, f = (unsigned)yabsys.frame_count;
-   int i;
-   if (init < 0)
-   {
-      FILE *fp;
-      init = 0;
-      fp = fopen("/mnt/sdcard/autopress.txt", "r");
-      if (fp)
-      {
-         char line[64];
-         while (fgets(line, sizeof(line), fp) && nap < 8)
-         {
-            char nm[16]; int a, b, id = -1;
-            if (sscanf(line, "%15s %d %d", nm, &a, &b) != 3) continue;
-            if      (!strcmp(nm, "a"))      id = RETRO_DEVICE_ID_JOYPAD_A;
-            else if (!strcmp(nm, "b"))      id = RETRO_DEVICE_ID_JOYPAD_B;
-            else if (!strcmp(nm, "x"))      id = RETRO_DEVICE_ID_JOYPAD_X;
-            else if (!strcmp(nm, "y"))      id = RETRO_DEVICE_ID_JOYPAD_Y;
-            else if (!strcmp(nm, "select")) id = RETRO_DEVICE_ID_JOYPAD_SELECT;
-            else if (!strcmp(nm, "start"))  id = RETRO_DEVICE_ID_JOYPAD_START;
-            if (id >= 0) { ap[nap].id = id; ap[nap].from = a; ap[nap].to = b; nap++; }
-         }
-         fclose(fp);
-         if (nap)
-            log_cb(RETRO_LOG_INFO, "[YK] autopress: %d entries loaded\n", nap);
-      }
-   }
-   for (i = 0; i < nap; i++)
-      if ((int)f >= ap[i].from && (int)f < ap[i].to) m |= (1u << ap[i].id);
-   return m;
-}
-
 static int input_state_cb_wrapper(unsigned port, unsigned device, unsigned index, unsigned id)
 {
-   unsigned apm = yk_autopress_mask();
    int r;
-   static unsigned char cap_prev[64];
-   extern int yk_cap_enabled(void);
    if (libretro_supports_bitmasks && device == RETRO_DEVICE_JOYPAD)
    {
       if (libretro_input_bitmask[port] == -1)
@@ -407,24 +337,6 @@ static int input_state_cb_wrapper(unsigned port, unsigned device, unsigned index
    }
    else
       r = input_state_cb(port, device, index, id);
-   if (device == RETRO_DEVICE_JOYPAD && yk_cap_enabled() && id < 64)
-   {
-      static FILE *lfp = NULL; static int linit = -1;
-      int cur = r ? 1 : 0;
-      if (linit < 0) { linit = 0; lfp = fopen("/mnt/sdcard/cap.log", "w"); }
-      if (lfp && cur != cap_prev[id])
-      {
-         cap_prev[id] = (unsigned char)cur;
-         fprintf(lfp, "frame=%u id=%u %s\n", (unsigned)yabsys.frame_count, (unsigned)id,
-                 cur ? "DOWN" : "UP");
-         fflush(lfp);
-      }
-   }
-   if (device == RETRO_DEVICE_JOYPAD && apm)
-   {
-      if (id == RETRO_DEVICE_ID_JOYPAD_MASK) r |= (int)apm;
-      else if (apm & (1u << id)) r = 1;
-   }
    return r;
 }
 
@@ -655,110 +567,9 @@ static void sdlConvert32uto16s(int32_t *srcL, int32_t *srcR, int16_t *dst, size_
    }
 }
 
-/* Black-box recorder for the "coin + START goes black" investigation.  Writes,
- * every 30 emulated frames, the frame counter, both SH2 program counters and the
- * audio peak seen since the last line, to /mnt/sdcard/yabstat.txt.  This judges
- * "is the game stuck, or merely sitting on a black screen?" without looking at
- * the picture at all.  Test instrumentation -- remove before shipping. */
-static int g_stat_peak = 0;
-static void yk_stat_log(void)
-{
-   if (!yk_dbg_enabled()) return;
-   static int init = -1;
-   static FILE *fp = NULL;
-   if (init < 0)
-   {
-      init = 0;
-      fp = fopen("/mnt/sdcard/yabstat.txt", "w");
-   }
-   if (!fp) return;
-   if ((yabsys.frame_count % 10) != 0) return;
-   {
-      unsigned mpc = MSH2 ? (unsigned)MSH2->regs.PC : 0u;
-      fprintf(fp, "%u M=%08X S=%08X pk=%d 68k=%08X mcipd=%08X scipd=%08X"
-                  " mcieb=%08X scieb=%08X pdr2(w=%u s=%u t=%u last=%02X ddr1=%02X)\n",
-              (unsigned)yabsys.frame_count, mpc,
-              SSH2 ? (unsigned)SSH2->regs.PC : 0u, g_stat_peak,
-              M68K ? (unsigned)M68K->GetPC() : 0u,
-              ScspDbgMcipd(), ScspDbgScipd(), ScspDbgMcieb(), ScspDbgScieb(),
-              (unsigned)g_pdr2_writes, (unsigned)g_pdr2_stops, (unsigned)g_pdr2_starts,
-              (unsigned)g_pdr2_last, (unsigned)g_ddr1_last);
-         fprintf(fp, "     [REGS] SCU D0AD=%08X D0EN=%08X D0MD=%08X"
-                     " R0=%08X R1=%08X R2=%08X R3=%08X R4=%08X R6=%08X R7=%08X SP=%08X"
-                     " | D1AD=%08X D1EN=%08X D2AD=%08X D2EN=%08X SRAM(w=%u last=%08X)\n",
-                 ScuRegs ? (unsigned)ScuRegs->D0AD : 0u,
-                 ScuRegs ? (unsigned)ScuRegs->D0EN : 0u,
-                 ScuRegs ? (unsigned)ScuRegs->D0MD : 0u,
-                 MSH2 ? (unsigned)MSH2->regs.R[0] : 0u,
-                 MSH2 ? (unsigned)MSH2->regs.R[1] : 0u,
-                 MSH2 ? (unsigned)MSH2->regs.R[2] : 0u,
-                 MSH2 ? (unsigned)MSH2->regs.R[3] : 0u,
-                 MSH2 ? (unsigned)MSH2->regs.R[4] : 0u,
-                 MSH2 ? (unsigned)MSH2->regs.R[6] : 0u,
-                 MSH2 ? (unsigned)MSH2->regs.R[7] : 0u,
-                 MSH2 ? (unsigned)MSH2->regs.R[15] : 0u,
-                 ScuRegs ? (unsigned)ScuRegs->D1AD : 0u,
-                 ScuRegs ? (unsigned)ScuRegs->D1EN : 0u,
-                 ScuRegs ? (unsigned)ScuRegs->D2AD : 0u,
-                 ScuRegs ? (unsigned)ScuRegs->D2EN : 0u,
-                 g_sram_writes, g_sram_last);
-         { extern u64 getM68KCounter(void);
-           fprintf(fp, "     [M68KTICK] frame=%u m68k=%llu\n",
-                   (unsigned)yabsys.frame_count,
-                   (unsigned long long)getM68KCounter()); }
-         if (MSH2 && mpc >= 0x4550u && mpc <= 0x455Au)
-            fprintf(fp, "     [CPY] r4=%08X r5=%08X r6=%08X\n",
-                    (unsigned)MSH2->regs.R[4], (unsigned)MSH2->regs.R[5],
-                    (unsigned)MSH2->regs.R[6]);
-         if (MSH2 && MSH2->regs.R[15])
-         {
-            /* The BIOS stack top holds the return address of the routine the
-             * master is inside -- that pinpoints the caller of the delay loop
-             * (and therefore whatever it is polling). */
-            u32 cyc = 0, sp = (u32)MSH2->regs.R[15];
-            fprintf(fp, "     [STACK] sp=%08X ret0=%08X ret1=%08X ret2=%08X ret3=%08X\n",
-                    sp, MappedMemoryReadLong(sp, &cyc),
-                    MappedMemoryReadLong(sp + 4, &cyc),
-                    MappedMemoryReadLong(sp + 8, &cyc),
-                    MappedMemoryReadLong(sp + 12, &cyc));
-         }
-      /* Black runs park the master SH2 in the BIOS spin at 0x17B2-0x17B8.  Record
-       * what that loop could be waiting for. */
-      if (mpc >= 0x17B0u && mpc <= 0x17BCu && SmpcRegs)
-         fprintf(fp, "   [SPIN] COM=%02X SF=%02X SR=%02X IREG0=%02X IREG1=%02X"
-                     " r0=%08X r5=%08X | 68kPC=%08X mcipd=%08X scipd=%08X\n",
-                 (unsigned)SmpcRegs->COMREG, (unsigned)SmpcRegs->SF,
-                 (unsigned)SmpcRegs->SR, (unsigned)SmpcRegs->IREG[0],
-                 (unsigned)SmpcRegs->IREG[1],
-                 MSH2 ? (unsigned)MSH2->regs.R[0] : 0u,
-                 MSH2 ? (unsigned)MSH2->regs.R[5] : 0u,
-                 M68K ? (unsigned)M68K->GetPC() : 0u,
-                 ScspDbgMcipd(), ScspDbgScipd());
-   }
-   fflush(fp);
-   g_stat_peak = 0;
-}
-
 static void SNDLIBRETROUpdateAudio(u32 *leftchanbuffer, u32 *rightchanbuffer, u32 num_samples)
 {
-   u32 q;
    sdlConvert32uto16s((int32_t*)leftchanbuffer, (int32_t*)rightchanbuffer, sound_buf, num_samples);
-   for (q = 0; q < num_samples * 2; q++)
-   {
-      int v = sound_buf[q];
-      if (v < 0) v = -v;
-      if (v > g_stat_peak) g_stat_peak = v;
-   }
-   {
-      static FILE *cfp = NULL; static int cinit = -1; static unsigned long long cbytes = 0;
-      if (cinit < 0) { cinit = 0; if (yk_cap_enabled()) cfp = fopen("/mnt/sdcard/cap.raw", "wb"); }
-      if (cfp && cbytes < 60ULL * 1024 * 1024)   /* cap ~5.5 min */
-      {
-         fwrite(sound_buf, 2, (size_t)num_samples * 2, cfp);
-         cbytes += (unsigned long long)num_samples * 4;
-         if ((cbytes & 0x3FFFF) < 2048) fflush(cfp);
-      }
-   }
    audio_batch_cb(sound_buf, num_samples);
 
    audio_size -= num_samples;
@@ -1409,265 +1220,6 @@ int YuiRevokeOGLOnThisThread()
  * problem) from "the engine is fine, the present path hands over an empty slot".
  *   YAB_MIRROR_DUMP=<from>-<to>[:step]   e.g. 600-900:20
  */
-static void yk_dump_mirror(unsigned frame)
-{
-   static int on = -1, from = 0, to = -1, step = 1;
-   char path[128];
-   FILE *fp;
-   unsigned char *buf;
-   YK_Uint prev = 0;
-   int w, h, x, y;
-
-   extern int GlWidth, GlHeight;
-   extern int g_dbg_lc_drops;
-   extern int g_dbg_v2lines_n, g_dbg_v2lines_max;
-   extern int g_dbg_ygl_calls, g_dbg_ygl_dispoff;
-   extern int g_dbg_en_seen, g_dbg_pri_seen, g_dbg_last_en, g_dbg_last_pri;
-   extern int g_dbg_stencil_bad, g_dbg_fbo_incomplete;
-   extern int g_dbg_win0cnt, g_dbg_win1cnt, g_dbg_bspwin, g_dbg_wctlc, g_dbg_wctl_gate, g_dbg_winwrites;
-   extern int g_dbg_default_fbo, g_dbg_target_fbo, g_dbg_tm_current, g_dbg_tm_tex, g_dbg_tm_frames;
-   extern int g_dbg_colormask_off, g_dbg_depthtest_off, g_dbg_state_probes;
-   extern int g_dbg_originx, g_dbg_originy, g_dbg_glw, g_dbg_glh;
-   extern int g_dbg_vp_x, g_dbg_vp_y, g_dbg_vp_w, g_dbg_vp_h, g_dbg_vp_empty;
-   extern int g_dbg_sc_on, g_dbg_sc_x, g_dbg_sc_y, g_dbg_sc_w, g_dbg_sc_h;
-   extern int g_dbg_mtx_nan, g_dbg_ygl_w, g_dbg_ygl_h, g_dbg_ygl_rw, g_dbg_ygl_rh, g_dbg_ygl_density;
-   extern float g_dbg_mtx_maxabs;
-   extern int g_dbg_blend_on, g_dbg_blend_srca, g_dbg_blend_dsta, g_dbg_blend_srcr;
-   extern int g_dbg_prog_min, g_dbg_prog_zero, g_dbg_prog_last;
-   extern int g_dbg_vbo_last, g_dbg_vbo_zero, g_dbg_texbind_last, g_dbg_texbind_zero;
-   extern int g_dbg_engine_tex;
-   extern Vdp2 Vdp2Lines[270];
-
-   if (on < 0)
-   {
-      const char *e;
-      /* Diagnostic build: on by default, because the user launches the game from
-       * the NextUI menu and we cannot inject environment variables there. */
-      on = 1; from = 100; to = 2000; step = 50;
-      e = getenv("YAB_MIRROR_DUMP");
-      if (e && *e)
-      {
-         if (strcmp(e, "0") == 0) on = 0;
-         else if (sscanf(e, "%d-%d:%d", &from, &to, &step) >= 2) on = 1;
-      }
-      if (step < 1) step = 1;
-   }
-   if (!yk_dbg_enabled()) return;
-   if (!on || !yk.ReadPixels || !yk.BindFramebuffer || !yk.mirror_fbo) return;
-   if ((int)frame < from) return;
-   if (to >= 0 && (int)frame > to) return;
-   if (((int)frame - from) % step) return;
-
-   w = yk.mirror_rb_w; h = yk.mirror_rb_h;
-   if (w <= 0 || h <= 0) { w = current_width; h = current_height; }
-   if (w <= 0 || h <= 0) return;
-
-   buf = (unsigned char *)malloc((size_t)w * h * 4);
-   if (!buf) return;
-   if (yk.GetIntegerv) yk.GetIntegerv(YK_GL_FRAMEBUFFER_BINDING, (YK_Int *)&prev);
-   yk.BindFramebuffer(YK_GL_FRAMEBUFFER, yk.mirror_fbo);
-   {
-      /* Which texture is the mirror actually attached to, and is it the frontend's
-       * current slot?  If they differ, the engine is drawing into a texture
-       * nobody presents -- engine content in the mirror, black on screen. */
-      YK_Int mtex = 0;
-      if (yk.GetFramebufferAttachmentParameteriv)
-         yk.GetFramebufferAttachmentParameteriv(YK_GL_FRAMEBUFFER, YK_GL_COLOR_ATTACHMENT0,
-               YK_GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME, &mtex);
-      yk.mirror_color_tex = (YK_Uint)mtex;
-   }
-   yk.ReadPixels(0, 0, w, h, 0x1908 /*GL_RGBA*/, 0x1401 /*GL_UNSIGNED_BYTE*/, buf);
-   yk.BindFramebuffer(YK_GL_FRAMEBUFFER, prev);
-
-   snprintf(path, sizeof(path), "/mnt/sdcard/mirror-%04u.ppm", frame);
-   fp = fopen(path, "wb");
-   if (fp)
-   {
-      unsigned long nonblack = 0;
-      fprintf(fp, "P6\n%d %d\n255\n", w, h);
-      for (y = h - 1; y >= 0; y--)
-         for (x = 0; x < w; x++)
-         {
-            const unsigned char *px = buf + ((size_t)y * w + x) * 4;
-            if (px[0] || px[1] || px[2]) nonblack++;
-            fwrite(px, 1, 3, fp);
-         }
-      fclose(fp);
-   {
-      /* Is the oracle itself racy?  This dump runs on the VDP worker, but the
-       * main thread may already be clearing/redrawing this same FBO for the
-       * next frame.  Two threads at a fixed rate lock their relative phase, so
-       * a "black" run may simply always sample after that clear.  Re-read after
-       * a short delay and compare: if the two reads disagree, the black screen
-       * we kept reproducing is partly (or wholly) a measurement artefact. */
-      unsigned long nz2 = 0;
-      unsigned char *buf2 = (unsigned char *)malloc((size_t)w * h * 4);
-      if (buf2)
-      {
-         struct timespec ts;
-         yk.Finish();
-         ts.tv_sec = 0; ts.tv_nsec = 3 * 1000 * 1000;
-         nanosleep(&ts, NULL);
-         yk.BindFramebuffer(YK_GL_FRAMEBUFFER, yk.mirror_fbo);
-         yk.ReadPixels(0, 0, w, h, 0x1908, 0x1401, buf2);
-         yk.BindFramebuffer(YK_GL_FRAMEBUFFER, prev);
-         for (y = 0; y < h; y++)
-            for (x = 0; x < w; x++)
-            {
-               unsigned char *pp = buf2 + ((size_t)y * w + x) * 4;
-               if (pp[0] || pp[1] || pp[2]) nz2++;
-            }
-         free(buf2);
-      }
-      {
-         /* Sample the same FBO several times across a whole frame period: the
-          * main thread clears and redraws it for the next frame, so if the black
-          * we see is a sampling phase, some of these must come back non-black. */
-         unsigned long seq[4];
-         int k;
-         seq[0] = nonblack; seq[1] = nz2;
-         for (k = 2; k < 4; k++)
-         {
-            struct timespec ts2;
-            unsigned long nzk = 0;
-            unsigned char *bk = (unsigned char *)malloc((size_t)w * h * 4);
-            if (!bk) { seq[k] = 0; continue; }
-            ts2.tv_sec = 0; ts2.tv_nsec = 5 * 1000 * 1000;
-            nanosleep(&ts2, NULL);
-            yk.BindFramebuffer(YK_GL_FRAMEBUFFER, yk.mirror_fbo);
-            yk.ReadPixels(0, 0, w, h, 0x1908, 0x1401, bk);
-            yk.BindFramebuffer(YK_GL_FRAMEBUFFER, prev);
-            for (y = 0; y < h; y++)
-               for (x = 0; x < w; x++)
-               {
-                  unsigned char *pp = bk + ((size_t)y * w + x) * 4;
-                  if (pp[0] || pp[1] || pp[2]) nzk++;
-               }
-            free(bk);
-            seq[k] = nzk;
-         }
-         printf("[YKDBG] mirror seq %lu %lu %lu %lu\n", seq[0], seq[1], seq[2], seq[3]);
-      }
-   }
-      printf("[YKDBG] mirror dump %s %dx%d nonblack=%lu attached_tex=%u front_tex=%u %s"
-             " | TVMD=%04X TVSTAT=%04X BGON=%04X PRINA=%04X PRINB=%04X"
-             " EDSR=%04X PTMR=%02X FBCR=%02X TVMR=%02X | Gl=%dx%d cur=%dx%d\n",
-             path, w, h, nonblack, (unsigned)yk.mirror_color_tex,
-             (unsigned)yk.front_tex,
-             (yk.mirror_color_tex == yk.front_tex) ? "MATCH" : "MISMATCH",
-             Vdp2Regs ? (unsigned)Vdp2Regs->TVMD : 0xFFFFu,
-             Vdp2Regs ? (unsigned)Vdp2Regs->TVSTAT : 0xFFFFu,
-             Vdp2Regs ? (unsigned)Vdp2Regs->BGON : 0xFFFFu,
-             Vdp2Regs ? (unsigned)Vdp2Regs->PRINA : 0xFFFFu,
-             Vdp2Regs ? (unsigned)Vdp2Regs->PRINB : 0xFFFFu,
-             Vdp1Regs ? (unsigned)Vdp1Regs->EDSR : 0xFFFFu,
-             Vdp1Regs ? (unsigned)Vdp1Regs->PTMR : 0xFFu,
-             Vdp1Regs ? (unsigned)Vdp1Regs->FBCR : 0xFFu,
-             Vdp1Regs ? (unsigned)Vdp1Regs->TVMR : 0xFFu,
-             GlWidth, GlHeight, current_width, current_height);
-      {
-         /* Is the render thread drawing from a fully-populated, current
-          * Vdp2Lines[] table?  "display enabled in TVMD/BGON yet all black" is
-          * only consistent with a stale/empty per-line snapshot table. */
-         int i, on = 0, off = 0;
-         for (i = 0; i < 224; i++)
-            if (Vdp2Lines[i].TVMD & 0x8000) on++; else off++;
-         printf("[YKDBG] v2lines written=%d maxline=%d | rows0_223: disp_on=%d disp_off=%d"
-                " | ygl_calls=%d disp_off_earlyout=%d\n",
-                g_dbg_v2lines_n, g_dbg_v2lines_max, on, off,
-                g_dbg_ygl_calls, g_dbg_ygl_dispoff);
-         printf("[YKDBG] layervis en_seen=%d pri_seen=%d last_en=%d last_pri=%d"
-                " | stencil_bad=%d fbo_incomplete=%d\n",
-                g_dbg_en_seen, g_dbg_pri_seen, g_dbg_last_en, g_dbg_last_pri,
-                g_dbg_stencil_bad, g_dbg_fbo_incomplete);
-         printf("[YKDBG] win gate=%d writes=%d win0cnt=%d win1cnt=%d bsp=%d WCTLC=%04X\n",
-                g_dbg_wctl_gate, g_dbg_winwrites, g_dbg_win0cnt, g_dbg_win1cnt,
-                g_dbg_bspwin, g_dbg_wctlc);
-         printf("[YKDBG] engine default_fbo=%d targetfbo=%d tm_cur=%d tm_tex=%d tm_frames=%d\n",
-                g_dbg_default_fbo, g_dbg_target_fbo, g_dbg_tm_current, g_dbg_tm_tex,
-                g_dbg_tm_frames);
-         printf("[YKDBG] glstate probes=%d colormask_off=%d depthtest_off=%d vp_empty=%d\n",
-                g_dbg_state_probes, g_dbg_colormask_off, g_dbg_depthtest_off, g_dbg_vp_empty);
-         printf("[YKDBG] geom origin=%d,%d gl=%dx%d | vp=%d,%d %dx%d | sc_on=%d sc=%d,%d %dx%d\n",
-                g_dbg_originx, g_dbg_originy, g_dbg_glw, g_dbg_glh,
-                g_dbg_vp_x, g_dbg_vp_y, g_dbg_vp_w, g_dbg_vp_h,
-                g_dbg_sc_on, g_dbg_sc_x, g_dbg_sc_y, g_dbg_sc_w, g_dbg_sc_h);
-         printf("[YKDBG] geo2 mtx_nan=%d mtx_maxabs=%g | _Ygl w=%d h=%d rw=%d rh=%d density=%d\n",
-                g_dbg_mtx_nan, (double)g_dbg_mtx_maxabs,
-                g_dbg_ygl_w, g_dbg_ygl_h, g_dbg_ygl_rw, g_dbg_ygl_rh, g_dbg_ygl_density);
-         {
-            /* The one judgement we have never used: did ANY fragment actually
-             * rasterise?  The engine clears depth to 0.0 and draws layers with
-             * z >= 0, so non-zero depth means geometry reached the rasteriser
-             * and only the colour write is missing; all-clear depth means no
-             * fragment was produced at all. */
-            static float dbuf[64 * 64];
-            unsigned long k, nzd = 0;
-            int cx = (w > 64) ? (w / 2 - 32) : 0;
-            int cy = (h > 64) ? (h / 2 - 32) : 0;
-            yk.BindFramebuffer(YK_GL_FRAMEBUFFER, yk.mirror_fbo);
-            yk.ReadPixels(cx, cy, 64, 64, 0x1902 /*GL_DEPTH_COMPONENT*/,
-                          0x1406 /*GL_FLOAT*/, dbuf);
-            for (k = 0; k < 64 * 64; k++)
-               if (dbuf[k] != 0.0f) nzd++;
-            printf("[YKDBG] depth %d,%d 64x64 nonzero=%lu first=%g\n",
-                   cx, cy, nzd, (double)dbuf[0]);
-            yk.BindFramebuffer(YK_GL_FRAMEBUFFER, prev);
-         }
-         { extern unsigned g_p63_reads, g_p63_writes; extern unsigned char g_p63_val, g_p63_lastw;
-           printf("     [P63] reads=%u val=%02X writes=%u lastw=%02X\n",
-                  g_p63_reads, (unsigned)g_p63_val, g_p63_writes, (unsigned)g_p63_lastw); }
-         printf("[YKDBG] blend on=%d src_alpha=%d dst_alpha=%d src_rgb=%d\n",
-                g_dbg_blend_on, g_dbg_blend_srca, g_dbg_blend_dsta, g_dbg_blend_srcr);
-         printf("[YKDBG] cmd prog_min=%d prog_last=%d prog_zero=%d | vbo=%d vbo0=%d | tex=%d tex0=%d\n",
-                g_dbg_prog_min, g_dbg_prog_last, g_dbg_prog_zero,
-                g_dbg_vbo_last, g_dbg_vbo_zero, g_dbg_texbind_last, g_dbg_texbind_zero);
-         /* Content check: read a block of the engine's VRAM texture.  Every
-          * scalar we can instrument is identical between the black and the good
-          * runs, so the difference has to be in the data itself. */
-         if (yk.ReadPixels && g_dbg_engine_tex)
-         {
-            static unsigned int tmpfbo = 0;
-            static unsigned char blk[256 * 256 * 4];   /* 256x256 RGBA */
-            if (!tmpfbo) yk.GenFramebuffers(1, &tmpfbo);
-            yk.BindFramebuffer(YK_GL_FRAMEBUFFER, tmpfbo);
-            yk.FramebufferTexture2D(YK_GL_FRAMEBUFFER, YK_GL_COLOR_ATTACHMENT0,
-                  YK_GL_TEXTURE_2D, (YK_Uint)g_dbg_engine_tex, 0);
-            if (yk.CheckFramebufferStatus &&
-                yk.CheckFramebufferStatus(YK_GL_FRAMEBUFFER) == 0x8CD5)
-            {
-               /* Sample SEVERAL spread-out blocks, not just the top-left corner:
-                * the layers may read any part of this texture. */
-               int tw = 1024, th = 1024, bi;
-               if (yk.GetTexLevelParameteriv)
-               {
-                  yk.GetTexLevelParameteriv(YK_GL_TEXTURE_2D, 0, 0x0DE0, &tw);
-                  yk.GetTexLevelParameteriv(YK_GL_TEXTURE_2D, 0, 0x0DE1, &th);
-               }
-               printf("[YKDBG] vramtex tex=%d size=%dx%d", g_dbg_engine_tex, tw, th);
-               for (bi = 0; bi < 4; bi++)
-               {
-                  int bx = (bi & 1) ? (tw > 256 ? tw/2 : 0) : 0;
-                  int by = (bi & 2) ? (th > 256 ? th/2 : 0) : 0;
-                  unsigned long k, nz = 0;
-                  int bw = (tw - bx) < 256 ? (tw - bx) : 256;
-                  int bh = (th - by) < 256 ? (th - by) : 256;
-                  if (bw <= 0 || bh <= 0) { printf(" b%d=skip", bi); continue; }
-                  yk.ReadPixels(bx, by, bw, bh, GL_RGBA, GL_UNSIGNED_BYTE, blk);
-                  for (k = 0; k < (unsigned long)bw * bh * 4; k += 4)
-                     if (blk[k] || blk[k+1] || blk[k+2]) nz++;
-                  printf(" b%d(%d,%d)=%lu", bi, bx, by, nz);
-               }
-               printf("\n");
-            }
-            else
-               printf("[YKDBG] vramtex tex=%d FBO incomplete\n", g_dbg_engine_tex);
-            yk.BindFramebuffer(YK_GL_FRAMEBUFFER, yk.mirror_fbo);
-         }
-      }
-   }
-   free(buf);
-}
 
 static void yk_adopt_front_fbo(void)
 {
@@ -1858,7 +1410,6 @@ void YuiSwapBuffers(void)
          yk.Finish();
       {
          static unsigned yk_dump_frame = 0;
-         yk_dump_mirror(yk_dump_frame++);
       }
       yk.frame_pending = 1;
       one_frame_rendered = true;
@@ -3179,29 +2730,11 @@ void reset_global_gl_state()
 /* Per-frame trace used to find the FIRST divergence between a run that goes
  * black and one that does not: the PC sequence up to that point is identical, so
  * the first differing line is where the machine took a different path. */
-static void yk_cpylog(void)
-{
-   if (!yk_dbg_enabled()) return;
-   static int init = -1;
-   static FILE *fp = NULL;
-   if (init < 0) { init = 0; fp = fopen("/mnt/sdcard/cpy.txt", "w"); }
-   if (!fp || !MSH2) return;
-   /* Every 8th frame only: writing a line every frame slows the emulation
-    * enough to make EVERY run go black, which defeats the comparison. */
-   if ((yabsys.frame_count % 8) != 0) return;
-   fprintf(fp, "%u %08X %08X %08X %08X %08X\n", (unsigned)yabsys.frame_count,
-           (unsigned)MSH2->regs.PC, SSH2 ? (unsigned)SSH2->regs.PC : 0u,
-           (unsigned)MSH2->regs.R[4], (unsigned)MSH2->regs.R[5],
-           (unsigned)MSH2->regs.R[6]);
-   if ((yabsys.frame_count % 60) == 0) fflush(fp);
-}
 
 void retro_run(void)
 {
    unsigned i;
    bool updated  = false;
-   yk_cpylog();
-   yk_stat_log();
    one_frame_rendered = false;
 
    if (!all_devices_ready)

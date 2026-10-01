@@ -19,13 +19,6 @@
 
 #include <stdlib.h>
 #include <math.h>
-int g_dbg_ygl_calls = 0, g_dbg_ygl_dispoff = 0;
-int g_dbg_win0cnt = -1, g_dbg_win1cnt = -1, g_dbg_bspwin = -1;
-int g_dbg_wctlc = -1, g_dbg_wctl_gate = -1, g_dbg_winwrites = 0;
-int g_dbg_default_fbo = -1, g_dbg_target_fbo = -1, g_dbg_bound_fbo = -1;
-int g_dbg_engine_tex = 0;
-int g_dbg_originx = 0, g_dbg_originy = 0, g_dbg_glw = 0, g_dbg_glh = 0;
-int g_dbg_tm_current = -1, g_dbg_tm_tex = 0, g_dbg_tm_frames = 0;
 #include "ygl.h"
 #include "yui.h"
 #include "vidshared.h"
@@ -3448,12 +3441,6 @@ void YglSetVdp2Window()
     bwin0 = (Vdp2Regs->WCTLC >> 9) &0x01;
     bwin1 = (Vdp2Regs->WCTLC >> 11) &0x01;
     bspwin = ((Vdp2Regs->SPCTL >> 4) & 0x03) == 0x01;
-    g_dbg_win0cnt = _Ygl->win0_vertexcnt;
-    g_dbg_win1cnt = _Ygl->win1_vertexcnt;
-    g_dbg_bspwin  = bspwin ? 1 : 0;
-    g_dbg_wctlc   = Vdp2Regs->WCTLC;
-    g_dbg_wctl_gate = (_Ygl->win0_vertexcnt != 0 || _Ygl->win1_vertexcnt != 0 || bspwin) ? 1 : 0;
-    if (g_dbg_wctl_gate) g_dbg_winwrites++;
    if( (_Ygl->win0_vertexcnt != 0 || _Ygl->win1_vertexcnt != 0 || bspwin) )
    {
 
@@ -4058,27 +4045,8 @@ void YglRender(void)
   YGLLOG("YglRender\n");
 
   FrameProfileAdd("YglRender start");
-  g_dbg_default_fbo = (int)_Ygl->default_fbo;
-  g_dbg_target_fbo  = (int)_Ygl->targetfbo;
-  g_dbg_tm_current  = YglTM ? YglTM->current : -1;
-  g_dbg_tm_tex      = YglTM ? (int)YglTM->textureID_in[YglTM->current] : 0;
-  g_dbg_engine_tex  = g_dbg_tm_tex;
-  g_dbg_originx = _Ygl ? (int)_Ygl->originx : 0;
-  g_dbg_originy = _Ygl ? (int)_Ygl->originy : 0;
-  g_dbg_glw = GlWidth; g_dbg_glh = GlHeight;
-  g_dbg_tm_frames++;
-  g_dbg_ygl_calls++;
   if ((Vdp2Regs->TVMD & 0x8000) == 0)
   {
-    /* Pure (0,0,0) frame with no back screen: is this early-out the cause?
-     * In the async path Vdp2Regs is swapped per line by Vdp2RestoreRegs() and
-     * the main thread is writing the NEXT frame's snapshots, so this check may
-     * be looking at a different object than the dump probes do. */
-    g_dbg_ygl_dispoff++;
-    if (getenv("YAB_YGLDBG") && g_dbg_ygl_dispoff <= 20)
-      printf("[YGLDBG] early-out #%d TVMD=%04X BGON=%04X PRINA=%04X PRINB=%04X\n",
-             g_dbg_ygl_dispoff, (unsigned)Vdp2Regs->TVMD, (unsigned)Vdp2Regs->BGON,
-             (unsigned)Vdp2Regs->PRINA, (unsigned)Vdp2Regs->PRINB);
     glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
     goto render_finish;
