@@ -4,11 +4,15 @@
 (a fork of [Yabause](https://github.com/Yabause/yabause) / Yaba Sanshiro by devmiyax),
 pinned at [`a40dace1`](https://github.com/sydarn/yabause/commit/a40dace1)
 (devmiyax `B2_1_11`, standalone 1.11.0 lineage). Branch **`h700`** is the only maintained
-branch here; upstream development on this line has stopped.
+branch here; upstream development on this line has stopped. The **Sega Titan Video (ST-V)**
+support was developed on a `stv` branch and merged into `h700` in `aa20951b` (2026-10-02);
+`stv` is kept on the remote as a historical reference.
 
 It targets low-end ARM handhelds — verified on the **Anbernic RGSP**
 (Allwinner H700, 4× Cortex-A53, Mali-G31 / libmali, glibc 2.35) with the NextUI/minarch-gl
-frontend — and is loaded as `yabasanshiro_libretro.so`.
+frontend — and is loaded as `yabasanshiro_libretro.so`. It plays **Sega Saturn** discs and
+**Sega Titan Video (ST-V)** arcade ROMs (the latter ported from the `kronos` branch of
+`libretro/yabause`, see *Sega Titan Video (ST-V)* below).
 
 ## What this branch adds
 
@@ -76,6 +80,55 @@ Two build switches, both off by default, both required for the async build:
 | `YAB_ASYNC_RENDERING` | upstream's VDP render thread (its `#define` in `vdp1.h` is commented out) |
 | `YAB_CORE_SHARED_CONTEXT` | the core-owned shared context added here (no-op when undefined) |
 
+## Sega Titan Video (ST-V)
+
+Ported from the **`kronos` branch of [`libretro/yabause`](https://github.com/libretro/yabause/tree/kronos)**
+(tip `3791ffb`, "Merge pull request #328 from WizzardSK/aarch64-kronos"; that branch is in turn the
+libretro port of [`FCare/Kronos`](https://github.com/FCare/Kronos)). Both are GPL-2.0, like this
+tree. What came over:
+
+* `stv.c`/`stv.h` — the ST-V BIOS table (`BiosList`: file name + CRC32 + region) and the game table
+  (`GameList`, 103 titles), zip ROM/BIOS loading, the 48 MiB ROM-board image, the NV-RAM template.
+* `eeprom.c`/`eeprom.h` and the SMPC bit-bang that drives it (PDR1 `0x3f` write, DO bit read back
+  through PDR2) — without it the ST-V BIOS spins forever waiting for the EEPROM.
+* `decrypt.c`/`decrypt.h`, the cs1 decryption channel in `cs0.c`, and `junzip.c`/`junzip.h` for
+  reading game ROMs and `stvbios.zip` straight out of the zip.
+* `cs0.c`'s `CART_ROMSTV` cartridge type (48 MiB) and the `memory.c` DMA read path the decryption
+  needs.
+* The **IOGA / JAMMA cabinet input**: `peripheral.c` keeps `IOPORT`/`PerCabAdd` and the games read
+  it at `0x04000000` (`0x01` P1, `0x03` P2, `0x05` system = coin/test/service/START); `libretro.c`
+  binds the frontend's joypad to the `PERJAMMA_*` keys.
+* The `memory.c`/`smpc.c`/`scu.c`/`yabause.c` alignments the port needs (`yabsys.isSTV` gating of
+  the Saturn-only init paths, the OREG[31] handshake, the PDR2 sound-CPU wire) and the libretro
+  hooks: `stv_mode` detected from the zip entry names + CRC32, `stv_favorite_region`, the ST-V key
+  descriptors.
+
+Two deliberate differences from Kronos, both measured:
+
+* **The backup-RAM card layout stays the classic yabause one** (`header[32]` = `FF 'B' FF 'a' …`,
+  card byte N at offset `2N+1`). Kronos' dense layout made every `<rom>.sav` written by an earlier
+  build unreadable, and a real BIOS then answers *"The System Memory is not ready for use. Please
+  clear all files using Sega Saturn's Memory Manager."* (Guardian Heroes, Castlevania SotN).
+  `6407c37d` reverts just that group; the `extend_backup` value and the real word/long handlers
+  from the same commit are kept.
+* **`SmpcSetTiming()` gives the INTBACK case a timing for every `IREG[0]`** (`56753e92`). The old
+  code handled only `IREG[0] == 0x01`/`0x00`; cotton2 asks with `0xFF`/`0x80`, so `SmpcExec()`
+  never ran the command, `SR` stayed 0 and the game never read the pad. That is why the
+  picture-good line never saw coin or START (the only build that did was the full Kronos SMPC port,
+  which came with a black picture and a deadlock at the resolution switch). Coin, START and the
+  in-game 1P start were verified on this tree afterwards.
+
+To run an ST-V game, put `stvbios.zip` in the frontend's **system** directory (next to
+`saturn_bios.bin`) and the game zips in the ROM directory. The board is recognised from the zip
+entry names + CRC32, so a re-zipped or renamed `stvbios.zip` silently falls back to Saturn mode.
+
+*Known limitation*: the ST-V SRAM lives in one shared `<save>/yabasanshiro/backup.bin` instead of
+Kronos' per-game `<save>/stv/<rom>.ram`.
+
+The probes and recorders that the porting effort needed (SMPC/IOGA loggers, black-box recorders,
+per-frame stat dumps, the `autopress.txt` hook) were removed in `09b9f8b8`: the shipping core runs
+no test instrumentation.
+
 ## Building
 
 ```sh
@@ -131,16 +184,21 @@ per-core configuration directory from the part before the first `_` (and segfaul
 ## Measured
 
 Anbernic RGSP (Allwinner H700, Mali-G31), minarch-gl hardware render, CPU governor pinned to
-`performance` (1512 MHz on all four cores), 120 s windows, frameskip disabled, debug HUD off,
-fps at frame 3600:
+`performance` (1512 MHz on all four cores), 4000-frame windows, **frameskip disabled**, debug HUD
+off. Values are *fps at frame 3600 / average over the window*; the control is the same tree built
+synchronously (no `YAB_ASYNC_RENDERING`/`YAB_CORE_SHARED_CONTEXT`):
 
-| Build | Golden Axe | Daytona USA |
-|---|---|---|
-| synchronous | 52.2 | 39.0 |
-| async + shared context | **58.4** (+8.8 %) | **40.3** (+3.3 %) |
+| Build | Golden Axe | Daytona USA | cotton2 (ST-V) | Die Hard Arcade (ST-V) |
+|---|---|---|---|---|
+| synchronous | 50.3 / 54.3 | 33.6 / 39.1 | — | — |
+| async + shared context | **60.2 / 60.4** | **40.4 / 43.6** | **55.3 / 55.7** | **42.7 / 48.9** |
 
-The emulation thread runs at ~0.70–0.84 cores instead of the synchronous build's ~1.0 (capped at
-one core), which is where the gain comes from; the render worker holds its own core.
+⇒ **+19.7 % (Golden Axe)** and **+20.2 % (Daytona USA)** at frame 3600, or +11.2 % / +11.5 % on the
+window average. Whole-process CPU (all threads) measures 1.41 → 1.71 cores on Golden Axe and
+~1.9 on Daytona, and the async build runs one thread more (9 vs 8): the VDP worker now does the
+rendering the emulation thread used to do inline, so the emulation thread is no longer pinned to a
+single core. (Re-measured 2026-10-02 on the merged `h700`; these numbers supersede the earlier
+58.4 / 40.3, which came from a different sampling point.)
 
 Known costs: the worker performs one `glFinish()` per frame (a whole-pipeline drain on the render
 thread, so the frame is complete in the shared texture before the frontend samples it from its own
@@ -153,6 +211,11 @@ blocking), and the presentation path adds a normalise pass in the frontend.
 * Upstream: [sydarn/yabause](https://github.com/sydarn/yabause) → devmiyax's Yaba Sanshiro →
   [Yabause](https://github.com/Yabause/yabause). The upstream website (uoyabause.org) is
   offline.
+* **ST-V support is ported from the `kronos` branch of
+  [`libretro/yabause`](https://github.com/libretro/yabause/tree/kronos)** (tip `3791ffb`), which is
+  the libretro port of [FCare/Kronos](https://github.com/FCare/Kronos). The `stv.c`/`eeprom.c`/
+  `decrypt.c`/`junzip.c` files, the cs0/cs1 cartridge and decryption channels, the IOGA/JAMMA
+  input model and the SMPC/peripheral alignments come from there (GPL-2.0, same as this tree).
 * The upstream tree's own documentation is kept as-is: `yabause/README`, `README.LIN`,
   `README.QT`, `README.WIN`, `README.DC`, `README.MAC` and `yabause/doc/`.
 * Upstream community, not maintained by this fork:
