@@ -123,6 +123,12 @@ To run an ST-V game, put `stvbios.zip` in the frontend's **system** directory (n
 `saturn_bios.bin`) and the game zips in the ROM directory. The board is recognised from the zip
 entry names + CRC32, so a re-zipped or renamed `stvbios.zip` silently falls back to Saturn mode.
 
+The core advertises `block_extract = true`, so the frontend has to hand the romset **zip over
+unextracted** — the core opens it itself (RetroArch would otherwise extract a member to
+`/tmp/cache/…` and the board detection would never run). A side effect is that Saturn CD images
+must be uncompressed (`.cue`/`.bin`/`.iso`/`.chd`); a zipped disc is not something this core can
+mount.
+
 The ST-V **SRAM is per game**: `<save>/stv/<game>.ram`, next to the `<game>.nv` EEPROM, matching
 Kronos' naming (the layout is still our classic 64 KB card image, not Kronos' dense 32 KB one). A
 Saturn keeps one shared internal memory card, as on hardware. Making that file actually appear

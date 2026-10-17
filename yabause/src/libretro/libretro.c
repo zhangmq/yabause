@@ -1652,7 +1652,15 @@ void retro_get_system_info(struct retro_system_info *info)
 #endif
    info->library_version  = "v" VERSION GIT_VERSION;
    info->need_fullpath    = true;
-   info->block_extract    = false;
+   /* ST-V games are MAME romsets: the core opens the .zip itself and matches its
+      entries by name + CRC32 against the game list, so the frontend must hand the
+      archive over as-is.  With block_extract false RetroArch extracts the zip and
+      passes the extracted member (measured on EmuELEC/RetroArch 1.21.0:
+      "extracting archive to temporary directory ... /tmp/cache/eeprom-<game>.bin"),
+      the detection never runs and the zip is then tried as a Saturn CD image
+      ("Unsupported CD image!").  Both reference branches (libretro/yabause
+      yabasanshiro and kronos) set this to true. */
+   info->block_extract    = true;
    info->valid_extensions = "bin|ccd|chd|cue|iso|mds|m3u|zip";
 }
 
@@ -2338,11 +2346,17 @@ bool retro_load_game(const struct retro_game_info *info)
       const char *ext = path_get_extension(info->path);
 
       if (ext != NULL && strcasecmp(ext, "zip") == 0)
-         STVGetSingle(info->path, stv_bios_path, &stvgame);
-      if (stvgame != NULL)
       {
-         stv_mode = true;
-         log_cb(RETRO_LOG_INFO, "ST-V game detected: %s\n", stvgame);
+         STVGetSingle(info->path, stv_bios_path, &stvgame);
+         if (stvgame != NULL)
+         {
+            stv_mode = true;
+            log_cb(RETRO_LOG_INFO, "ST-V game detected: %s\n", stvgame);
+         }
+         else
+            log_cb(RETRO_LOG_WARN,
+                   "%s: no ST-V romset in the game list matched this zip -- "
+                   "trying it as a Saturn CD image\n", info->path);
       }
    }
 
