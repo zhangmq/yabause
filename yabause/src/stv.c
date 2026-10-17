@@ -2462,7 +2462,16 @@ int processBios(JZFile *zip,void *input) {
     //LOGSTV("%s, %d / %d bytes at offset %08X\n", filename, header.compressedSize, header.uncompressedSize, header.offset);
     j=0;
     while(BiosList.blobs[j].type != GAME_END) {
-      if ((header.crc32 == BiosList.blobs[j].crc32) && (strcmp(BiosList.blobs[j].filename,filename)==0)) {
+      /* Match by content (CRC32) only, not by filename.  MAME has renamed these
+         files over the years: this list (ported from Kronos) says
+         "epr-17954a.ic8" while the widely distributed "Sega ST-V (Full Romset
+         and Bios Files)" package ships the byte-identical file as "mp17954a.s"
+         (measured: all six entries of its stvbios.zip have the same CRC32 as
+         this list, only the names differ).  Requiring the name made such a
+         package look like an unknown board and silently fall back to Saturn
+         mode.  CRC32 still pins the exact bytes, so no different BIOS revision
+         is accepted. */
+      if (header.crc32 == BiosList.blobs[j].crc32) {
         //Compatible file found
         biosFound[j] = 1;
       }
@@ -2510,6 +2519,7 @@ int copyBios(JZFile *zip, void* id) {
     char long_filename[MAX_LENGTH_FILENAME];
     char* filename;
     char* biosname = NULL;
+    u32 bioscrc = 0;   /* CRC32 of the specific BIOS a game asks for (biosname's bytes) */
     u8* data;
     unsigned int i,j, dataAvailable;
     rominfo* info = (rominfo*)id;
@@ -2535,6 +2545,7 @@ int copyBios(JZFile *zip, void* id) {
         // We need a specific bios
         biosname = (char*)malloc(strlen(availableGames[gameId].entry->blobs[i].filename) + 1);
         strcpy(biosname, availableGames[gameId].entry->blobs[i].filename);
+        bioscrc = availableGames[gameId].entry->blobs[i].crc32;
       }
       i++;
     }
@@ -2542,7 +2553,13 @@ int copyBios(JZFile *zip, void* id) {
     i=0;
     dataAvailable = 0;
     while(biosLink.entry->blobs[i].type != GAME_END) {
-      if (strncmp(biosLink.entry->blobs[i].filename, filename, MAX_LENGTH_FILENAME) == 0) {
+      /* Match by content (CRC32) here too, exactly like processBios does when it
+         decides whether the board is recognised.  Matching only the filename in
+         this loop is what made a renamed-but-identical stvbios.zip (the usual
+         "Sega ST-V (Full Romset and Bios Files)" package: mp17954a.s where this
+         list says epr-17954a.ic8, same CRC32) get *detected* and then run with an
+         empty BiosRom -- a black screen and no error message anywhere. */
+      if (header.crc32 == biosLink.entry->blobs[i].crc32) {
         if (dataAvailable == 0) {
           dataAvailable = (jzReadData(zip, &header, data) == Z_OK);
         }
@@ -2556,7 +2573,7 @@ int copyBios(JZFile *zip, void* id) {
             case BIOS_BLOB:
               if(biosname != NULL) {
                 // Load the special bios (sfish2 & sfish2j have a special bios, part of the romset, which allow optical media reading)
-                if (strcmp(biosname,filename) == 0) {
+                if (bioscrc == biosLink.entry->blobs[i].crc32) {
                   LOGSTV("Load bios %s\n", filename);
                   for (j=0; j<biosLink.entry->blobs[i].length;j++) {
                     T1WriteByte(BiosRom, biosLink.entry->blobs[i].offset+j, data[j]);
