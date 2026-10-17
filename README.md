@@ -78,8 +78,12 @@ Two build switches, both off by default, both required for the async build:
 
 | Define | Meaning |
 |---|---|
-| `YAB_ASYNC_RENDERING` | upstream's VDP render thread (its `#define` in `vdp1.h` is commented out) |
-| `YAB_CORE_SHARED_CONTEXT` | the core-owned shared context added here (no-op when undefined) |
+| `YAB_ASYNC_RENDERING` | upstream's VDP render thread (its `#define` in `vdp1.h` is commented out); **on by default** in this branch |
+| `YAB_CORE_SHARED_CONTEXT` | the core-owned shared context added here (no-op when undefined); **on by default** in this branch |
+
+Both are added by `yabause/src/libretro/Makefile.common` now, so a plain `make platform=arm64` gives
+the shipping asynchronous core. Build the old synchronous one with `make platform=arm64 YAB_SYNC=1`
+(kept for A/B comparisons -- it is how the ~+20 % below was measured).
 
 ## Sega Titan Video (ST-V)
 
@@ -147,18 +151,16 @@ no test instrumentation.
 ```sh
 cd yabause/src/libretro
 
-# synchronous build
+# asynchronous build (the default now: Makefile.common adds both defines)
 make platform=arm64
 
-# asynchronous build (what this branch ships)
-CFLAGS="-DYAB_ASYNC_RENDERING -DYAB_CORE_SHARED_CONTEXT" \
-CXXFLAGS="-DYAB_ASYNC_RENDERING -DYAB_CORE_SHARED_CONTEXT" \
-make platform=arm64
+# synchronous build (A/B reference)
+make platform=arm64 YAB_SYNC=1
 ```
 
-Pass the defines **in the environment**, not as `make CFLAGS=…`: a `CFLAGS` on the command line
-overrides the makefile's own `CFLAGS += $(FLAGS)`, which would drop the platform flags
-(`-DAARCH64`, `-D_OGLES3_`, `-I…`, `-D__LIBRETRO__`, `-std=gnu99`, …).
+(Before this branch made them the default you had to pass them yourself, and only in the environment
+-- a `CFLAGS=` on the command line overrides the makefile's own `CFLAGS += $(FLAGS)` and would drop
+the platform flags (`-DAARCH64`, `-D_OGLES3_`, `-I…`, `-D__LIBRETRO__`, `-std=gnu99`, …).)
 
 `platform=arm64` selects `-DAARCH64 -march=armv8-a+crc+fp+simd -mcpu=cortex-a53`, `FORCE_GLES=1`,
 `-D_OGLES3_ -DHAVE_OPENGLES -DHAVE_OPENGLES3` and `HAVE_GLSYM_PRIVATE`.

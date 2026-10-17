@@ -35,6 +35,20 @@ FLAGS += -D__LIBRETRO__ -DHAVE_LIBGL -DVERSION=\"3.4.2\" -DHAVE_LROUND -D_7ZIP_S
 #  once the device was idle.  Timing numbers are only worth what the idle state
 #  behind them is worth -- check `top`/`/proc/loadavg` first.)
 FLAGS += -DDONT_PROFILE
+# Async rendering is this fork's shipping configuration, so build it by default
+# instead of leaving it to whoever remembers to pass the defines:
+#   YAB_ASYNC_RENDERING     upstream's VDP render thread (its #define in vdp1.h
+#                           is commented out, so it is off unless asked for)
+#   YAB_CORE_SHARED_CONTEXT the core-owned shared context added by this fork; a
+#                           no-op when undefined, and it is what lets the VDP
+#                           thread render into the frontend's texture
+# Measured on the RGSP, 4000-frame windows, governor pinned, frameskip disabled:
+# Golden Axe 50.3 -> 60.2 fps, Daytona USA 33.6 -> 40.4 fps (~+20 %).
+# A synchronous core is still useful as an A/B reference, hence the opt-out:
+#   make ... YAB_SYNC=1
+ifneq ($(YAB_SYNC),1)
+FLAGS += -DYAB_ASYNC_RENDERING -DYAB_CORE_SHARED_CONTEXT
+endif
 FLAGS += -include $(CORE_DIR)/gl_compat_extra.h
 # Windows-ism used by cdbase.c; POSIX spelling exists in glibc/strings.h
 FLAGS += -Dstricmp=strcasecmp -Dstrnicmp=strncasecmp
