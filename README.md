@@ -122,6 +122,8 @@ Two deliberate differences from Kronos, both measured:
 To run an ST-V game, put `stvbios.zip` in the frontend's **system** directory (next to
 `saturn_bios.bin`) and the game zips in the ROM directory. The board is recognised from the zip
 entry names + CRC32, so a re-zipped or renamed `stvbios.zip` silently falls back to Saturn mode.
+`yabasanshiro_libretro.info` declares that file the way Kronos' `.info` does (`firmware1`, optional,
+because Saturn titles do not need it), so RetroArch's *Information → Firmware* list names it too.
 
 The core advertises `block_extract = true`, so the frontend has to hand the romset **zip over
 unextracted** — the core opens it itself (RetroArch would otherwise extract a member to
