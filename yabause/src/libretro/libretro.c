@@ -1841,6 +1841,32 @@ void retro_get_system_av_info(struct retro_system_av_info *info)
    info->geometry.max_width    = 704 * (initial_resolution_mode == max_resolution_mode ? max_resolution_mode/2 : initial_resolution_mode);
    info->geometry.max_height   = 512 * (initial_resolution_mode == max_resolution_mode ? max_resolution_mode/2 : initial_resolution_mode);
    info->geometry.aspect_ratio = (retro_get_region() == RETRO_REGION_NTSC) ? 4.0 / 3.0 : 5.0 / 4.0;
+   /* Screen rotation, following the RetroArch convention the way flycast does it
+      (shell/libretro/libretro.cpp: setRotation() + setGameGeometry()): the core
+      leaves the framebuffer alone and asks the frontend to turn it.
+      Kronos -- where this ST-V support came from -- is the same in its libretro
+      build: its renderer's own rotation is guarded by
+      `#ifndef __LIBRETRO__ ... #else u32 isRotated = 0;` (opengl/common/src/
+      ogl_shader.c), i.e. the rotated texture-coordinate set is for its
+      standalone build only.  So no renderer work belongs here; this core has
+      none and needs none.
+      Vertical ST-V boards produce a sideways picture -- the ported game list
+      carries a per-title ROTATED flag (shienryu is one) and STVInit() copies it
+      into yabsys.isRotated; a Saturn game leaves that 0.
+      The command is sent unconditionally, including 0: a frontend keeps the last
+      value it was handed (minarch-gl's ma_gl_rotation is a plain static, reset by
+      nothing between games), so staying silent would leave the previous title's
+      rotation applied.  The aspect ratio is inverted only while rotated, so that
+      the frontend's own width/height swap lands on the right box -- minarch-gl
+      documents exactly this pairing ("it fits the core's reported aspect, which
+      for flycast rotated games is 0.75"), and Kronos, where this ST-V support
+      came from, does the same in its av_info path. */
+   {
+      unsigned rotation = (unsigned)yabsys.isRotated;
+      environ_cb(RETRO_ENVIRONMENT_SET_ROTATION, &rotation);
+      if (rotation != 0)
+         info->geometry.aspect_ratio = 1.0f / info->geometry.aspect_ratio;
+   }
 }
 
 void retro_set_controller_port_device(unsigned port, unsigned device)
