@@ -143,7 +143,6 @@ void ScspUnMuteAudio(int flags);
 void ScspSetVolume(int volume);
 void ScspAsynMain(void * p);
 void ScspExecAsync();
-void ScspPumpPendingInterrupts(void);
 void FASTCALL scsp_w_b(u32, u8);
 void FASTCALL scsp_w_w(u32, u16);
 void FASTCALL scsp_w_d(u32, u32);
