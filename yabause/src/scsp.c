@@ -4864,24 +4864,11 @@ c68k_interrupt_handler (u32 level)
 
 //////////////////////////////////////////////////////////////////////////////
 
-/* The SCSP -> main-CPU interrupt is the SCU's sound request (0x46 / level 9).
- * In async builds this handler runs on the SCSP/68k thread while the SCU state
- * (ScuRegs, its interrupt queue, SH2 delivery) belongs to the thread that runs
- * ScuExec.  Queue it and let the frame loop deliver it from the SCU's own
- * thread: the sound side's IRQ then lands at a fixed deciline instead of at a
- * moment decided by host scheduling. */
-static _Atomic int pending_sound_request = 0;
-
 static void
 scu_interrupt_handler (void)
 {
-  atomic_store (&pending_sound_request, 1);
-}
-
-void ScspPumpPendingInterrupts (void)
-{
-  if (atomic_exchange (&pending_sound_request, 0))
-    ScuSendSoundRequest ();
+  // send interrupt to scu
+  ScuSendSoundRequest ();
 }
 
 //////////////////////////////////////////////////////////////////////////////
