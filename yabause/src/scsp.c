@@ -1539,8 +1539,27 @@ void generate_sample(struct Scsp * s, int rbp, int rbl, s16 * out_l, s16* out_r,
 
       get_panning(s->slots[i].regs.efpan, &pan_val_l, &pan_val_r);
 
-      panned_l = (efsdl_applied >> pan_val_l)>>1;
-      panned_r = (efsdl_applied >> pan_val_r)>>1;
+      /* The DSP effect returns (i < 16) and the two external inputs (slots
+         16/17, where the CD-DA stream enters) are mixed at the same 0 dBFS
+         scale as a slot: MAME's pan/level table puts one unity return exactly
+         at full scale, and the CD input arrives as sample*32768, with no extra
+         headroom on either path.  The ">> 1" that used to be here was this
+         mixer's own convention and cost both paths 6 dB.
+
+         That is issue #4's Daytona USA: its music is synthesised by the SCSP
+         DSP and comes out through the EFREG returns, so it played 6 dB down
+         (peak 8754 = -11.5 dBFS).  Dropping the shift doubles it to 17506
+         (-5.4 dBFS) and leaves slot-mixed titles alone (cotton2 mean 1136 ->
+         1144, peak 18813 -> 18630, i.e. run-to-run noise).
+
+         The per-slot ">> 1" in the loop above is deliberately *not* touched:
+         the same +6 dB on the dry slots pushes titles that already sit at full
+         scale deeper into the s16 clamp (cotton2 26418 -> 32768, gaxe 32768),
+         and an on-screen A/B rejected that.  This keeps the two paths at the
+         hardware-relative balance the reference uses, without adding gain the
+         user can hear as clipping. */
+      panned_l = efsdl_applied >> pan_val_l;
+      panned_r = efsdl_applied >> pan_val_r;
 
       outl32 = outl32 + panned_l;
       outr32 = outr32 + panned_r;
