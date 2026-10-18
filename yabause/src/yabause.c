@@ -856,6 +856,7 @@ int YabauseEmulate(void) {
          PROFILE_STOP("hblankout");
          PROFILE_START("SCSP");
          ScspExec();
+         ScspPumpPendingInterrupts();
          PROFILE_STOP("SCSP");
          yabsys.DecilineCount = 0;
          yabsys.LineCount++;
