@@ -28,6 +28,10 @@ frontend — and is loaded as `yabasanshiro_libretro.so`. It plays **Sega Saturn
   gains 3–9 % depending on the game (see *Measured*).
 * `b2bb246e` — hand the frontend's GL context back after borrowing the shared one (SDL tracks
   "which context is current" per thread in TLS; bypassing it left the frontend without a context).
+* **Renderer mode is a runtime setting** (see below): both renderers are compiled in and the core
+  option *Async Renderer* picks one per boot, instead of a `YAB_SYNC=1` rebuild. The async path is
+  faster but lets host scheduling reach the emulated machine; the inline path is deterministic and
+  is the workaround for the black-screen boot described below.
 
 **GL / correctness on this driver** (textures are shared between the two contexts, FBOs are not):
 
@@ -74,16 +78,37 @@ span at ~1.09 cores; fixing the clock source restored the on-demand synchronisat
 An optional realtime priority switch exists (`YAB_SCSP_RT_PRIO`/`YAB_SCSP_RT_NICE`, off by default:
 it measured neutral on this device).
 
-Two build switches, both off by default, both required for the async build:
+### Renderer mode is a runtime setting
 
-| Define | Meaning |
-|---|---|
-| `YAB_ASYNC_RENDERING` | upstream's VDP render thread (its `#define` in `vdp1.h` is commented out); **on by default** in this branch |
-| `YAB_CORE_SHARED_CONTEXT` | the core-owned shared context added here (no-op when undefined); **on by default** in this branch |
+Both renderers are compiled into one core and selected by the core option **Async Renderer**
+(`yabasanshiro_async_rendering`, category *Video*, default `enabled`). It is latched when a game is
+loaded -- the GL context and the render worker are created once per machine boot -- so a change
+takes effect on the **next launch** of a game ("Core restart required").
 
-Both are added by `yabause/src/libretro/Makefile.common` now, so a plain `make platform=arm64` gives
-the shipping asynchronous core. Build the old synchronous one with `make platform=arm64 YAB_SYNC=1`
-(kept for A/B comparisons -- it is how the ~+20 % below was measured).
+* `enabled` (default) -- VDP1/VDP2 rendering runs on its own thread through the core-owned shared
+  context described above. The fastest configuration, and what this fork is about.
+* `disabled` -- the frame loop draws inline with the frontend's context, exactly like upstream
+  Yabause. Slower, but the emulated machine no longer depends on host scheduling.
+
+**If a game boots to a black screen while the emulator still reports a healthy frame rate** --
+seen on some Sega Titan Video titles -- set *Async Renderer* to `disabled`, save the setting, then
+exit and relaunch the game. The inline renderer is deterministic; measured cost on this device is
+7--17 % on heavy titles and nothing on titles that are already at 60 fps. Some titles only trip
+this after a key press during boot, so the switch is worth trying before blaming the ROM or the
+BIOS.
+
+Measured on the RGSP (2400-frame windows, governor pinned at `performance`/1512000, frameskip
+disabled) -- same core, only the option differs:
+
+| Title | `enabled` (async) | `disabled` (inline) |
+|---|---|---|
+| cotton2 (ST-V) | 56.2 | 46.4 |
+| Daytona USA | 47.1 | 43.8 |
+| Golden Axe - The Duel | 60.6 | 54.9 |
+
+There is no build-time switch left: `make platform=arm64 YAB_SYNC=1` no longer changes anything
+(the defines it removes no longer gate code). For A/B runs the environment variable
+`YAB_VDP_SYNC=1` forces the inline path.
 
 ## Sega Titan Video (ST-V)
 
@@ -107,6 +132,15 @@ tree. What came over:
   the Saturn-only init paths, the OREG[31] handshake, the PDR2 sound-CPU wire) and the libretro
   hooks: `stv_mode` detected from the zip entry names + CRC32, `stv_favorite_region`, the ST-V key
   descriptors.
+
+**Known ST-V quirk -- black screen at full speed.** A few ST-V titles can boot to a black screen
+while the emulator still runs at ~60 fps and the audio is alive; it is input-timing dependent
+(a key press during the boot sequence can be the trigger) and it is a *rendering-schedule*
+problem, not a bad dump: with the inline renderer those same boots come out identical every time.
+If it happens, set the *Async Renderer* core option to `disabled`, save, and relaunch the game --
+see [Renderer mode is a runtime setting](#renderer-mode-is-a-runtime-setting). It was tracked down
+on `batmanfr`: 3 of 12 boot+coin combinations went black with the async renderer, 0 of 12 with the
+inline one.
 
 Two deliberate differences from Kronos, both measured:
 
@@ -151,11 +185,8 @@ no test instrumentation.
 ```sh
 cd yabause/src/libretro
 
-# asynchronous build (the default now: Makefile.common adds both defines)
+# one build, both renderers inside; the mode is a core option at runtime
 make platform=arm64
-
-# synchronous build (A/B reference)
-make platform=arm64 YAB_SYNC=1
 ```
 
 (Before this branch made them the default you had to pass them yourself, and only in the environment
@@ -180,9 +211,11 @@ per-core configuration directory from the part before the first `_` (and segfaul
 
 ## Notes for frontends
 
-* The core renders into a **core-owned mirror FBO** over the colour texture the frontend hands it
-  (FBOs are not shared between the two EGL contexts on this driver, textures are). It attaches its
-  own depth+stencil, sized to the render area.
+* With the async renderer the core renders into a **core-owned mirror FBO** over the colour texture
+  the frontend hands it (FBOs are not shared between the two EGL contexts on this driver, textures
+  are). It attaches its own depth+stencil, sized to the render area. With the inline renderer
+  (`Async Renderer = disabled`) the engine draws straight into the frontend's FBO and none of this
+  applies: `get_current_framebuffer()` is used as-is.
 * It asks for `depth` **and** `stencil` in `retro_hw_render_callback`; a frontend that builds the
   per-slot FBOs itself should attach `GL_DEPTH24_STENCIL8` (RetroArch's `gl3` and NextUI's
   minarch-gl do).

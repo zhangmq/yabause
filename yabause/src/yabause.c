@@ -132,6 +132,19 @@ u32 saved_scsp_cycles = 0;//fixed point
 volatile u64 saved_m68k_cycles = 0;//fixed point
 static u32 g_scsp_main_mode = 1;
 
+/* Renderer mode.  1 = the VDP1/VDP2 rendering runs on its own thread (the
+ * worker draws into a mirror FBO on the core's shared GL context); 0 = the
+ * frame loop draws inline with the frontend's context, exactly like upstream
+ * Yabause and like a `YAB_SYNC=1` build used to do.
+ *
+ * Both paths are compiled in and completely isolated; the flag is latched in
+ * retro_load_game() from the core option, before the context is created and
+ * before Vdp2Init() would start the worker, so it can only change on the next
+ * launch of a game.  See vdp2.cpp (Vdp2Init / Vdp2VBlankIN / Vdp2VBlankOUT /
+ * vdp2VBlankOUT / VdpResume / VdpRevoke), vdp1.cpp (PTMR direct draw) and
+ * libretro.c (shared context, mirror FBO, frame delivery). */
+int g_vdp_async = 1;
+
 extern char * getLastShaderError();
 
 //////////////////////////////////////////////////////////////////////////////

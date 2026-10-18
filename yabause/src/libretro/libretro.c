@@ -80,6 +80,11 @@ static int g_sh2coretype = SH2CORE_INTERPRETER;
 #endif
 
 static int g_frame_skip = 1;
+/* Async renderer (core option "yabasanshiro_async_rendering").  _opt is the
+ * option's intent, refreshed by check_variables(); the real g_vdp_async is
+ * latched from it in retro_load_game(), because the GL context and the VDP
+ * worker are created once per machine boot (context_reset -> YabauseInit). */
+static int g_vdp_async_opt = 1;
 static int g_rbg_resolution_mode = 0;
 static int g_rbg_use_compute_shader = 1;
 static int addon_cart_type = CART_DRAM32MBIT;
@@ -659,7 +664,6 @@ void YuiErrorMsg(const char *string)
       log_cb(RETRO_LOG_ERROR, "Yabause: %s\n", string);
 }
 
-#if defined(YAB_CORE_SHARED_CONTEXT)
 /* ============ core-side shared GL context for the async VDP thread ==========
  * The async VDP thread issues real GL calls, so it needs a current context.
  * The frontend's context belongs to the frontend's thread and cannot be handed
@@ -1166,27 +1170,35 @@ static int yk_held(void)
 {
    return yk.state == 1 && yk.GetCurrentContext && yk.GetCurrentContext() == yk.ctx_sub;
 }
-#endif /* YAB_CORE_SHARED_CONTEXT */
 
 
 static int first_ctx_reset = 1;
 
 int YuiUseOGLOnThisThread()
 {
-#if defined(YAB_CORE_SHARED_CONTEXT)
-  return yk_attach();
-#elif !defined(_USEGLEW_)
+  /* Async renderer: the VDP worker borrows the core-owned shared context.
+   * Sync renderer: nothing to borrow (the engine draws with the frontend's
+   * context on the frontend's thread), keep the old glsm bind for parity. */
+  if (g_vdp_async)
+    return yk_attach();
+#if !defined(_USEGLEW_)
   return glsm_ctl(GLSM_CTL_STATE_BIND, NULL);
+#else
+  return 0;
 #endif
 }
 
 int YuiRevokeOGLOnThisThread()
 {
-#if defined(YAB_CORE_SHARED_CONTEXT)
-  yk_detach();
-  return 0;
-#elif !defined(_USEGLEW_)
+  if (g_vdp_async)
+  {
+    yk_detach();
+    return 0;
+  }
+#if !defined(_USEGLEW_)
   return glsm_ctl(GLSM_CTL_STATE_UNBIND, NULL);
+#else
+  return 0;
 #endif
 }
 
@@ -1223,11 +1235,10 @@ int YuiRevokeOGLOnThisThread()
 
 static void yk_adopt_front_fbo(void)
 {
-#if defined(YAB_CORE_SHARED_CONTEXT)
    YK_Uint fbo, name = 0;
    YK_Int  type = 0, prev_fbo = 0;
 
-   if (yk.state != 1 || !hw_render.get_current_framebuffer)
+   if (!g_vdp_async || yk.state != 1 || !hw_render.get_current_framebuffer)
       return;
    fbo = (YK_Uint)(uintptr_t)hw_render.get_current_framebuffer();
    if (!fbo)
@@ -1256,7 +1267,6 @@ static void yk_adopt_front_fbo(void)
          yk.ring_adopt_log++;
       }
    }
-#endif
 }
 
 /* Applied on the VDP thread, at the top of YglRender(): the engine binds the
@@ -1275,8 +1285,7 @@ static void yk_adopt_front_fbo(void)
  * frontend replaced without changing the FBO name. */
 void YuiRetargetFB(void)
 {
-#if defined(YAB_CORE_SHARED_CONTEXT)
-   if (yk.state == 1 && yk.front_tex)
+   if (g_vdp_async && yk.state == 1 && yk.front_tex)
    {
       yk.BindFramebuffer(YK_GL_FRAMEBUFFER, yk.mirror_fbo);
       yk.FramebufferTexture2D(YK_GL_FRAMEBUFFER, YK_GL_COLOR_ATTACHMENT0,
@@ -1290,17 +1299,15 @@ void YuiRetargetFB(void)
       }
       yk.retarget = 0;
    }
-#endif
 }
 
 int YuiGetFB(void)
 {
-#if defined(YAB_CORE_SHARED_CONTEXT)
-  /* the engine renders into the core's mirror FBO, which attaches the
-   * frontend's colour texture (re-pointed per frame by YuiRetargetFB) */
-  if (yk.mirror_fbo)
+  /* async: the engine renders into the core's mirror FBO, which attaches the
+   * frontend's colour texture (re-pointed per frame by YuiRetargetFB).
+   * sync: the engine renders straight into the frontend's hw-render FBO. */
+  if (g_vdp_async && yk.mirror_fbo)
      return (int)yk.mirror_fbo;
-#endif
   return hw_render.get_current_framebuffer();
 }
 
@@ -1386,8 +1393,7 @@ void YuiSwapBuffers(void)
    if (GlWidth  > game_width)  game_width  = GlWidth;
    if ((prev_game_width != game_width) || (prev_game_height != game_height))
    {
-#if defined(YAB_CORE_SHARED_CONTEXT)
-      if (yk.state == 1 && yk.worker_valid && (pthread_self() == yk.worker))
+      if (g_vdp_async && yk.state == 1 && yk.worker_valid && (pthread_self() == yk.worker))
       {
          /* VIDCore->Resize() + the AV-info env callback must run on the
           * frontend's thread (retro_run); block hashing/GL here would also
@@ -1395,12 +1401,10 @@ void YuiSwapBuffers(void)
          yk.res_pending = 1;
       }
       else
-#endif
          retro_set_resolution();
    }
    audio_size = soundlen;
-#if defined(YAB_CORE_SHARED_CONTEXT)
-   if (yk.state == 1 && yk.worker_valid && (pthread_self() == yk.worker))
+   if (g_vdp_async && yk.state == 1 && yk.worker_valid && (pthread_self() == yk.worker))
    {
       /* video_cb -> frontend video_refresh -> shader chain + swap: those run
        * with the FRONTEND's context on the FRONTEND's thread, so only mark
@@ -1415,7 +1419,6 @@ void YuiSwapBuffers(void)
       one_frame_rendered = true;
       return;
    }
-#endif
    video_cb(RETRO_HW_FRAME_BUFFER_VALID, current_width, current_height, 0);
    one_frame_rendered = true;
 }
@@ -1502,10 +1505,9 @@ static void set_memory_maps(void)
 
 static void context_reset(void)
 {
-#if defined(YAB_CORE_SHARED_CONTEXT)
-   /* Create the core's own (shared) context and leave it current on this
-    * thread, so YabauseInit()'s GL objects live in the context the VDP
-    * thread uses.  Must happen before YabauseInit() starts that thread.
+   /* Async renderer only: create the core's own (shared) context and leave it
+    * current on this thread, so YabauseInit()'s GL objects live in the context
+    * the VDP thread uses.  Must happen before YabauseInit() starts that thread.
     * yk_remember_front() first, and yk_restore_front() at the end: the engine's GL
     * work below is the only part of this call that must run in the core's
     * context -- handing the frontend's context back afterwards is what keeps
@@ -1516,14 +1518,17 @@ static void context_reset(void)
     * (retro_run's option/res_pending bracket, or apply_state_buffer) is in
     * progress and owns the hand-back -- this re-entry (MA_GL_update_fbo_size ->
     * context_reset) must not hand the frontend's context back early. */
-   int outer_borrow = yk_held();
-   YK_TRACE("context_reset enter outer_borrow=%d now=%p", outer_borrow,
-         (void *)(yk.GetCurrentContext ? yk.GetCurrentContext() : NULL));
-   if (!outer_borrow)
-      yk_remember_front();
-   yk_load();
-   yk_attach();
-#endif
+   int outer_borrow = 0;
+   if (g_vdp_async)
+   {
+      outer_borrow = yk_held();
+      YK_TRACE("context_reset enter outer_borrow=%d now=%p", outer_borrow,
+            (void *)(yk.GetCurrentContext ? yk.GetCurrentContext() : NULL));
+      if (!outer_borrow)
+         yk_remember_front();
+      yk_load();
+      yk_attach();
+   }
 #if !defined(_USEGLEW_)
    glsm_ctl(GLSM_CTL_STATE_CONTEXT_RESET, NULL);
    glsm_ctl(GLSM_CTL_STATE_SETUP, NULL);
@@ -1566,33 +1571,32 @@ static void context_reset(void)
       retro_set_resolution();
       set_memory_maps();
    }
-#if defined(YAB_CORE_SHARED_CONTEXT)
    /* Engine is up: give the frontend's thread its own context back (unless an
     * outer borrow is still holding it; see outer_borrow above). */
-   YK_TRACE("context_reset engine-up now=%p (outer_borrow=%d)",
-         (void *)(yk.GetCurrentContext ? yk.GetCurrentContext() : NULL), outer_borrow);
-   if (!outer_borrow)
-      yk_restore_front();
-#endif
+   if (g_vdp_async)
+   {
+      YK_TRACE("context_reset engine-up now=%p (outer_borrow=%d)",
+            (void *)(yk.GetCurrentContext ? yk.GetCurrentContext() : NULL), outer_borrow);
+      if (!outer_borrow)
+         yk_restore_front();
+   }
 }
 
 static void context_destroy(void)
 {
-#if defined(YAB_CORE_SHARED_CONTEXT)
    /* The frontend calls context_destroy before retro_unload_game, so the
-    * VDP thread has not been joined yet: stop it, then hold the shared
-    * context on this thread for the engine's GL teardown.  yk_attach()
+    * VDP thread has not been joined yet: stop it, then (async only) hold the
+    * shared context on this thread for the engine's GL teardown.  yk_attach()
     * remembers the frontend's context and yk_detach() hands it back, so the
     * frontend keeps drawing with the context it thinks it owns. */
    Vdp2StopRenderThread();
-   yk_attach();
-#endif
+   if (g_vdp_async)
+      yk_attach();
    if (renderer_running)
       VIDCore->DeInit();
    renderer_running = false;
-#if defined(YAB_CORE_SHARED_CONTEXT)
-   yk_detach();
-#endif
+   if (g_vdp_async)
+      yk_detach();
 #if !defined(_USEGLEW_)
    glsm_ctl(GLSM_CTL_STATE_CONTEXT_DESTROY, NULL);
 #endif
@@ -1819,6 +1823,23 @@ void check_variables(void)
          polygon_mode = CPU_TESSERATION;
    }
 #endif
+
+   var.key = "yabasanshiro_async_rendering";
+   var.value = NULL;
+   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+   {
+      if (strcmp(var.value, "enabled") == 0)
+         g_vdp_async_opt = 1;
+      else if (strcmp(var.value, "disabled") == 0)
+         g_vdp_async_opt = 0;
+   }
+   /* Debug override, same pattern as YAB_SH2: force one renderer for an
+      on-device A/B without touching the frontend's option. */
+   {
+      const char *e = getenv("YAB_VDP_SYNC");
+      if (e && *e && e[0] != '0')
+         g_vdp_async_opt = 0;
+   }
 }
 
 void retro_get_system_av_info(struct retro_system_av_info *info)
@@ -1970,19 +1991,20 @@ bool retro_serialize(void *data, size_t size)
 static int apply_state_buffer(const void *data, size_t size)
 {
    int error = YabLoadStateBuffer(data, size);
-#if defined(YAB_CORE_SHARED_CONTEXT)
-   /* retro_set_resolution() rebuilds the video core's GL objects, and the thread
-    * driving retro_run does not own the core's shared context -- borrow it from
-    * the VDP thread for the duration, exactly like the option-change and
-    * res_pending paths in retro_run(). */
-   VdpRevoke();
-   yk_attach();
-   retro_set_resolution();
-   yk_detach();
-   VdpResume();
-#else
-   retro_set_resolution();
-#endif
+   if (g_vdp_async)
+   {
+      /* retro_set_resolution() rebuilds the video core's GL objects, and the thread
+       * driving retro_run does not own the core's shared context -- borrow it from
+       * the VDP thread for the duration, exactly like the option-change and
+       * res_pending paths in retro_run(). */
+      VdpRevoke();
+      yk_attach();
+      retro_set_resolution();
+      yk_detach();
+      VdpResume();
+   }
+   else
+      retro_set_resolution();
    return error;
 }
 
@@ -2357,6 +2379,12 @@ bool retro_load_game(const struct retro_game_info *info)
       return false;
 
    check_variables();
+
+   /* Latch the renderer mode before the machine boots: context_reset() creates
+    * the (shared) GL context and YabauseInit() starts the VDP worker, so the
+    * mode may not change while a game is running.  (The option says "Core
+    * restart required" for exactly this reason.) */
+   g_vdp_async = g_vdp_async_opt;
 
    /* Resolve the disc to boot: a single image, or the first entry of an .m3u
     * playlist (disk control can swap to the other entries later). */
@@ -2801,14 +2829,15 @@ void retro_run(void)
 
    if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE_UPDATE, &updated) && updated)
    {
-#if defined(YAB_CORE_SHARED_CONTEXT)
-      /* Resolution/filter changes touch GL: borrow the shared context from
-       * the VDP thread for the duration (standalone pattern:
-       * retro_arena/main.cpp VdpRevoke() -> MakeCurrent(main) -> ... ->
-       * MakeCurrent(NULL) -> VdpResume()). */
-      VdpRevoke();
-      yk_attach();
-#endif
+      if (g_vdp_async)
+      {
+         /* Resolution/filter changes touch GL: borrow the shared context from
+          * the VDP thread for the duration (standalone pattern:
+          * retro_arena/main.cpp VdpRevoke() -> MakeCurrent(main) -> ... ->
+          * MakeCurrent(NULL) -> VdpResume()). */
+         VdpRevoke();
+         yk_attach();
+      }
       int prev_resolution_mode = resolution_mode;
       int prev_multitap[2] = {multitap[0],multitap[1]};
       bool prev_service_enabled = service_enabled;
@@ -2826,10 +2855,11 @@ void retro_run(void)
          EnableAutoFrameSkip();
       else
          DisableAutoFrameSkip();
-#if defined(YAB_CORE_SHARED_CONTEXT)
-      yk_detach();
-      VdpResume();
-#endif
+      if (g_vdp_async)
+      {
+         yk_detach();
+         VdpResume();
+      }
    }
 
    //YabauseExec(); runs from handle events
@@ -2840,11 +2870,10 @@ void retro_run(void)
     * on the same thread that just emulated the frame, so no locking is needed. */
    sram_sync();
 
-#if defined(YAB_CORE_SHARED_CONTEXT)
-   /* The async VDP thread only marks frames: the libretro contract wants
-    * video_cb (and the frontend's shader chain + swap it triggers) on the
-    * thread that drives retro_run. */
-   if (yk.res_pending)
+   /* Async renderer only: the VDP thread just marks frames, and the libretro
+    * contract wants video_cb (and the frontend's shader chain + swap it
+    * triggers) on the thread that drives retro_run. */
+   if (g_vdp_async && yk.res_pending)
    {
       yk.res_pending = 0;
       YK_TRACE("res_pending begin cur_w=%dx%d now=%p", game_width, game_height,
@@ -2887,26 +2916,31 @@ void retro_run(void)
       yk_detach();
       VdpResume();
    }
-   if (yk.frame_pending)
+   if (g_vdp_async)
    {
-      video_cb(RETRO_HW_FRAME_BUFFER_VALID, current_width, current_height, 0);
-      one_frame_rendered = true;
+      if (yk.frame_pending)
+      {
+         video_cb(RETRO_HW_FRAME_BUFFER_VALID, current_width, current_height, 0);
+         one_frame_rendered = true;
+      }
+      if (!one_frame_rendered)
+         video_cb(NULL, current_width, current_height, 0);
+      /* The frontend presented in video_cb() and advanced its hw-render ring
+       * slot; adopt the new slot's texture so the VDP thread's NEXT frame lands
+       * in a different slot than the one just presented (YuiRetargetFB applies
+       * it at the top of the next YglRender). */
+      yk_adopt_front_fbo();
+      yk.frame_pending = 0;
    }
-   if (!one_frame_rendered)
-      video_cb(NULL, current_width, current_height, 0);
-   /* The frontend presented in video_cb() and advanced its hw-render ring slot;
-    * adopt the new slot's texture so the VDP thread's NEXT frame lands in a
-    * different slot than the one just presented (YuiRetargetFB applies it at
-    * the top of the next YglRender). */
-   yk_adopt_front_fbo();
-   yk.frame_pending = 0;
-#else
-   // If no frame rendered, dupe
-   if(!one_frame_rendered)
-      video_cb(NULL, current_width, current_height, 0);
+   else
+   {
+      /* Sync renderer: YuiSwapBuffers() already issued video_cb on this
+       * thread, so only the dupe and the GL-state reset remain. */
+      if(!one_frame_rendered)
+         video_cb(NULL, current_width, current_height, 0);
 
-   reset_global_gl_state();
-#endif
+      reset_global_gl_state();
+   }
 }
 
 #ifdef ANDROID
