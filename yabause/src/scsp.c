@@ -1451,7 +1451,6 @@ void generate_sample(struct Scsp * s, int rbp, int rbl, s16 * out_l, s16* out_r,
 {
    int step_num = 0;
    int i = 0;
-   int mvol_shift = 0;
    s32 outl32 = 0;
    s32 outr32 = 0;
 
@@ -1547,11 +1546,21 @@ void generate_sample(struct Scsp * s, int rbp, int rbl, s16 * out_l, s16* out_r,
       outr32 = outr32 + panned_r;
    }
 
-   mvol_shift = 0xf - mvol;
+   /* Master volume (SCSP register 0x400, low nibble) is a *linear* gain,
+      mvol/15, over the whole mix -- MAME models it as exactly that
+      (set_output_gain(0, MVOL() / 15.0)).  This port, and the yabause line it
+      comes from, shifted right by (15 - mvol) instead, i.e. -6 dB per step:
+      mvol=12 attenuated by 18 dB where the hardware attenuates by 1.9 dB, and
+      only mvol=15 was correct.  That is the whole of issue #4 for sokyugrt,
+      which runs at mvol=12 (peak 3471 -> 25166 on the harness, +16.1 dB).
 
-   outl32 = outl32 >> mvol_shift;
+      The product is formed in 64 bits and the division is exact, which keeps
+      mvol=15 bit-identical to the old shift: a title that already runs at full
+      master volume is left untouched, and only titles that ask for less than
+      full volume change, in proportion to mvol/15. */
+   outl32 = (int)(((long long)outl32 * mvol) / 15);
    *out_l = min(SHRT_MAX, max(SHRT_MIN, outl32));
-   outr32 = outr32 >> mvol_shift;
+   outr32 = (int)(((long long)outr32 * mvol) / 15);
    *out_r = min(SHRT_MAX, max(SHRT_MIN, outr32));
 }
 
