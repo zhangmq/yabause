@@ -24,8 +24,8 @@ frontend — and is loaded as `yabasanshiro_libretro.so`. It plays **Sega Saturn
   `eglCreateContext(share = frontend context)`, and the engine draws through a mirror FBO whose
   colour attachment is the frontend's texture. VDP rendering moves to a worker thread while
   `video_cb()` stays on the frontend's thread. Without it the port is synchronous and pinned to
-  one CPU core; with it the emulation thread drops from ~1.0 to ~0.7 cores and the frame rate
-  gains 3–9 % depending on the game (see *Measured*).
+  one CPU core; with it the emulation thread drops from 0.80–0.91 to 0.50–0.77 cores, and turning it
+  off costs 7–17 % of the frame rate depending on the game (see *Measured*).
 * `b2bb246e` — hand the frontend's GL context back after borrowing the shared one (SDL tracks
   "which context is current" per thread in TLS; bypassing it left the frontend without a context).
 * **Renderer mode is a runtime setting** (see below): both renderers are compiled in and the core
@@ -93,7 +93,7 @@ takes effect on the **next launch** of a game ("Core restart required").
 **If a game boots to a black screen while the emulator still reports a healthy frame rate** --
 seen on some Sega Titan Video titles -- set *Async Renderer* to `disabled`, save the setting, then
 exit and relaunch the game. The inline renderer is deterministic; measured cost on this device is
-7--17 % on heavy titles and nothing on titles that are already at 60 fps. Some titles only trip
+7–17 % on heavy titles and nothing on titles that are already at 60 fps. Some titles only trip
 this after a key press during boot, so the switch is worth trying before blaming the ROM or the
 BIOS.
 
@@ -231,29 +231,38 @@ per-core configuration directory from the part before the first `_` (and segfaul
 
 ## Measured
 
-Anbernic RGSP (Allwinner H700, Mali-G31), minarch-gl hardware render, CPU governor pinned to
-`performance` (1512 MHz on all four cores), 4000-frame windows, **frameskip disabled**, debug HUD
-off. Values are *fps at frame 3600 / average over the window*; the control is the same tree built
-synchronously (no `YAB_ASYNC_RENDERING`/`YAB_CORE_SHARED_CONTEXT`):
+Anbernic RGSP (Allwinner H700, Mali-G31), hardware render through the offscreen `lrheadless` harness
+(pbuffer, same hw-render contract and option defaults as minarch-gl), CPU governor pinned to
+`performance` (1512 MHz on all four cores), **2400-frame windows**, frameskip disabled. Every row is
+the *same core* with only the **Async Renderer** option changed, so this is the cost of that switch
+and not a build-to-build comparison; the windows are no-input (attract/demo) runs, so read them as a
+rendering/threading benchmark rather than a gameplay one:
 
-| Build | Golden Axe | Daytona USA |
-|---|---|---|
-| synchronous | 50.3 / 54.3 | 33.6 / 39.1 |
-| async + shared context | **60.2 / 60.4** | **40.4 / 43.6** |
+| Title | `enabled` (async) | | `disabled` (inline) | | inline is |
+|---|---|---|---|---|---|
+| | fps | emulation thread | fps | emulation thread | |
+| cotton2 (ST-V) | **56.2** | 0.71 cores | 46.4 | 0.90 cores | **−17.4 %** |
+| Daytona USA | **47.1** | 0.77 cores | 43.8 | 0.91 cores | **−7.0 %** |
+| Golden Axe - The Duel | **60.6** | 0.50 cores | 54.9 | 0.80 cores | **−9.4 %** |
 
-⇒ **+19.7 % (Golden Axe)** and **+20.2 % (Daytona USA)** at frame 3600, or +11.2 % / +11.5 % on the
-window average. Whole-process CPU (all threads) measures 1.41 → 1.71 cores on Golden Axe and
-~1.9 on Daytona, and the async build runs one thread more (9 vs 8): the VDP worker now does the
-rendering the emulation thread used to do inline, so the emulation thread is no longer pinned to a
-single core. (Re-measured 2026-10-02 on the merged `h700`; these numbers supersede the earlier
-58.4 / 40.3, which came from a different sampling point.) Both windows are no-input runs, i.e. the
-titles' attract/title screens — treat them as a rendering/threading benchmark, not a gameplay one.
+Whole-process CPU is essentially unchanged between the two modes (1.46 / 1.53 / 1.33 cores with the
+worker vs 1.39 / 1.56 / 1.24 without): the async renderer does not do less work, it moves the
+rendering off the emulation thread's critical path. That thread is the one that matters — it is the
+one that has to fit inside a frame — and it drops by 0.14–0.30 cores.
 
-Known costs: the worker performs one `glFinish()` per frame (a whole-pipeline drain on the render
-thread, so the frame is complete in the shared texture before the frontend samples it from its own
-context — this is *not* the frontend's ring fence, which is a `glFenceSync`/`glClientWaitSync` pair
-guarding a slot against being overwritten while the GPU still reads it, and which measured as never
-blocking), and the presentation path adds a normalise pass in the frontend.
+**These figures supersede the 4000-frame numbers this section used to carry** (Golden Axe 50.3 → 60.2,
+Daytona USA 33.6 → 40.4, quoted as "~+20 %"): re-measured on the same commit pair with the governor
+pinned, the async side reaches 56–61 fps and the inline side 44–55 fps, so the inline path costs
+7–17 % depending on the title. The old Daytona absolutes in particular are not reproducible. Treat
+the table above as the reference; it was taken on `e10904b6`.
+
+Known costs of the async path: the worker performs one `glFinish()` per frame (a whole-pipeline drain
+on the render thread, so the frame is complete in the shared texture before the frontend samples it
+from its own context — this is *not* the frontend's ring fence, which is a
+`glFenceSync`/`glClientWaitSync` pair guarding a slot against being overwritten while the GPU still
+reads it, and which measured as never blocking), and the presentation path adds a normalise pass in
+the frontend. The larger cost is behavioural: the emulated machine's timing then depends on host
+scheduling, which is what the *Async Renderer* option exists to turn off (see above).
 
 ## Upstream, credits and license
 
