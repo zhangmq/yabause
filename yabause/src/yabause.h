@@ -97,6 +97,10 @@ typedef struct
    int stv_favorite_region;
 } yabauseinit_struct;
 
+/* Renderer mode: 1 = async VDP worker (default), 0 = draw inline (sync).
+ * Latched at load time; see the comment on the definition in yabause.c. */
+extern int g_vdp_async;
+
 #define CLKTYPE_26MHZ           0
 #define CLKTYPE_28MHZ           1
 

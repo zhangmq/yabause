@@ -56,6 +56,20 @@ struct retro_core_option_v2_definition option_defs_us[] = {
       "opengl"
    },
 {
+      "yabasanshiro_async_rendering",
+      "Async Renderer",
+      NULL,
+      "Run VDP1/VDP2 rendering on its own thread, drawing into the framebuffer through a shared GL context. Faster on heavy titles, but the emulated machine then depends on host scheduling: some ST-V games boot to a black screen at full speed. Disable to render inline (deterministic, slower). Core restart required.",
+      NULL,
+      "video",
+      {
+         { "enabled",  NULL },
+         { "disabled", NULL },
+         { NULL, NULL },
+      },
+      "enabled"
+   },
+{
       "yabasanshiro_addon_cart",
       "Addon Cartridge",
       NULL,

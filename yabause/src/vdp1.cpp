@@ -446,35 +446,39 @@ extern "C" void FASTCALL Vdp1WriteWord(u32 addr, u16 val) {
       //Vdp1Regs->COPR = 0;
       //printf("COPR = 0 at %d\n", __LINE__);
       Vdp1Regs->PTMR = val;
-#if YAB_ASYNC_RENDERING
-      if (val == 1){ 
-        FRAMELOG("[VDP1] VDPEV_DIRECT_DRAW %d/%d", YaGetQueueSize(vdp1_rcv_evqueue), yabsys.LineCount);
-        if ( YaGetQueueSize(vdp1_rcv_evqueue) > 0){
-          yabsys.wait_line_count = -1;
-          do{
-            YabWaitEventQueue(vdp1_rcv_evqueue);
-          } while (YaGetQueueSize(vdp1_rcv_evqueue) != 0);
+      if (val == 1)
+      {
+        if (g_vdp_async)
+        {
+          /* Async renderer: hand the direct draw to the VDP worker. */
+          FRAMELOG("[VDP1] VDPEV_DIRECT_DRAW %d/%d", YaGetQueueSize(vdp1_rcv_evqueue), yabsys.LineCount);
+          if ( YaGetQueueSize(vdp1_rcv_evqueue) > 0){
+            yabsys.wait_line_count = -1;
+            do{
+              YabWaitEventQueue(vdp1_rcv_evqueue);
+            } while (YaGetQueueSize(vdp1_rcv_evqueue) != 0);
+          }
+          Vdp1Regs->EDSR >>= 1;
+          yabsys.wait_line_count = yabsys.LineCount + 50;
+          yabsys.wait_line_count %= yabsys.MaxLineCount;
+          if (yabsys.wait_line_count == 5) { yabsys.wait_line_count = 4; }
+          FRAMELOG("SET DIRECT WAIT %d", yabsys.wait_line_count);
+          YabAddEventQueue(evqueue,VDPEV_DIRECT_DRAW);
+          YabThreadYield();
         }
-        Vdp1Regs->EDSR >>= 1;
-        yabsys.wait_line_count = yabsys.LineCount + 50;
-        yabsys.wait_line_count %= yabsys.MaxLineCount;
-        if (yabsys.wait_line_count == 5) { yabsys.wait_line_count = 4; }
-        FRAMELOG("SET DIRECT WAIT %d", yabsys.wait_line_count);
-        YabAddEventQueue(evqueue,VDPEV_DIRECT_DRAW); 
-        YabThreadYield();
+        else
+        {
+          /* Sync renderer: draw it now, on this thread. */
+          FRAMELOG("VDP1: VDPEV_DIRECT_DRAW\n");
+          Vdp1Regs->EDSR >>= 1;
+          Vdp1Draw();
+          VIDCore->Vdp1DrawEnd();
+          yabsys.wait_line_count = yabsys.LineCount + 50;
+          yabsys.wait_line_count %= yabsys.MaxLineCount;
+          //if (yabsys.wait_line_count == 2) { yabsys.wait_line_count = 3; } // it should not be the same line with render.
+          FRAMELOG("VDP1: end line is %d", yabsys.wait_line_count);
+        }
       }
-#else
-    if (val == 1){
-      FRAMELOG("VDP1: VDPEV_DIRECT_DRAW\n");
-      Vdp1Regs->EDSR >>= 1;
-      Vdp1Draw();
-      VIDCore->Vdp1DrawEnd();
-      yabsys.wait_line_count = yabsys.LineCount + 50;
-      yabsys.wait_line_count %= yabsys.MaxLineCount;
-      //if (yabsys.wait_line_count == 2) { yabsys.wait_line_count = 3; } // it should not be the same line with render.
-      FRAMELOG("VDP1: end line is %d", yabsys.wait_line_count);
-    }
-#endif
          break;
       case 0x6:
          Vdp1Regs->EWDR = val;
