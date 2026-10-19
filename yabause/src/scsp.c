@@ -1423,18 +1423,53 @@ u16 scsp_slot_read_word(struct Scsp *s, u32 addr)
    return data;
 }
 
-void get_panning(int pan, int * pan_val_l, int * pan_val_r)
+/* Pan attenuation, 12-bit fixed point (4096 = 0 dB).
+
+   The panned side is attenuated in 3/6/12/24 dB steps selected by the low
+   nibble of DIPAN/EFPAN, and a nibble of 0xf mutes that side outright; the
+   other side stays at unity.  That is the hardware, SEGA Saturn Developer's
+   Manual (ST-077) Table 4.30: -3, -6, -9 ... -45 dB for nibbles 1..15, with
+   0 = -0.0 dB and 0xf = -infinity.  MAME builds the same curve from the same
+   bit weights ("if (iPAN & 0x1) SegaDB -= 3.0f; ... if (iPAN & 0x8) SegaDB -=
+   24.0f", PAN = 0 when the nibble is 0xf); the values below are its
+   FIX(4096 * 10^(dB/20)) truncated.
+
+   The old code shifted by the raw nibble, i.e. 6 dB per step: -12 dB at a
+   nibble that means -6 dB, -48 dB where the hardware stops at -45 dB.  Since
+   the steps are not powers of two this has to be a multiply. */
+static const int scsp_pan_gain[16] = {
+   4096, /* 0x0:   0 dB */
+   2899, /* 0x1:  -3 dB */
+   2052, /* 0x2:  -6 dB */
+   1453, /* 0x3:  -9 dB */
+   1028, /* 0x4: -12 dB */
+    728, /* 0x5: -15 dB */
+    515, /* 0x6: -18 dB */
+    365, /* 0x7: -21 dB */
+    258, /* 0x8: -24 dB */
+    182, /* 0x9: -27 dB */
+    129, /* 0xA: -30 dB */
+     91, /* 0xB: -33 dB */
+     64, /* 0xC: -36 dB */
+     45, /* 0xD: -39 dB */
+     32, /* 0xE: -42 dB */
+      0, /* 0xF: muted */
+};
+
+void get_panning(int pan, int * gain_l, int * gain_r)
 {
+   const int att = scsp_pan_gain[pan & 0xf];
+
    if (pan & 0x10)
    {
-      //negative values
-      *pan_val_l = 0;
-      *pan_val_r = pan & 0xf;
+      /* attenuate the right side */
+      *gain_l = 4096;
+      *gain_r = att;
    }
    else
    {
-      *pan_val_l = pan & 0xf;
-      *pan_val_r = 0;
+      *gain_l = att;
+      *gain_r = 4096;
    }
 }
 
@@ -1447,11 +1482,23 @@ int get_sdl_shift(int sdl)
 
 
 
+/* 18-bit D/A converter mode (register 0x400 bit 8).
+
+   In this mode the chip stops halving the output word: the same mix reaches an
+   18-bit converter at four times the digital value, i.e. 12 dB more range.
+   MAME models it exactly that way (it writes the unshifted value with a
+   131072 clamp instead of ">> 2" with 32768).  Titles that turn it on keep
+   their voice levels low to spend that range -- with the shift applied anyway
+   they play far too quietly (Virtua Fighter 2 was the report in issue #4).
+
+   File scope rather than a field of struct scsp_t: generate_sample() is
+   defined before that struct, and this is a single global register anyway. */
+static u32 scsp_dac18b = 0;
+
 void generate_sample(struct Scsp * s, int rbp, int rbl, s16 * out_l, s16* out_r, int mvol, s16 cd_in_l, s16 cd_in_r)
 {
    int step_num = 0;
    int i = 0;
-   int mvol_shift = 0;
    s32 outl32 = 0;
    s32 outr32 = 0;
 
@@ -1485,12 +1532,12 @@ void generate_sample(struct Scsp * s, int rbp, int rbl, s16 * out_l, s16* out_r,
          s16 mixs_input = s->slots[last_step].state.output >> 
             get_sdl_shift(s->slots[last_step].regs.imxl);
 
-         int pan_val_l = 0, pan_val_r = 0;
+         int pan_val_l = 4096, pan_val_r = 4096;
 
          get_panning(s->slots[last_step].regs.dipan, &pan_val_l, &pan_val_r);
 
-         outl32 = outl32 + ((disdl_applied >> pan_val_l) >> 1);
-         outr32 = outr32 + ((disdl_applied >> pan_val_r) >> 1);
+         outl32 = outl32 + ((disdl_applied * pan_val_l) >> 13);
+         outr32 = outr32 + ((disdl_applied * pan_val_r) >> 13);
          scsp_dsp.mixs[s->slots[last_step].regs.isel] += mixs_input << 4;
       }
    }
@@ -1528,7 +1575,7 @@ void generate_sample(struct Scsp * s, int rbp, int rbl, s16 * out_l, s16* out_r,
       int efsdl = get_sdl_shift(s->slots[i].regs.efsdl);
       s16 efsdl_applied = 0; 
 
-      int pan_val_l = 0, pan_val_r = 0;
+      int pan_val_l = 4096, pan_val_r = 4096;
       s16 panned_l = 0, panned_r = 0;
 
       if (i < 16)
@@ -1540,19 +1587,53 @@ void generate_sample(struct Scsp * s, int rbp, int rbl, s16 * out_l, s16* out_r,
 
       get_panning(s->slots[i].regs.efpan, &pan_val_l, &pan_val_r);
 
-      panned_l = (efsdl_applied >> pan_val_l)>>1;
-      panned_r = (efsdl_applied >> pan_val_r)>>1;
+      /* The DSP effect returns (i < 16) and the two external inputs (slots
+         16/17, where the CD-DA stream enters) get the same ">> 1" headroom
+         convention as the direct slots above, so the dry and wet paths keep
+         one balance.
+
+         Note this whole mixer runs 6 dB below the reference: MAME's pan/TL/SDL
+         table carries a factor 4 and its output stage a ">> 2", i.e. unity
+         for one slot at TL=0/SDL=7, while this port has a bare ">> 1" and no
+         compensating factor.  Removing it from both paths is the accurate
+         fix, but it lifts the titles that already sit at full scale into the
+         s16 clamp (cotton2 26418 -> 32768, gaxe 32768), and an on-screen A/B
+         rejected that -- so the uniform -6 dB stays, documented, rather than
+         being applied to one path only. */
+      panned_l = (efsdl_applied * pan_val_l) >> 13;
+      panned_r = (efsdl_applied * pan_val_r) >> 13;
 
       outl32 = outl32 + panned_l;
       outr32 = outr32 + panned_r;
    }
 
-   mvol_shift = 0xf - mvol;
+   /* Master volume (SCSP register 0x400, low nibble) is a *linear* gain,
+      mvol/15, over the whole mix -- MAME models it as exactly that
+      (set_output_gain(0, MVOL() / 15.0)).  This port, and the yabause line it
+      comes from, shifted right by (15 - mvol) instead, i.e. -6 dB per step:
+      mvol=12 attenuated by 18 dB where the hardware attenuates by 1.9 dB, and
+      only mvol=15 was correct.  That is the whole of issue #4 for sokyugrt,
+      which runs at mvol=12 (peak 3471 -> 25166 on the harness, +16.1 dB).
 
-   outl32 = outl32 >> mvol_shift;
-   *out_l = min(SHRT_MAX, max(SHRT_MIN, outl32));
-   outr32 = outr32 >> mvol_shift;
-   *out_r = min(SHRT_MAX, max(SHRT_MIN, outr32));
+      The product is formed in 64 bits and the division is exact, which keeps
+      mvol=15 bit-identical to the old shift: a title that already runs at full
+      master volume is left untouched, and only titles that ask for less than
+      full volume change, in proportion to mvol/15.
+
+      MVOL sits at the D/A converter, i.e. *after* the mixer's saturation -- the
+      manual says so explicitly (ST-077 p88: lowering MVOL does not remove
+      clipping noise; reset DISDL/EFSDL to get rid of the overflow), and MAME
+      applies it as a stream output gain after its put_int_clamp.  Hence the
+      clamp here comes first and the volume scales the clamped value. */
+   if (scsp_dac18b)
+   {
+      outl32 = (outl32 > 0x7FFF) ? 0x7FFFF : ((outl32 < -0x8000) ? -0x80000 : outl32 << 2);
+      outr32 = (outr32 > 0x7FFF) ? 0x7FFFF : ((outr32 < -0x8000) ? -0x80000 : outr32 << 2);
+   }
+   outl32 = min(SHRT_MAX, max(SHRT_MIN, outl32));
+   outr32 = min(SHRT_MAX, max(SHRT_MIN, outr32));
+   *out_l = (s16)(((long long)outl32 * mvol) / 15);
+   *out_r = (s16)(((long long)outr32 * mvol) / 15);
 }
 
 void new_scsp_reset(struct Scsp* s)
@@ -1879,55 +1960,14 @@ void scsp_check_interrupt() {
   if (level != 0) {
     SCSPLOG("SCSP LV0=%08X, LV1=%08X, LV2=%08X, SCIPD = %08X, SCIEB = %08X\n",
       scsp.scilv0, scsp.scilv1, scsp.scilv2, scsp.scipd, scsp.scieb);
-    scsp.sintf(level);
   }
-  
+  /* Level 0 must be delivered too: it is how the SCSP drops the sound
+     CPU's interrupt line once nothing is pending any more.  The old code
+     only ever raised it, so a level stayed asserted (and the 68K side
+     ignored 0 as well -- see M68KMusashiSetIRQ). */
+  scsp.sintf(level);
 }
 
-static INLINE void
-scsp_trigger_sound_interrupt (u32 id)
-{
-   u32 level;
-   level = 0;
-   if (id > 0x80) id = 0x80;
-   if (scsp.scilv0 & id) level |= 1;
-   if (scsp.scilv1 & id) level |= 2;
-   if (scsp.scilv2 & id) level |= 4;
-#if 0
-   unsigned mask_test;
-   unsigned lvmasked[3];
-   unsigned level = 0;
-
-   scsp.scipd |= id;
-
-   mask_test = scsp.scipd & scsp.scieb;
-   if (mask_test &~0xFF)
-     mask_test = (mask_test & 0xFF) | 0x80;
-
-   lvmasked[0] = (scsp.scilv0 & mask_test) << 0;
-   lvmasked[1] = (scsp.scilv1 & mask_test) << 1;
-   lvmasked[2] = (scsp.scilv2 & mask_test) << 2;
-
-   for (unsigned i = 0; i < 8; i++)
-   {
-     unsigned l = (lvmasked[0] & 0x1) | (lvmasked[1] & 0x2) | (lvmasked[2] & 0x4);
-
-     if (l > level)
-       level = l;
-
-     lvmasked[0] >>= 1;
-     lvmasked[1] >>= 1;
-     lvmasked[2] >>= 1;
-   }
-#endif
-
-#ifdef SCSP_DEBUG
-   if (id == 0x8) SCSPLOG ("scsp sound interrupt accepted %.2X lev=%d\n", id, level);
-#endif
-
-   //if(level!=0)SCSPLOG("scsp sound interrupt accepted %.2X lev=%d\n", id, level);
-   scsp.sintf (level);
-}
 
 
 void scsp_main_interrupt (u32 id)
@@ -1952,7 +1992,7 @@ void scsp_sound_interrupt (u32 id)
   WRITE_THROUGH (scsp.scipd);
 
   if (scsp.scieb & id)
-    scsp_trigger_sound_interrupt (id);
+    scsp_check_interrupt ();
 }
 
 ////////////////////////////////////////////////////////////////
@@ -2723,6 +2763,7 @@ scsp_set_b (u32 a, u8 d)
   switch (a & 0x3F)
     {
     case 0x00: // MEM4MB/DAC18B
+      scsp_dac18b = (d >> 0) & 0x1;
       scsp.mem4b = (d >> 1) & 0x1;
       if (scsp.mem4b)
         {
@@ -2893,6 +2934,7 @@ scsp_set_w (u32 a, u16 d)
   switch (a & 0x3E)
     {
     case 0x00: // MEM4MB/DAC18B/VER/MVOL
+      scsp_dac18b = (d >> 8) & 0x1;
       scsp.mem4b = (d >> 9) & 0x1;
       scsp.mvol = d & 0xF;
       if (scsp.mem4b)
@@ -4564,6 +4606,7 @@ scsp_reset (void)
   memset(scsp_reg, 0, 0x1000);
 
   scsp.mem4b     = 0;
+  scsp_dac18b    = 0;
   scsp.mvol      = 0;
   scsp.rbl       = 0;
   scsp.rbp       = 0;
@@ -6061,7 +6104,10 @@ M68KClearCodeBreakpoints ()
  *   which leaves the SCSP silent forever).
  * v5: those hooks really write/read the 23-word register block (see
  *   m68kmusashi.c).  v4 files still load -- their block is simply absent and the
- *   68k is left untouched, exactly as before. */
+ *   68k is left untouched, exactly as before.
+ *
+ * (The DAC18B flag does not need a field of its own: the whole SCSP register
+ * file is in the chunk, so SoundLoadState() derives it from scsp_reg[0x403].) */
 #define SCSP_STATE_VERSION 5
 
 int
@@ -6276,7 +6322,6 @@ SoundSaveState (FILE *fp)
 
   // Write main internal variables
   ywrite (&check, (void *)&scsp.mem4b, 4, 1, fp);
-  //ywrite (&check, (void *)&scsp.dac18b, 4, 1, fp);
   ywrite (&check, (void *)&scsp.mvol, 4, 1, fp);
 
   ywrite (&check, (void *)&scsp.rbl, 4, 1, fp);
@@ -6373,9 +6418,13 @@ SoundLoadState (FILE *fp, int version, int size)
   yread(&check, (void *)&savedcycles, sizeof(u32), 1, fp);
 
 #ifdef IMPROVED_SAVESTATES
-  /* SCSP_STATE_VERSION 5 and up carry the 68k register block; older chunks do
-   * not, so skip the read instead of consuming the next fields as registers. */
-  if (version >= SCSP_STATE_VERSION)
+  /* Version 5 introduced the 68k register block; older chunks do not carry it,
+   * so skip the read instead of consuming the following fields as registers.
+   * This must compare against the version that *introduced* the block, not
+   * against SCSP_STATE_VERSION -- using the current constant made every later
+   * bump misread every older file (found the hard way: v6 crashed on v5). */
+#define SCSP_STATE_68K_VERSION 5
+  if (version >= SCSP_STATE_68K_VERSION)
     M68K->LoadState(fp);
 #else
   for (i = 0; i < 8; i++)
@@ -6464,6 +6513,11 @@ SoundLoadState (FILE *fp, int version, int size)
 
   // Now for the SCSP registers
   yread (&check, (void *)scsp_reg, 0x1000, 1, fp);
+  /* 0x400 bit 8 (DAC18B) lives in that register file -- scsp_ccr points at
+     &scsp_reg[0x400] and the high byte is index 3 -- so every state carries
+     it, whatever chunk version wrote the file.  Derive the mixer's copy from
+     it instead of adding a field and a format bump. */
+  scsp_dac18b = (scsp_reg[0x403] >> 0) & 0x1;
 
   // Lastly, sound ram
   yread (&check, (void *)SoundRam, 0x80000, 1, fp);
@@ -6623,9 +6677,6 @@ SoundLoadState (FILE *fp, int version, int size)
 
       // Read main internal variables
       yread (&check, (void *)&scsp.mem4b, 4, 1, fp);
-      if( version >= 4){
-        //yread (&check, (void *)&scsp.dac18b, 4, 1, fp);
-      }
       yread (&check, (void *)&scsp.mvol, 4, 1, fp);
 
       yread (&check, (void *)&scsp.rbl, 4, 1, fp);

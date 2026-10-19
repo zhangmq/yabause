@@ -111,6 +111,10 @@ static void M68KMusashiSetFetch(u32 low_adr, u32 high_adr, pointer fetch_adr) {
 static void FASTCALL M68KMusashiSetIRQ(s32 level) {
    if (level > 0)
       m68k_set_irq(level);
+   else
+      /* Level 0 = nothing pending any more: the SCSP dropped its interrupt
+         line.  Ignoring it left the 68K line asserted for good. */
+      m68k_set_irq(0);
 }
 
 static void FASTCALL M68KMusashiWriteNotify(u32 address, u32 size) {
