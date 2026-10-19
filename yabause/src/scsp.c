@@ -1423,18 +1423,53 @@ u16 scsp_slot_read_word(struct Scsp *s, u32 addr)
    return data;
 }
 
-void get_panning(int pan, int * pan_val_l, int * pan_val_r)
+/* Pan attenuation, 12-bit fixed point (4096 = 0 dB).
+
+   The panned side is attenuated in 3/6/12/24 dB steps selected by the low
+   nibble of DIPAN/EFPAN, and a nibble of 0xf mutes that side outright; the
+   other side stays at unity.  That is the hardware, SEGA Saturn Developer's
+   Manual (ST-077) Table 4.30: -3, -6, -9 ... -45 dB for nibbles 1..15, with
+   0 = -0.0 dB and 0xf = -infinity.  MAME builds the same curve from the same
+   bit weights ("if (iPAN & 0x1) SegaDB -= 3.0f; ... if (iPAN & 0x8) SegaDB -=
+   24.0f", PAN = 0 when the nibble is 0xf); the values below are its
+   FIX(4096 * 10^(dB/20)) truncated.
+
+   The old code shifted by the raw nibble, i.e. 6 dB per step: -12 dB at a
+   nibble that means -6 dB, -48 dB where the hardware stops at -45 dB.  Since
+   the steps are not powers of two this has to be a multiply. */
+static const int scsp_pan_gain[16] = {
+   4096, /* 0x0:   0 dB */
+   2899, /* 0x1:  -3 dB */
+   2052, /* 0x2:  -6 dB */
+   1453, /* 0x3:  -9 dB */
+   1028, /* 0x4: -12 dB */
+    728, /* 0x5: -15 dB */
+    515, /* 0x6: -18 dB */
+    365, /* 0x7: -21 dB */
+    258, /* 0x8: -24 dB */
+    182, /* 0x9: -27 dB */
+    129, /* 0xA: -30 dB */
+     91, /* 0xB: -33 dB */
+     64, /* 0xC: -36 dB */
+     45, /* 0xD: -39 dB */
+     32, /* 0xE: -42 dB */
+      0, /* 0xF: muted */
+};
+
+void get_panning(int pan, int * gain_l, int * gain_r)
 {
+   const int att = scsp_pan_gain[pan & 0xf];
+
    if (pan & 0x10)
    {
-      //negative values
-      *pan_val_l = 0;
-      *pan_val_r = pan & 0xf;
+      /* attenuate the right side */
+      *gain_l = 4096;
+      *gain_r = att;
    }
    else
    {
-      *pan_val_l = pan & 0xf;
-      *pan_val_r = 0;
+      *gain_l = att;
+      *gain_r = 4096;
    }
 }
 
@@ -1484,12 +1519,12 @@ void generate_sample(struct Scsp * s, int rbp, int rbl, s16 * out_l, s16* out_r,
          s16 mixs_input = s->slots[last_step].state.output >> 
             get_sdl_shift(s->slots[last_step].regs.imxl);
 
-         int pan_val_l = 0, pan_val_r = 0;
+         int pan_val_l = 4096, pan_val_r = 4096;
 
          get_panning(s->slots[last_step].regs.dipan, &pan_val_l, &pan_val_r);
 
-         outl32 = outl32 + ((disdl_applied >> pan_val_l) >> 1);
-         outr32 = outr32 + ((disdl_applied >> pan_val_r) >> 1);
+         outl32 = outl32 + ((disdl_applied * pan_val_l) >> 13);
+         outr32 = outr32 + ((disdl_applied * pan_val_r) >> 13);
          scsp_dsp.mixs[s->slots[last_step].regs.isel] += mixs_input << 4;
       }
    }
@@ -1527,7 +1562,7 @@ void generate_sample(struct Scsp * s, int rbp, int rbl, s16 * out_l, s16* out_r,
       int efsdl = get_sdl_shift(s->slots[i].regs.efsdl);
       s16 efsdl_applied = 0; 
 
-      int pan_val_l = 0, pan_val_r = 0;
+      int pan_val_l = 4096, pan_val_r = 4096;
       s16 panned_l = 0, panned_r = 0;
 
       if (i < 16)
@@ -1558,8 +1593,8 @@ void generate_sample(struct Scsp * s, int rbp, int rbl, s16 * out_l, s16* out_r,
          and an on-screen A/B rejected that.  This keeps the two paths at the
          hardware-relative balance the reference uses, without adding gain the
          user can hear as clipping. */
-      panned_l = efsdl_applied >> pan_val_l;
-      panned_r = efsdl_applied >> pan_val_r;
+      panned_l = (efsdl_applied * pan_val_l) >> 12;
+      panned_r = (efsdl_applied * pan_val_r) >> 12;
 
       outl32 = outl32 + panned_l;
       outr32 = outr32 + panned_r;
