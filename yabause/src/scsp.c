@@ -1575,26 +1575,20 @@ void generate_sample(struct Scsp * s, int rbp, int rbl, s16 * out_l, s16* out_r,
       get_panning(s->slots[i].regs.efpan, &pan_val_l, &pan_val_r);
 
       /* The DSP effect returns (i < 16) and the two external inputs (slots
-         16/17, where the CD-DA stream enters) are mixed at the same 0 dBFS
-         scale as a slot: MAME's pan/level table puts one unity return exactly
-         at full scale, and the CD input arrives as sample*32768, with no extra
-         headroom on either path.  The ">> 1" that used to be here was this
-         mixer's own convention and cost both paths 6 dB.
+         16/17, where the CD-DA stream enters) get the same ">> 1" headroom
+         convention as the direct slots above, so the dry and wet paths keep
+         one balance.
 
-         That is issue #4's Daytona USA: its music is synthesised by the SCSP
-         DSP and comes out through the EFREG returns, so it played 6 dB down
-         (peak 8754 = -11.5 dBFS).  Dropping the shift doubles it to 17506
-         (-5.4 dBFS) and leaves slot-mixed titles alone (cotton2 mean 1136 ->
-         1144, peak 18813 -> 18630, i.e. run-to-run noise).
-
-         The per-slot ">> 1" in the loop above is deliberately *not* touched:
-         the same +6 dB on the dry slots pushes titles that already sit at full
-         scale deeper into the s16 clamp (cotton2 26418 -> 32768, gaxe 32768),
-         and an on-screen A/B rejected that.  This keeps the two paths at the
-         hardware-relative balance the reference uses, without adding gain the
-         user can hear as clipping. */
-      panned_l = (efsdl_applied * pan_val_l) >> 12;
-      panned_r = (efsdl_applied * pan_val_r) >> 12;
+         Note this whole mixer runs 6 dB below the reference: MAME's pan/TL/SDL
+         table carries a factor 4 and its output stage a ">> 2", i.e. unity
+         for one slot at TL=0/SDL=7, while this port has a bare ">> 1" and no
+         compensating factor.  Removing it from both paths is the accurate
+         fix, but it lifts the titles that already sit at full scale into the
+         s16 clamp (cotton2 26418 -> 32768, gaxe 32768), and an on-screen A/B
+         rejected that -- so the uniform -6 dB stays, documented, rather than
+         being applied to one path only. */
+      panned_l = (efsdl_applied * pan_val_l) >> 13;
+      panned_r = (efsdl_applied * pan_val_r) >> 13;
 
       outl32 = outl32 + panned_l;
       outr32 = outr32 + panned_r;
@@ -1611,11 +1605,17 @@ void generate_sample(struct Scsp * s, int rbp, int rbl, s16 * out_l, s16* out_r,
       The product is formed in 64 bits and the division is exact, which keeps
       mvol=15 bit-identical to the old shift: a title that already runs at full
       master volume is left untouched, and only titles that ask for less than
-      full volume change, in proportion to mvol/15. */
-   outl32 = (int)(((long long)outl32 * mvol) / 15);
-   *out_l = min(SHRT_MAX, max(SHRT_MIN, outl32));
-   outr32 = (int)(((long long)outr32 * mvol) / 15);
-   *out_r = min(SHRT_MAX, max(SHRT_MIN, outr32));
+      full volume change, in proportion to mvol/15.
+
+      MVOL sits at the D/A converter, i.e. *after* the mixer's saturation -- the
+      manual says so explicitly (ST-077 p88: lowering MVOL does not remove
+      clipping noise; reset DISDL/EFSDL to get rid of the overflow), and MAME
+      applies it as a stream output gain after its put_int_clamp.  Hence the
+      clamp here comes first and the volume scales the clamped value. */
+   outl32 = min(SHRT_MAX, max(SHRT_MIN, outl32));
+   outr32 = min(SHRT_MAX, max(SHRT_MIN, outr32));
+   *out_l = (s16)(((long long)outl32 * mvol) / 15);
+   *out_r = (s16)(((long long)outr32 * mvol) / 15);
 }
 
 void new_scsp_reset(struct Scsp* s)
