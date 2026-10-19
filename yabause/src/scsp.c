@@ -6395,9 +6395,14 @@ SoundLoadState (FILE *fp, int version, int size)
   yread(&check, (void *)&savedcycles, sizeof(u32), 1, fp);
 
 #ifdef IMPROVED_SAVESTATES
-  /* SCSP_STATE_VERSION 5 and up carry the 68k register block; older chunks do
-   * not, so skip the read instead of consuming the next fields as registers. */
-  if (version >= SCSP_STATE_VERSION)
+  /* Version 5 introduced the 68k register block; older chunks do not carry it,
+   * so skip the read instead of consuming the following fields as registers.
+   * Compare against the version that *introduced* the block, not against
+   * SCSP_STATE_VERSION: using the current constant means that the next bump
+   * misreads every older file (a v6 experiment crashed on v5 states exactly
+   * like that before it ever ran). */
+#define SCSP_STATE_68K_VERSION 5
+  if (version >= SCSP_STATE_68K_VERSION)
     M68K->LoadState(fp);
 #else
   for (i = 0; i < 8; i++)
