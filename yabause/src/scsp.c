@@ -1907,55 +1907,14 @@ void scsp_check_interrupt() {
   if (level != 0) {
     SCSPLOG("SCSP LV0=%08X, LV1=%08X, LV2=%08X, SCIPD = %08X, SCIEB = %08X\n",
       scsp.scilv0, scsp.scilv1, scsp.scilv2, scsp.scipd, scsp.scieb);
-    scsp.sintf(level);
   }
-  
+  /* Level 0 must be delivered too: it is how the SCSP drops the sound
+     CPU's interrupt line once nothing is pending any more.  The old code
+     only ever raised it, so a level stayed asserted (and the 68K side
+     ignored 0 as well -- see M68KMusashiSetIRQ). */
+  scsp.sintf(level);
 }
 
-static INLINE void
-scsp_trigger_sound_interrupt (u32 id)
-{
-   u32 level;
-   level = 0;
-   if (id > 0x80) id = 0x80;
-   if (scsp.scilv0 & id) level |= 1;
-   if (scsp.scilv1 & id) level |= 2;
-   if (scsp.scilv2 & id) level |= 4;
-#if 0
-   unsigned mask_test;
-   unsigned lvmasked[3];
-   unsigned level = 0;
-
-   scsp.scipd |= id;
-
-   mask_test = scsp.scipd & scsp.scieb;
-   if (mask_test &~0xFF)
-     mask_test = (mask_test & 0xFF) | 0x80;
-
-   lvmasked[0] = (scsp.scilv0 & mask_test) << 0;
-   lvmasked[1] = (scsp.scilv1 & mask_test) << 1;
-   lvmasked[2] = (scsp.scilv2 & mask_test) << 2;
-
-   for (unsigned i = 0; i < 8; i++)
-   {
-     unsigned l = (lvmasked[0] & 0x1) | (lvmasked[1] & 0x2) | (lvmasked[2] & 0x4);
-
-     if (l > level)
-       level = l;
-
-     lvmasked[0] >>= 1;
-     lvmasked[1] >>= 1;
-     lvmasked[2] >>= 1;
-   }
-#endif
-
-#ifdef SCSP_DEBUG
-   if (id == 0x8) SCSPLOG ("scsp sound interrupt accepted %.2X lev=%d\n", id, level);
-#endif
-
-   //if(level!=0)SCSPLOG("scsp sound interrupt accepted %.2X lev=%d\n", id, level);
-   scsp.sintf (level);
-}
 
 
 void scsp_main_interrupt (u32 id)
@@ -1980,7 +1939,7 @@ void scsp_sound_interrupt (u32 id)
   WRITE_THROUGH (scsp.scipd);
 
   if (scsp.scieb & id)
-    scsp_trigger_sound_interrupt (id);
+    scsp_check_interrupt ();
 }
 
 ////////////////////////////////////////////////////////////////
