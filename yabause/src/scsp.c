@@ -1482,6 +1482,19 @@ int get_sdl_shift(int sdl)
 
 
 
+/* 18-bit D/A converter mode (register 0x400 bit 8).
+
+   In this mode the chip stops halving the output word: the same mix reaches an
+   18-bit converter at four times the digital value, i.e. 12 dB more range.
+   MAME models it exactly that way (it writes the unshifted value with a
+   131072 clamp instead of ">> 2" with 32768).  Titles that turn it on keep
+   their voice levels low to spend that range -- with the shift applied anyway
+   they play far too quietly (Virtua Fighter 2 was the report in issue #4).
+
+   File scope rather than a field of struct scsp_t: generate_sample() is
+   defined before that struct, and this is a single global register anyway. */
+static u32 scsp_dac18b = 0;
+
 void generate_sample(struct Scsp * s, int rbp, int rbl, s16 * out_l, s16* out_r, int mvol, s16 cd_in_l, s16 cd_in_r)
 {
    int step_num = 0;
@@ -1612,6 +1625,11 @@ void generate_sample(struct Scsp * s, int rbp, int rbl, s16 * out_l, s16* out_r,
       clipping noise; reset DISDL/EFSDL to get rid of the overflow), and MAME
       applies it as a stream output gain after its put_int_clamp.  Hence the
       clamp here comes first and the volume scales the clamped value. */
+   if (scsp_dac18b)
+   {
+      outl32 = (outl32 > 0x7FFF) ? 0x7FFFF : ((outl32 < -0x8000) ? -0x80000 : outl32 << 2);
+      outr32 = (outr32 > 0x7FFF) ? 0x7FFFF : ((outr32 < -0x8000) ? -0x80000 : outr32 << 2);
+   }
    outl32 = min(SHRT_MAX, max(SHRT_MIN, outl32));
    outr32 = min(SHRT_MAX, max(SHRT_MIN, outr32));
    *out_l = (s16)(((long long)outl32 * mvol) / 15);
@@ -2745,6 +2763,7 @@ scsp_set_b (u32 a, u8 d)
   switch (a & 0x3F)
     {
     case 0x00: // MEM4MB/DAC18B
+      scsp_dac18b = (d >> 0) & 0x1;
       scsp.mem4b = (d >> 1) & 0x1;
       if (scsp.mem4b)
         {
@@ -2915,6 +2934,7 @@ scsp_set_w (u32 a, u16 d)
   switch (a & 0x3E)
     {
     case 0x00: // MEM4MB/DAC18B/VER/MVOL
+      scsp_dac18b = (d >> 8) & 0x1;
       scsp.mem4b = (d >> 9) & 0x1;
       scsp.mvol = d & 0xF;
       if (scsp.mem4b)
@@ -4586,6 +4606,7 @@ scsp_reset (void)
   memset(scsp_reg, 0, 0x1000);
 
   scsp.mem4b     = 0;
+  scsp_dac18b    = 0;
   scsp.mvol      = 0;
   scsp.rbl       = 0;
   scsp.rbp       = 0;
@@ -6083,7 +6104,10 @@ M68KClearCodeBreakpoints ()
  *   which leaves the SCSP silent forever).
  * v5: those hooks really write/read the 23-word register block (see
  *   m68kmusashi.c).  v4 files still load -- their block is simply absent and the
- *   68k is left untouched, exactly as before. */
+ *   68k is left untouched, exactly as before.
+ *
+ * (The DAC18B flag does not need a field of its own: the whole SCSP register
+ * file is in the chunk, so SoundLoadState() derives it from scsp_reg[0x403].) */
 #define SCSP_STATE_VERSION 5
 
 int
@@ -6298,7 +6322,6 @@ SoundSaveState (FILE *fp)
 
   // Write main internal variables
   ywrite (&check, (void *)&scsp.mem4b, 4, 1, fp);
-  //ywrite (&check, (void *)&scsp.dac18b, 4, 1, fp);
   ywrite (&check, (void *)&scsp.mvol, 4, 1, fp);
 
   ywrite (&check, (void *)&scsp.rbl, 4, 1, fp);
@@ -6397,10 +6420,9 @@ SoundLoadState (FILE *fp, int version, int size)
 #ifdef IMPROVED_SAVESTATES
   /* Version 5 introduced the 68k register block; older chunks do not carry it,
    * so skip the read instead of consuming the following fields as registers.
-   * Compare against the version that *introduced* the block, not against
-   * SCSP_STATE_VERSION: using the current constant means that the next bump
-   * misreads every older file (a v6 experiment crashed on v5 states exactly
-   * like that before it ever ran). */
+   * This must compare against the version that *introduced* the block, not
+   * against SCSP_STATE_VERSION -- using the current constant made every later
+   * bump misread every older file (found the hard way: v6 crashed on v5). */
 #define SCSP_STATE_68K_VERSION 5
   if (version >= SCSP_STATE_68K_VERSION)
     M68K->LoadState(fp);
@@ -6491,6 +6513,11 @@ SoundLoadState (FILE *fp, int version, int size)
 
   // Now for the SCSP registers
   yread (&check, (void *)scsp_reg, 0x1000, 1, fp);
+  /* 0x400 bit 8 (DAC18B) lives in that register file -- scsp_ccr points at
+     &scsp_reg[0x400] and the high byte is index 3 -- so every state carries
+     it, whatever chunk version wrote the file.  Derive the mixer's copy from
+     it instead of adding a field and a format bump. */
+  scsp_dac18b = (scsp_reg[0x403] >> 0) & 0x1;
 
   // Lastly, sound ram
   yread (&check, (void *)SoundRam, 0x80000, 1, fp);
@@ -6650,9 +6677,6 @@ SoundLoadState (FILE *fp, int version, int size)
 
       // Read main internal variables
       yread (&check, (void *)&scsp.mem4b, 4, 1, fp);
-      if( version >= 4){
-        //yread (&check, (void *)&scsp.dac18b, 4, 1, fp);
-      }
       yread (&check, (void *)&scsp.mvol, 4, 1, fp);
 
       yread (&check, (void *)&scsp.rbl, 4, 1, fp);
