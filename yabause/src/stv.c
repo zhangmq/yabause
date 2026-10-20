@@ -1,6 +1,7 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <ctype.h>
 
 #ifndef WIN32
 #include <sys/types.h>
@@ -2706,12 +2707,28 @@ int recordCallback(JZFile *zip, int idx, JZFileHeader *header, char *filename, v
     return 1; // continue
 }
 
+/* Case-insensitive comparison of n bytes: MAME set names are lower case but a
+   file system or a user-renamed zip need not be. */
+static int stv_name_eq(const char *a, const char *b, size_t n)
+{
+  size_t k;
+  for (k = 0; k < n; k++) {
+    if (tolower((unsigned char)a[k]) != tolower((unsigned char)b[k]))
+      return 0;
+  }
+  return 1;
+}
+
 char * updateGameList(const char* file, int *nbGames){
   FILE *fp;
   JZEndRecord endRecord;
   JZFile *zip;
   char *romset = NULL;
   int i, j;
+  /* Best matching GameList entry: exact zip name first, then most blobs. */
+  int bestGame = -1, bestBlobs = -1, bestExact = 0;
+  const char *base;
+  size_t baseLen;
   u8 isASTVGame, isBiosFound, isBlobFound;
   rominfo info;
   info.filename = file;
@@ -2719,6 +2736,19 @@ char * updateGameList(const char* file, int *nbGames){
   info.bios = 0;
 
   LOGSTV("updateGameList %s\n", file);
+
+  /* Zip basename without the extension, for the exact-name preference below. */
+  base = strrchr(file, '/');
+#ifdef WIN32
+  {
+    const char *bs = strrchr(file, '\\');
+    if (bs != NULL && (base == NULL || bs > base)) base = bs;
+  }
+#endif
+  base = (base != NULL) ? base + 1 : file;
+  baseLen = strlen(base);
+  if (baseLen > 4 && stv_name_eq(base + baseLen - 4, ".zip", 4))
+     baseLen -= 4;
 
   memset(fileFound, 0x0, NB_STV_GAMES*MAX_GAME_FILES);
 
@@ -2768,6 +2798,24 @@ char * updateGameList(const char* file, int *nbGames){
     }
     isASTVGame = isBlobFound & (isBiosFound | hasBios);
     if (isASTVGame == 1) {
+      /* Several entries can match: a clone's blob list is a subset of its
+         parent's.  Score them so that the most specific one wins instead of
+         whichever comes last in GameList -- otherwise ffreveng.zip is loaded
+         with the ffrevng10 entry and loses the parent's extra 1 MiB
+         HEADER_BLOB (issue #13). */
+      {
+        int nblobs = 0;
+        int exact = 0;
+        while (GameList[i].blobs[nblobs].type != GAME_END) nblobs++;
+        if (strlen(GameList[i].romset) == baseLen &&
+            stv_name_eq(GameList[i].romset, base, baseLen))
+          exact = 1;
+        if (exact > bestExact || (exact == bestExact && nblobs > bestBlobs)) {
+          bestExact = exact;
+          bestBlobs = nblobs;
+          bestGame = i;
+        }
+      }
       //Add the filename as a Game
       int found = 0;
       for (j=0; j<NB_STV_GAMES; j++) {
@@ -2779,12 +2827,14 @@ char * updateGameList(const char* file, int *nbGames){
       if (found == 0) {
         availableGames[*nbGames].entry = &GameList[i];
         strncpy(availableGames[*nbGames].path, file, MAX_LENGTH_FILEPATH);
-        romset = strdup(GameList[i].romset);
         (*nbGames)++;
         //break;
       }
     }
   }
+
+  if (bestGame >= 0)
+    romset = strdup(GameList[bestGame].romset);
 
 endClose:
     zip->close(zip);
