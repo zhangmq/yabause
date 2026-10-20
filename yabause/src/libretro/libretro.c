@@ -2364,7 +2364,17 @@ bool retro_load_game_common()
     * a coin insert never rises -- measured 2026-10-02, stvS1..stvS4. */
    yinit.extend_backup             = 0;
    yinit.buppath                   = bup_path;
-   yinit.use_new_scsp              = 1;
+   /* Classic SCSP mixer (scsp_update), i.e. the same path Yabadabadoo and the
+    * older libretro Yabause line use.  The devmiyax "new" mixer
+    * (new_scsp_update_samples -> generate_sample) mixes ~11 dB quieter on the
+    * same state (Daytona: peak 8760/rms 1027 vs 32555/3556, -30.1 vs -19.3
+    * dBFS) and the user's listening test on H700 found its output too quiet
+    * across Daytona / Golden Axe / sokyugrt, while this path matches the
+    * expected volume.  Note the classic path never executes the SCSP DSP and
+    * never applies MVOL (SCSP reg 0x400) -- that is how the reference fork
+    * behaves too, and the ear test stands: correctness of the mix is decided on
+    * the device, not by RMS numbers from the headless harness. */
+   yinit.use_new_scsp              = 0;
    yinit.scsp_sync_count_per_frame = 1;
    yinit.scsp_main_mode            = 1;
    yinit.videoformattype           = VIDEOFORMATTYPE_NTSC;
