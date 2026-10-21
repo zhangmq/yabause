@@ -3715,6 +3715,11 @@ int ScuLoadState(FILE *fp, UNUSED int version, int size)
      yread(&check, incFlg, sizeof(int), 4, fp);
    }
 
+   /* The saved Scu struct carries the DMA channels, so the cached "transfer in
+    * flight" flag has to be recomputed or a state saved mid-transfer would
+    * load without the SoundRam bus wait. */
+   ScuDmaUpdateBusy();
+
    return size;
 }
 
