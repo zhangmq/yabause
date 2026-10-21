@@ -1090,6 +1090,18 @@ static u8 FASTCALL ROMSTVCs1ReadByte(u32 addr)
 
 static u16 FASTCALL ROMSTVCs1ReadWord(u32 addr)
 {
+   /* 0x04FFFFF8/0x04FFFFFA are the crypto "set low/high address" latches and
+    * are readable: twcup98 writes 0x1234 to 0x04FFFFF8 and polls until it reads
+    * back (0x0600967C), so returning the cartridge bytes there hung the game
+    * for ever.  Measured: twcup98 and twsoc98 both boot to a full screen
+    * (nonblack 315392 at 704x448) once the latches are readable, and the other
+    * titles are unchanged at f800 (gaxeduel 76471, cotton2 69136,
+    * ffreveng 78123, tatacot/astrass 3781). */
+   switch (addr & 0xF) {
+   case 0x8:  return cyptoGetLowAddr();
+   case 0xA:  return cyptoGetHighAddr();
+   default:   break;
+   }
    return T1ReadWord(&((u8 *)CartridgeArea->rom)[0x2000000], addr & 0xFFFFFF);
 }
 
