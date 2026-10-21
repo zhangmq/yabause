@@ -2085,7 +2085,12 @@ Game GameList[NB_STV_GAMES]={
     STV_REGION_JP,
     0x0,
     0,
-    sanjeon_init,
+    /* NULL, not sanjeon_init: that hook XORs every byte of the whole 48 MB
+     * cart image with 0xFF and bit-reverses it in place, which turned this
+     * cart's plain "SEGA ..." header (00 53 00 45 ...) into 00 FF 00 35 ...
+     * so the ST-V BIOS answered "ERROR ON CARTRIDGE" and stopped.  Only
+     * "sanjeon" itself uses that transform. */
+    NULL,
     NV_1P,
     {
         HEADER_BLOB,	"epr-18790.ic13",	0x0000001, 0x0080000, 0xd95155dc,
