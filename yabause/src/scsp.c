@@ -4919,6 +4919,7 @@ scu_interrupt_handler (void)
 u8 FASTCALL
 SoundRamReadByte (u32 addr)
 {
+  ScuDmaBusWaitSoundRam();
   addr &= 0xFFFFF;
   u8 val = 0;
 
@@ -4939,6 +4940,9 @@ void FASTCALL
 SoundRamWriteByte (u32 addr, u8 val)
 {
   addr &= 0xFFFFF;
+
+  /* Same bus arbitration as the reads: the SCU DMA owns the bus first. */
+  ScuDmaBusWaitSoundRam();
 
   // If mem4b is set, mirror ram every 256k
   if (scsp.mem4b == 0)
@@ -4992,6 +4996,10 @@ SoundRamReadWord (u32 addr)
   addr &= 0xFFFFF;
   u16 val = 0;
 
+  /* The SCU DMA is the bus master while a transfer is running: hold the CPU
+   * off until it has finished (see ScuDmaBusWaitSoundRam). */
+  ScuDmaBusWaitSoundRam();
+
   if (scsp.mem4b == 0)
     addr &= 0x3FFFF;
   else if (addr > 0x7FFFF)
@@ -5014,6 +5022,9 @@ SoundRamWriteWord (u32 addr, u16 val)
 {
   addr &= 0xFFFFF;
 
+  /* Same bus arbitration as the reads: the SCU DMA owns the bus first. */
+  ScuDmaBusWaitSoundRam();
+
   // If mem4b is set, mirror ram every 256k
   if (scsp.mem4b == 0)
     addr &= 0x3FFFF;
@@ -5030,6 +5041,8 @@ SoundRamWriteWord (u32 addr, u16 val)
 u32 FASTCALL
 SoundRamReadLong (u32 addr)
 {
+  /* See ScuDmaBusWaitSoundRam: no CPU read may overtake an in-flight DMA. */
+  ScuDmaBusWaitSoundRam();
   addr &= 0xFFFFF;
   u32 val;
   u32 pre_cycle = m68kcycle;
@@ -5058,6 +5071,9 @@ void FASTCALL
 SoundRamWriteLong (u32 addr, u32 val)
 {
   addr &= 0xFFFFF;
+
+  /* Same bus arbitration as the reads: the SCU DMA owns the bus first. */
+  ScuDmaBusWaitSoundRam();
   //u32 pre_cycle = m68kcycle;
 
   // If mem4b is set, mirror ram every 256k

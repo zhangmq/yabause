@@ -175,6 +175,7 @@ void ScuReset(u8 powering_up) {
    memset(&ScuRegs->dma0, 0, sizeof(ScuRegs->dma0));
    memset(&ScuRegs->dma1, 0, sizeof(ScuRegs->dma1));
    memset(&ScuRegs->dma2, 0, sizeof(ScuRegs->dma2));
+   ScuDmaBusy = 0;
 
 }
 
@@ -1336,13 +1337,44 @@ void SucDmaCheck(scudmainfo_struct * dma, int time) {
 }
 
 
+int ScuDmaBusy = 0;
+static int ScuDmaSyncing = 0;
+
+void ScuDmaProc(Scu * scu, int time);
+
+static void ScuDmaUpdateBusy(void) {
+   ScuDmaBusy = (ScuRegs->dma0.TransferNumber > 0
+              || ScuRegs->dma1.TransferNumber > 0
+              || ScuRegs->dma2.TransferNumber > 0);
+}
+
+/* Called by the SH-2 SoundRam accessors while an SCU DMA may still be moving
+ * data.  If a channel is currently writing into SoundRam, the CPU access is
+ * held until that transfer has finished, which is what the SCU does to any
+ * other bus master on real hardware.  Cheap when no DMA is in flight. */
+void ScuDmaBusWaitSoundRamSlow(void) {
+   if (!ScuDmaBusy || ScuDmaSyncing)
+      return;
+   if ((ScuRegs->dma0.TransferNumber <= 0 || (ScuRegs->dma0.WriteAddress & 0x1FF00000) != 0x05A00000)
+    && (ScuRegs->dma1.TransferNumber <= 0 || (ScuRegs->dma1.WriteAddress & 0x1FF00000) != 0x05A00000)
+    && (ScuRegs->dma2.TransferNumber <= 0 || (ScuRegs->dma2.WriteAddress & 0x1FF00000) != 0x05A00000))
+      return;
+   ScuDmaProc(ScuRegs, 0x7FFFFFFF);
+}
+
 void ScuDmaProc(Scu * scu, int time) {
 #if OLD_DMA
   return;
 #endif
+  /* The transfer itself writes SoundRam through the same accessors the CPU
+   * uses, so mark the DMA as running to stop ScuDmaBusWaitSoundRam() from
+   * re-entering it. */
+  ScuDmaSyncing = 1;
   SucDmaCheck(&scu->dma0, time);
   SucDmaCheck(&scu->dma1, time);
   SucDmaCheck(&scu->dma2, time);
+  ScuDmaSyncing = 0;
+  ScuDmaUpdateBusy();
 }
 
 //////////////////////////////////////////////////////////////////////////////

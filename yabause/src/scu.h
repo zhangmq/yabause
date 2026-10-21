@@ -148,6 +148,17 @@ extern "C" {
 
   extern Scu * ScuRegs;
 
+  /* Non-zero while an SCU DMA channel still has data to move.  The SH-2 bus
+   * accessors call ScuDmaBusWaitSoundRam() before touching SoundRam: the SCU
+   * DMA is the bus master on real hardware, so a CPU data access that lands
+   * while a transfer is in flight is held off until the transfer has finished.
+   * Without that, the CPU can read a SoundRam block that is still half
+   * uploaded (this is what made ST-V Golden Axe read a zeroed sound header). */
+  extern int ScuDmaBusy;
+  void ScuDmaBusWaitSoundRamSlow(void);
+  /* Fast path: a single global test when no transfer is running (the norm). */
+  #define ScuDmaBusWaitSoundRam() do { if (ScuDmaBusy) ScuDmaBusWaitSoundRamSlow(); } while (0)
+
   typedef struct
   {
     scucodebreakpoint_struct codebreakpoint[MAX_BREAKPOINTS];
