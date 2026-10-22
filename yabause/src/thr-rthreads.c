@@ -168,6 +168,30 @@ void YabAddEventQueue( YabEventQueue * queue_t, int evcode )
 	scond_broadcast(queue->cond_empty);
 }
 
+/* Non-blocking variant: drop the event when the queue is full.  The VDP worker
+ * uses it to post "one VDP1 draw finished" -- a coalescing notification, not
+ * data -- so a full queue must never stall the worker (it used to deadlock:
+ * the worker blocked here while the main CPU was waiting for that same worker
+ * inside Vdp2VBlankIN). */
+int YabTryAddEventQueue( YabEventQueue * queue_t, int evcode )
+{
+	YabEventQueue_rthreads * queue = (YabEventQueue_rthreads*)queue_t;
+	int added = 0;
+	slock_lock(queue->mutex);
+	if (queue->size != queue->capacity) {
+		queue->buffer[queue->in] = evcode;
+		++ queue->size;
+		++ queue->in;
+		queue->in %= queue->capacity;
+		added = 1;
+	}
+	slock_unlock(queue->mutex);
+	if (added)
+		scond_broadcast(queue->cond_empty);
+	return added;
+}
+
+
 int YabClearEventQueue(YabEventQueue * queue_t)
 {
 	YabEventQueue_rthreads * queue = (YabEventQueue_rthreads*)queue_t;
