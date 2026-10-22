@@ -84,6 +84,22 @@ struct retro_core_option_v2_definition option_defs_us[] = {
       "4M_extended_ram"
    },
 {
+      "yabasanshiro_stv_region",
+      "ST-V BIOS Region",
+      NULL,
+      "Which region's ST-V BIOS from stvbios.zip to boot a Titan game with, chosen among the regions its cart header allows. Only used in ST-V mode; some Japanese carts only work on the JP BIOS. Core restart required.",
+      NULL,
+      "system",
+      {
+         { "EU", "Europe" },
+         { "US", "USA" },
+         { "JP", "Japan" },
+         { "TW", "Taiwan" },
+         { NULL, NULL },
+      },
+      "EU"
+   },
+{
       "yabasanshiro_sh2coretype",
       "SH2 Core",
       NULL,

@@ -1672,6 +1672,33 @@ void check_variables(void)
 {
    struct retro_variable var;
 
+   /* ST-V: which region's BIOS from stvbios.zip to run a Titan cart with.  The
+    * loader in stv.c only ever picks a BIOS whose region the cart header allows,
+    * so this is a preference among legal choices, not an override -- it exists
+    * because some Japanese carts (e.g. seabass V0.001) only come up on the JP
+    * BIOS.  Kronos has the same option as kronos_stv_favorite_region. */
+   var.key = "yabasanshiro_stv_region";
+   var.value = NULL;
+   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+   {
+      if (strcmp(var.value, "US") == 0)      stv_favorite_region = STV_REGION_US;
+      else if (strcmp(var.value, "JP") == 0) stv_favorite_region = STV_REGION_JP;
+      else if (strcmp(var.value, "TW") == 0) stv_favorite_region = STV_REGION_TW;
+      else                                   stv_favorite_region = STV_REGION_EU;
+   }
+   /* YAB_STV_REGION=eu|us|jp|tw still wins, so the headless harness (which has
+    * no core options) can test regions without a separate build. */
+   {
+      const char *e = getenv("YAB_STV_REGION");
+      if (e && *e)
+      {
+         if (!strcmp(e, "us"))      stv_favorite_region = STV_REGION_US;
+         else if (!strcmp(e, "jp")) stv_favorite_region = STV_REGION_JP;
+         else if (!strcmp(e, "tw")) stv_favorite_region = STV_REGION_TW;
+         else if (!strcmp(e, "eu")) stv_favorite_region = STV_REGION_EU;
+      }
+   }
+
    var.key = "yabasanshiro_force_hle_bios";
    var.value = NULL;
    if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
@@ -2722,6 +2749,10 @@ bool retro_load_game(const struct retro_game_info *info)
       yinit.stvbiospath         = stv_bios_path;
       yinit.eepromdir           = stv_eeprom_dir;
       yinit.stv_favorite_region = stv_favorite_region;
+      log_cb(RETRO_LOG_INFO, "ST-V preferred BIOS region: %s\n",
+             stv_favorite_region == STV_REGION_JP ? "JP" :
+             stv_favorite_region == STV_REGION_US ? "US" :
+             stv_favorite_region == STV_REGION_TW ? "TW" : "EU");
       yinit.carttype            = CART_ROMSTV;
       yinit.cartpath            = NULL;
       yinit.cdcoretype          = CDCORE_DUMMY;
