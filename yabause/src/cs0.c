@@ -1090,17 +1090,22 @@ static u8 FASTCALL ROMSTVCs1ReadByte(u32 addr)
 
 static u16 FASTCALL ROMSTVCs1ReadWord(u32 addr)
 {
-   /* 0x04FFFFF8/0x04FFFFFA are the crypto "set low/high address" latches and
-    * are readable: twcup98 writes 0x1234 to 0x04FFFFF8 and polls until it reads
+   /* Only the two command latches at the very top of the CS1 window are
+    * readable: twcup98 writes 0x1234 to 0x04FFFFF8 and polls until it reads
     * back (0x0600967C), so returning the cartridge bytes there hung the game
-    * for ever.  Measured: twcup98 and twsoc98 both boot to a full screen
-    * (nonblack 315392 at 704x448) once the latches are readable, and the other
-    * titles are unchanged at f800 (gaxeduel 76471, cotton2 69136,
-    * ffreveng 78123, tatacot/astrass 3781). */
-   switch (addr & 0xF) {
-   case 0x8:  return cyptoGetLowAddr();
-   case 0xA:  return cyptoGetHighAddr();
-   default:   break;
+    * for ever.
+    *
+    * The first version of this gated on "addr & 0xF == 8 / A", which hijacked
+    * every 16-bit CS1 read whose low nibble happened to be 8 or A -- that is
+    * one address in eight of the whole cartridge window.  tatacot reads its
+    * own graphics data through CS1 at such addresses and got the latch values
+    * instead: its background lost whole columns (evenly spaced black vertical
+    * bars) and its colours were wrong.  Gate on the full register address
+    * instead (Kronos reads the ROM unconditionally here at all). */
+   switch (addr & 0xFFFFFF) {
+   case 0xFFFFF8: return cyptoGetLowAddr();
+   case 0xFFFFFA: return cyptoGetHighAddr();
+   default:       break;
    }
    return T1ReadWord(&((u8 *)CartridgeArea->rom)[0x2000000], addr & 0xFFFFFF);
 }
