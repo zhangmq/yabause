@@ -224,6 +224,26 @@ void YabAddEventQueue(YabEventQueue *queue_t, int evcode)
 #endif
 }
 
+/* Non-blocking variant: drop the event when the queue is full. */
+int YabTryAddEventQueue(YabEventQueue *queue_t, int evcode)
+{
+  YabEventQueue_win32 *queue = (YabEventQueue_win32 *)queue_t;
+  int added = 0;
+  EnterCriticalSection(&(queue->mutex));
+  if (queue->size != queue->capacity)
+  {
+    queue->buffer[queue->in] = evcode;
+    ++queue->size;
+    ++queue->in;
+    queue->in %= queue->capacity;
+    added = 1;
+  }
+  LeaveCriticalSection(&(queue->mutex));
+  if (added)
+    SetEvent(queue->cond_empty);
+  return added;
+}
+
 int YabClearEventQueue(YabEventQueue *queue_t)
 {
   YabEventQueue_win32 *queue = (YabEventQueue_win32 *)queue_t;

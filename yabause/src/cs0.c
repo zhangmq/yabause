@@ -1090,6 +1090,23 @@ static u8 FASTCALL ROMSTVCs1ReadByte(u32 addr)
 
 static u16 FASTCALL ROMSTVCs1ReadWord(u32 addr)
 {
+   /* Only the two command latches at the very top of the CS1 window are
+    * readable: twcup98 writes 0x1234 to 0x04FFFFF8 and polls until it reads
+    * back (0x0600967C), so returning the cartridge bytes there hung the game
+    * for ever.
+    *
+    * The first version of this gated on "addr & 0xF == 8 / A", which hijacked
+    * every 16-bit CS1 read whose low nibble happened to be 8 or A -- that is
+    * one address in eight of the whole cartridge window.  tatacot reads its
+    * own graphics data through CS1 at such addresses and got the latch values
+    * instead: its background lost whole columns (evenly spaced black vertical
+    * bars) and its colours were wrong.  Gate on the full register address
+    * instead (Kronos reads the ROM unconditionally here at all). */
+   switch (addr & 0xFFFFFF) {
+   case 0xFFFFF8: return cyptoGetLowAddr();
+   case 0xFFFFFA: return cyptoGetHighAddr();
+   default:       break;
+   }
    return T1ReadWord(&((u8 *)CartridgeArea->rom)[0x2000000], addr & 0xFFFFFF);
 }
 

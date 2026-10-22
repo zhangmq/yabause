@@ -243,6 +243,25 @@ void YabAddEventQueue( YabEventQueue * queue_t, int evcode ){
     pthread_cond_broadcast(&(queue->cond_empty));
 }
 
+/* Non-blocking variant: drop the event when the queue is full (see
+ * YabTryAddEventQueue in threads.h -- the VDP worker must never stall). */
+int YabTryAddEventQueue( YabEventQueue * queue_t, int evcode ){
+    YabEventQueue_pthread * queue = (YabEventQueue_pthread*)queue_t;
+    int added = 0;
+    pthread_mutex_lock(&(queue->mutex));
+    if (queue->size != queue->capacity) {
+        queue->buffer[queue->in] = evcode;
+        ++ queue->size;
+        ++ queue->in;
+        queue->in %= queue->capacity;
+        added = 1;
+    }
+    pthread_mutex_unlock(&(queue->mutex));
+    if (added)
+        pthread_cond_broadcast(&(queue->cond_empty));
+    return added;
+}
+
 
 int YabClearEventQueue(YabEventQueue * queue_t) {
   YabEventQueue_pthread * queue = (YabEventQueue_pthread*)queue_t;

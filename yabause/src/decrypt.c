@@ -512,6 +512,20 @@ void cyptoSetSubkey(u16 subKey)
   cryptoReady = 0;
 }
 
+/* The command latches are readable on hardware: ST-V titles use the 0x04FFFFF8
+ * and 0x04FFFFFA ports as scratch registers -- write a pattern, then poll until
+ * it reads back.  twcup98 (and twsoc98) sit in exactly that loop at
+ * 0x0600967C forever unless the write can be read back, so expose the latches. */
+u16 cyptoGetLowAddr(void)
+{
+  return (u16)(cryptoAddr & 0xffff);
+}
+
+u16 cyptoGetHighAddr(void)
+{
+  return (u16)((cryptoAddr >> 16) & 0xffff);
+}
+
 static u16 bitswap16(u16 in, const u8* vec)
 {
   u16 ret = 0;

@@ -95,6 +95,10 @@ void YabThreadDestoryQueue( YabEventQueue * queue_t );
 
 // YabAddEventQueue: send event
 void YabAddEventQueue( YabEventQueue * queue_t, int evcode );
+// YabTryAddEventQueue: send event, but never block.  Returns 1 if the event
+// was queued, 0 if the queue was full and the event was dropped.  Use this for
+// "something finished" notifications from a producer that must not stall.
+int YabTryAddEventQueue( YabEventQueue * queue_t, int evcode );
 
 // YabWaitEventQueue: recive event
 int YabWaitEventQueue( YabEventQueue * queue_t );

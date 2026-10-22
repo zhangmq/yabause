@@ -4824,6 +4824,15 @@ scsp_alloc_bufs (void)
 }
 
 static u8 IsM68KRunning;
+/* The ST-V sound-CPU wire (SMPC PDR2) is toggled from the main thread, but the
+ * 68k executes on the SCSP thread.  Resetting it from the main thread raced
+ * with that execution: the instruction trace showed the CPU running from
+ * 0x00000004 / 0x00000006 -- the intermediate states of m68k_pulse_reset() --
+ * and then executing the vector table as code (seabass's BIOS sound self test
+ * toggles this wire several times per run, and the crash PC differed on every
+ * run: 0x05FFFFB8, 0x10000002, 0x1E10674C, 0x30401E10).  Defer the reset to
+ * the thread that owns the CPU. */
+static volatile int Is68KResetPending;
 static s32 FASTCALL (*m68kexecptr)(s32 cycles);  // M68K->Exec or M68KExecBP
 static s32 savedcycles;  // Cycles left over from the last M68KExec() call
 
@@ -4919,6 +4928,7 @@ scu_interrupt_handler (void)
 u8 FASTCALL
 SoundRamReadByte (u32 addr)
 {
+  ScuDmaBusWaitSoundRam();
   addr &= 0xFFFFF;
   u8 val = 0;
 
@@ -4939,6 +4949,9 @@ void FASTCALL
 SoundRamWriteByte (u32 addr, u8 val)
 {
   addr &= 0xFFFFF;
+
+  /* Same bus arbitration as the reads: the SCU DMA owns the bus first. */
+  ScuDmaBusWaitSoundRam();
 
   // If mem4b is set, mirror ram every 256k
   if (scsp.mem4b == 0)
@@ -4992,6 +5005,10 @@ SoundRamReadWord (u32 addr)
   addr &= 0xFFFFF;
   u16 val = 0;
 
+  /* The SCU DMA is the bus master while a transfer is running: hold the CPU
+   * off until it has finished (see ScuDmaBusWaitSoundRam). */
+  ScuDmaBusWaitSoundRam();
+
   if (scsp.mem4b == 0)
     addr &= 0x3FFFF;
   else if (addr > 0x7FFFF)
@@ -5014,6 +5031,9 @@ SoundRamWriteWord (u32 addr, u16 val)
 {
   addr &= 0xFFFFF;
 
+  /* Same bus arbitration as the reads: the SCU DMA owns the bus first. */
+  ScuDmaBusWaitSoundRam();
+
   // If mem4b is set, mirror ram every 256k
   if (scsp.mem4b == 0)
     addr &= 0x3FFFF;
@@ -5030,6 +5050,8 @@ SoundRamWriteWord (u32 addr, u16 val)
 u32 FASTCALL
 SoundRamReadLong (u32 addr)
 {
+  /* See ScuDmaBusWaitSoundRam: no CPU read may overtake an in-flight DMA. */
+  ScuDmaBusWaitSoundRam();
   addr &= 0xFFFFF;
   u32 val;
   u32 pre_cycle = m68kcycle;
@@ -5058,6 +5080,9 @@ void FASTCALL
 SoundRamWriteLong (u32 addr, u32 val)
 {
   addr &= 0xFFFFF;
+
+  /* Same bus arbitration as the reads: the SCU DMA owns the bus first. */
+  ScuDmaBusWaitSoundRam();
   //u32 pre_cycle = m68kcycle;
 
   // If mem4b is set, mirror ram every 256k
@@ -5230,7 +5255,7 @@ ScspDeInit (void)
 void
 M68KStart (void)
 {
-  M68K->Reset ();
+  Is68KResetPending = 1;   /* done on the SCSP thread, see M68KExec */
   //ScspReset();
   savedcycles = 0;
   IsM68KRunning = 1;
@@ -5241,7 +5266,7 @@ M68KStart (void)
 void
 M68KStop (void)
 {
-  M68K->Reset();
+  Is68KResetPending = 1;   /* the next start begins from a clean state */
   //ScspReset();
   IsM68KRunning = 0;
 }
@@ -5293,6 +5318,12 @@ void M68KExec(s32 cycles)
   s32 newcycles = savedcycles - cycles;
   if (LIKELY(IsM68KRunning))
     {
+      if (UNLIKELY(Is68KResetPending))
+        {
+          Is68KResetPending = 0;
+          M68K->Reset();
+          newcycles = 0;
+        }
       if (LIKELY(newcycles < 0))
         {
           s32 cyclestoexec = -newcycles;
