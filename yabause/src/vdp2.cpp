@@ -125,6 +125,107 @@ YabEventQueue * command_ = NULL;
 
 //---------------------------------------------------------------------------------------
 
+/* ---------------------------------------------------------------------------
+ * VDP1 draw-completion handshake (async renderer).
+ *
+ * The VDP worker posts one "a VDP1 draw finished" event into
+ * vdp1_rcv_evqueue.  The main CPU consumes one (and clears the rest) on the
+ * line armed in yabsys.wait_line_count, then raises ScuSendDrawEnd.  Two ways
+ * that handshake used to deadlock the whole machine (tatacot, in game):
+ *
+ *  a) the wait line was armed (or inherited) at a line the main CPU had
+ *     already passed, so the main CPU never consumed anything: after 8 frames
+ *     the queue was full and the worker blocked for ever inside
+ *     YabAddEventQueue -- while the main CPU waited for that same worker in
+ *     Vdp2VBlankIN;
+ *  b) the worker drew a frame because VDP1 was still RUNNING, while the main
+ *     CPU only arms the line for Plot Trigger mode 2 (frame_change_plot), so
+ *     those completions had no consumer at all.
+ *
+ * Fix: never arm a line that is already behind, arm the line from the paths
+ * that draw without the main CPU arming, and post the completion without ever
+ * blocking the worker.  getenv() states are cached; YAB_VDPQ=1 traces the
+ * handshake, YAB_VDPQFIX=0 restores the old behaviour for an A/B run.
+ * ------------------------------------------------------------------------- */
+static int yab_vdpq_on(void)
+{
+   static int on = -1;
+   if (on < 0) on = getenv("YAB_VDPQ") ? 1 : 0;
+   return on;
+}
+
+static int yab_vdpq_fix(void)
+{
+   static int on = -1;
+   if (on < 0) {
+      const char *e = getenv("YAB_VDPQFIX");
+      on = (e && *e == '0') ? 0 : 1;
+   }
+   return on;
+}
+
+static void vdp1ArmWaitLineAt(int line)
+{
+   int target;
+   if (!yab_vdpq_fix()) {
+      yabsys.wait_line_count += 45;
+      yabsys.wait_line_count %= yabsys.VBlankLineCount;
+      return;
+   }
+   target = yabsys.wait_line_count;
+   if (target < 0)
+      target = line;
+   target = (target + 45) % yabsys.VBlankLineCount;
+   /* A target the main CPU has already passed would never match: the
+    * completion would stay queued for ever (and fill the queue after 8
+    * frames).  If it is behind, schedule from the line we are on now --
+    * wrapping past VBlankLineCount is fine, the main CPU reaches it after
+    * the line counter resets. */
+   if (line < yabsys.VBlankLineCount && target <= line)
+      target = (line + 45) % yabsys.VBlankLineCount;
+   if (yab_vdpq_on() && target != yabsys.wait_line_count) {
+      printf("[VDPQ] W arm line=%d wait=%d->%d\n",
+             line, yabsys.wait_line_count, target);
+      fflush(stdout);
+   }
+   yabsys.wait_line_count = target;
+}
+
+static void vdp1ArmWaitLine(void)
+{
+   vdp1ArmWaitLineAt(yabsys.LineCount);
+}
+
+/* Arm only when nothing is pending: used by the path that draws because VDP1
+ * is still RUNNING, where the main CPU arms for Plot Trigger mode 2.  Never
+ * overwrite an arm the main CPU made for a PTMR direct draw. */
+static void vdp1ArmWaitLineIfIdle(void)
+{
+   if (yabsys.wait_line_count != -1)
+      return;
+   vdp1ArmWaitLineAt(yabsys.LineCount);
+}
+
+/* Worker side: post one completion, but never block.  The event is a
+ * coalescing "something finished" notification, not data: dropping it when the
+ * queue is already full is harmless, blocking here deadlocks the machine. */
+static void vdp1NotifyDrawDone(void)
+{
+   int q = YaGetQueueSize(vdp1_rcv_evqueue);
+   if (yab_vdpq_on() && q >= 1) {
+      printf("[VDPQ] W add line=%d q=%d status=%d swap=%d plot=%d wait=%d\n",
+             yabsys.LineCount, q, Vdp1External.status,
+             Vdp1External.swap_frame_buffer, Vdp1External.frame_change_plot,
+             yabsys.wait_line_count);
+      fflush(stdout);
+   }
+   if (yab_vdpq_fix())
+      YabTryAddEventQueue(vdp1_rcv_evqueue, 0);
+   else
+      YabAddEventQueue(vdp1_rcv_evqueue, 0);
+}
+
+
 extern "C" void * VdpProc(void *arg);      // rendering thread.
 static void vdp2VBlankIN(void); // VBLANK-IN handler
 static void vdp2VBlankOUT(void);// VBLANK-OUT handler
@@ -561,7 +662,7 @@ extern "C" void * VdpProc( void *arg ){
       VIDCore->Vdp1DrawEnd();
       Vdp1External.frame_change_plot = 0;
       FrameProfileAdd("DirectDraw end");
-      YabAddEventQueue(vdp1_rcv_evqueue, 0);
+      vdp1NotifyDrawDone();
       break;
     case VDPEV_MAKECURRENT:
       YuiUseOGLOnThisThread();
@@ -1030,8 +1131,7 @@ void Vdp2HBlankOUT(void) {
       {
         Vdp1Regs->EDSR >>= 1;
         if (Vdp1External.frame_change_plot == 1 ) {
-          yabsys.wait_line_count += 45;
-          yabsys.wait_line_count %= yabsys.VBlankLineCount;
+          vdp1ArmWaitLineAt(yabsys.LineCount);
           FRAMELOG("SET Vdp1 end wait at %d", yabsys.wait_line_count);
         }
       }else{
@@ -1061,6 +1161,13 @@ void Vdp2HBlankOUT(void) {
   if (yabsys.wait_line_count != -1 && yabsys.LineCount == yabsys.wait_line_count) {
     if (g_vdp_async)
     {
+      if (yab_vdpq_on() && YaGetQueueSize(vdp1_rcv_evqueue) > 1) {
+        printf("[VDPQ] M drain line=%d q=%d status=%d swap=%d plot=%d\n",
+               yabsys.LineCount, YaGetQueueSize(vdp1_rcv_evqueue),
+               Vdp1External.status, Vdp1External.swap_frame_buffer,
+               Vdp1External.frame_change_plot);
+        fflush(stdout);
+      }
       FRAMELOG("**WAIT START %d %d**", yabsys.wait_line_count, YaGetQueueSize(vdp1_rcv_evqueue));
       YabWaitEventQueue(vdp1_rcv_evqueue); // sync VOUT
       YabClearEventQueue(vdp1_rcv_evqueue);
@@ -1328,6 +1435,11 @@ void vdp2VBlankOUT(void) {
       Vdp1Regs->COPR = 0;
       Vdp1Draw();
       isrender = 1;
+      /* The main CPU only arms the wait line for Plot Trigger mode 2; when we
+       * draw because VDP1 is still RUNNING, nobody else arms it, so the
+       * completion we are about to post would have no consumer at all. */
+      if (g_vdp_async && Vdp1External.frame_change_plot != 1)
+         vdp1ArmWaitLineIfIdle();
     }
   }
   else {
@@ -1338,19 +1450,15 @@ void vdp2VBlankOUT(void) {
       Vdp1Draw();
       isrender = 1;
       if (g_vdp_async)
-      {
-         yabsys.wait_line_count += 45;
-         yabsys.wait_line_count %= yabsys.VBlankLineCount;
-      }
+         vdp1ArmWaitLine();
 
     }
   }
 
   if (g_vdp_async)
   {
-    if (isrender){
-      YabAddEventQueue(vdp1_rcv_evqueue, 0);
-    }
+    if (isrender)
+      vdp1NotifyDrawDone();
   }
 
   if (Vdp2Regs->TVMD & 0x8000) {
