@@ -30,8 +30,8 @@ frontend — and is loaded as `yabasanshiro_libretro.so`. It plays **Sega Saturn
   "which context is current" per thread in TLS; bypassing it left the frontend without a context).
 * **Renderer mode is a runtime setting** (see below): both renderers are compiled in and the core
   option *Async Renderer* picks one per boot, instead of a `YAB_SYNC=1` rebuild. The async path is
-  faster but lets host scheduling reach the emulated machine; the inline path is deterministic and
-  is the workaround for the black-screen boot described below.
+  faster (7-17% in the *Measured* table) and is the default; the inline path keeps the emulated
+  machine off the host scheduler entirely, which is occasionally useful when bisecting.
 
 **GL / correctness on this driver** (textures are shared between the two contexts, FBOs are not):
 
@@ -66,10 +66,13 @@ frontend — and is loaded as `yabasanshiro_libretro.so`. It plays **Sega Saturn
   games swap discs from the frontend menu.
 * `610bb618` — the reference core's low-risk robustness fixes (`error.c` allocation, the thread
   CPU-index mutex, `BackupManager` flush, HLE BIOS default Slave-CPU proc, `debug.c` log mutex).
-* `6cf146a3` (restored by `843509a2`) — align the two rendering differences with the reference
-  core: the VDP1 shadow-discard threshold and the RGB shader bit ops. An earlier revert
-  (`cfcba53f`) had blamed the threshold for SotN's missing walls; that premise was disproven —
-  the walls were lost to the missing depth/stencil on the async mirror FBO (`074c4034`).
+* `cc7ee800` — **keep the VDP1 shadow-discard test as upstream writes it** (`fbColor.b != 0.0`).
+  An alignment with the reference core's `>= 0.45` (`6cf146a3`, briefly restored by `843509a2`) was
+  reverted for good: on-screen inspection showed Castlevania SotN losing its walls, and although the
+  missing depth/stencil on the mirror FBO (`074c4034`) turned out to be the real cause of that
+  regression, a three-colour shader probe plus save-state-pinned comparisons then showed the two
+  spellings cannot differ on anything reachable here (the disputed range `b ∈ (0, 0.45)` never
+  occurs), so the upstream form stays. Do not "align" it again without a scene that disagrees.
 
 **SCSP threading** (`68821ac4`, `8fd15b47`, `b000abc0`) — the async sound CPU thread used
 `ctime()` as a `struct timespec *`, so its timed wait returned `EINVAL` immediately and the thread
@@ -90,15 +93,15 @@ takes effect on the **next launch** of a game ("Core restart required").
 * `disabled` -- the frame loop draws inline with the frontend's context, exactly like upstream
   Yabause. Slower, but the emulated machine no longer depends on host scheduling.
 
-**If a game boots to a black screen while the emulator still reports a healthy frame rate** --
-seen on some Sega Titan Video titles -- set *Async Renderer* to `disabled`, save the setting, then
-exit and relaunch the game. The inline renderer is deterministic; measured cost on this device is
-7–17 % on heavy titles and nothing on titles that are already at 60 fps. Some titles only trip
-this after a key press during boot, so the switch is worth trying before blaming the ROM or the
-BIOS.
+**A black screen while the emulator still reports a healthy frame rate was an ST-V bus race, not a
+renderer problem.** Some Titan titles booted black at a steady 60 fps with the async renderer and
+never with the inline one, which made the renderer look guilty; the actual cause was the SCU DMA
+writing SoundRam while the SH-2 still owned the bus, so the CPU read back half-uploaded data
+(`7d8552b5`, ported from MAME's bus arbitration). With that fixed the async renderer boots those
+titles like the inline one, and switching renderers is no longer a workaround for anything.
 
 Measured on the RGSP (2400-frame windows, governor pinned at `performance`/1512000, frameskip
-disabled) -- same core, only the option differs:
+disabled, build `v2.5.1 cfcba53f`, 2026-09-20) -- same core, only the option differs:
 
 | Title | `enabled` (async) | `disabled` (inline) |
 |---|---|---|
@@ -133,14 +136,29 @@ tree. What came over:
   hooks: `stv_mode` detected from the zip entry names + CRC32, `stv_favorite_region`, the ST-V key
   descriptors.
 
-**Known ST-V quirk -- black screen at full speed.** A few ST-V titles can boot to a black screen
-while the emulator still runs at ~60 fps and the audio is alive; it is input-timing dependent
-(a key press during the boot sequence can be the trigger) and it is a *rendering-schedule*
-problem, not a bad dump: with the inline renderer those same boots come out identical every time.
-If it happens, set the *Async Renderer* core option to `disabled`, save, and relaunch the game --
-see [Renderer mode is a runtime setting](#renderer-mode-is-a-runtime-setting). It was tracked down
-on `batmanfr`: 3 of 12 boot+coin combinations went black with the async renderer, 0 of 12 with the
-inline one.
+**ST-V fixes that came after the initial port**: the SCU-DMA/SH-2 bus race above (`7d8552b5`);
+the CS1 protection port that the Saturn cart-ID special case used to short-circuit, which left
+three encrypted titles looping on a garbage read and is now gated by cartridge type (issue #9);
+unimplemented IOGA offsets reading `0xFF` like MAME instead of `0x00`; 32-bit reads of the VDP2
+register file; and romset matching that prefers the exact zip name over the last matching entry
+(issue #13).
+
+**Two ST-V options exist because a few carts are region- or timing-sensitive**:
+
+* `yabasanshiro_stv_region` = `EU` (default) / `US` / `JP` / `TW` — picks a BIOS from `stvbios.zip`
+  among the regions the cart header allows, exactly like Kronos' `kronos_stv_favorite_region`
+  (there is deliberately no "Auto": the header only lists what is *allowed*, and the region changes
+  gameplay, not just language). `Radiant Silvergun` is the case in point: on a JP BIOS it runs its
+  three-button, seven-weapon set; on any western BIOS it enters the two-button "overseas" mode with
+  no Weapon C. Set `JP` for that one.
+* `yabasanshiro_stv_sound_cpu_lead` = `off` (default) / `half_frame` — **experimental, temporary**.
+  Holds the 68k sound CPU half a frame ahead of the SH-2 frame. `Sea Bass Fishing V0.001` only
+  cold-boots with it (22 of 25 attempts on this device with the original test build; re-measured
+  with a time series on the daily config: 4 of 6 first tries, 6 of 6 after one relaunch). It is an
+  empirical workaround, not a timing model, it costs a few percent of frame rate, and it will be
+  **removed once the boot is fixed properly** — the intended use meanwhile is: enable it for the
+  boot, save a state, turn it off (or load that state with it off). Everything else about the boot
+  stays a known limitation of the emulator, not a feature.
 
 Two deliberate differences from Kronos, both measured:
 
@@ -231,7 +249,8 @@ per-core configuration directory from the part before the first `_` (and segfaul
 
 ## Measured
 
-Anbernic RGSP (Allwinner H700, Mali-G31), hardware render through the offscreen `lrheadless` harness
+Anbernic RGSP (Allwinner H700, Mali-G31), build `v2.5.1 cfcba53f` (2026-09-20), hardware render
+through the offscreen `lrheadless` harness
 (pbuffer, same hw-render contract and option defaults as minarch-gl), CPU governor pinned to
 `performance` (1512 MHz on all four cores), **2400-frame windows**, frameskip disabled. Every row is
 the *same core* with only the **Async Renderer** option changed, so this is the cost of that switch
