@@ -717,6 +717,109 @@ u64 g_m68K_dec_cycle = 0;
 
 
 
+/* Core option yabasanshiro_stv_sound_cpu_lead (libretro.c): 68k lead for ST-V */
+extern int yab_stv_sound_cpu_phase;
+extern int yab_stv_mode;
+
+/* 68k throttle, owned by the SCSP realtime thread (scsp.c).  The main thread
+ * publishes the highest yab_68k_cycles the sound CPU may reach and then waits
+ * for it to get there -- that is what makes the phase below reproducible on a
+ * device where the sound thread used to free-run against the wall clock. */
+extern volatile int yab_68k_throttle;
+extern u64 yab_68k_allow;
+extern u64 yab_68k_cycles;
+extern u64 yab_68k_gate_n;
+extern int g_scsp_lock;
+/* Wakes the sound thread up after the main thread has published a new cap. */
+extern void yab_68k_kick(void);
+
+/* Steady pacing state: the cap published per scanline is
+ *   yab_68k_line_want + lines_done * 188160 / MaxLineCount
+ * i.e. the 68k is allowed to advance at exactly the SH-2's rate, so the two
+ * CPUs stay offset by the phase instead of the 68k running a whole frame ahead
+ * inside the frame. */
+static u64 yab_68k_line_want = 0;
+static int yab_68k_line_cap = 0;
+
+/* Throttle shape, selected with the YAB_68KTHR probe variable (the core option
+ * only picks "the default shape"):
+ *   frame - (default) publish one frame of slack after the wait, so the 68k
+ *           keeps running in parallel with the SH-2 frame and only the phase at
+ *           the frame boundary is pinned.  Measured on seabass through the real
+ *           frontend: 11/13 boots.
+ *   steady - grow the cap with the SH-2's progress inside the frame (published
+ *           every 8 scanlines) so the 68k runs alongside it at the same rate.
+ *           Measured on seabass: 0/13 boots, so it is *not* the shape the game
+ *           wants even though it looks like the most faithful one.
+ *   sync  - no slack and no per-scanline publish: the 68k does its whole frame
+ *           of work at the frame boundary (serialised behind the SH-2).
+ *   wall  - like frame, but keep the wall-clock sleep in the sound thread, i.e.
+ *           the 68k is spread evenly through the frame (what the old harness
+ *           did implicitly).
+ *   off   - no throttle at all (the pre-2026-10-24 "wait only" behaviour).
+ * YAB_68KLOCK=<cycles> still overrides the phase offset, and takes precedence
+ * over the core option; YAB_68KLOCK=off disables everything. */
+static int yab_68k_throttle_mode(void)
+{
+   /* 0 = steady, 1 = frame, 2 = wall, 3 = off, 4 = sync */
+   static int init = 0, mode = 1;
+   if (!init)
+   {
+      const char *e = getenv("YAB_68KTHR");
+      init = 1;
+      mode = 1;
+      if (e && *e)
+      {
+         if (!strcmp(e, "steady")) mode = 0;
+         else if (!strcmp(e, "frame")) mode = 1;
+         else if (!strncmp(e, "wall", 4)) mode = 2;
+         else if (!strcmp(e, "sync")) mode = 4;
+         else if (!strcmp(e, "off") || !strcmp(e, "no") || !strcmp(e, "0")) mode = 3;
+      }
+   }
+   return mode;
+}
+
+/* The lock is on when the core option is enabled, or when the YAB_68KLOCK probe
+ * variable is present.  "off"/"no" (and an empty value) disable the probe;
+ * any number -- including 0 -- enables the lock with that phase offset. */
+static int yab_68k_lock_on(void)
+{
+   static int init = 0, env_on = 0;
+   if (!init)
+   {
+      const char *e = getenv("YAB_68KLOCK");
+      init = 1;
+      if (e && *e && strcmp(e, "off") && strcmp(e, "no")) env_on = 1;
+   }
+   if (env_on) return 1;
+   return yab_stv_sound_cpu_phase && yab_stv_mode;
+}
+
+/* Phase offset in 68k cycles.  The default is half of the 188160-cycle frame:
+ * measured on seabass, only +94080 boots (0 / +47040 / +141120 / +188160 all
+ * stay black), i.e. the sound CPU has to lead the SH-2 frame by half a frame. */
+static long yab_68k_lock_off(void)
+{
+   static int init = 0; static long off = 94080;
+   if (!init)
+   {
+      const char *e = getenv("YAB_68KLOCK");
+      init = 1;
+      if (e && *e && strcmp(e, "off") && strcmp(e, "no")) off = strtol(e, NULL, 10);
+   }
+   return off;
+}
+
+/* YAB_68KLOCK_UNTIL=<frame>: apply the lockstep only for the first N frames
+ * (boot window), then release it so gameplay keeps its full speed.  0 = always. */
+static int yab_68k_lock_until(void)
+{
+   static int init = 0, n = 0;
+   if (!init) { const char *e = getenv("YAB_68KLOCK_UNTIL"); init = 1; if (e && *e) n = atoi(e); }
+   return n;
+}
+
 int YabauseEmulate(void) {
    int oneframeexec = 0;
    /* Where is the machine stuck?  The dynarec only syncs regs.PC at block
@@ -740,6 +843,159 @@ int YabauseEmulate(void) {
     * switch.  yabsys.LineCount is still maintained because VDP2 needs it. */
    int local_line = 0;
    yabsys.frame_count++;
+   /* yabasanshiro_stv_sound_cpu_lead / YAB_68KLOCK: pin the *phase* between
+    * the sound CPU (68k) and the SH2s at the frame boundary.
+    *
+    * The SCSP realtime thread paces the 68k against the wall clock, i.e. it
+    * free-runs relative to the emulated frame; on the device it was measured
+    * 3.5 frames ahead at f=100 and 5.5 ahead at f=600, so a plain "wait for the
+    * 68k" lock never fires there (spins=0) and the phase is arbitrary.
+    *
+    * So the main thread owns the phase instead: it publishes the highest cycle
+    * count the sound CPU may reach (yab_68k_allow, enforced in scsp.c) and
+    * waits for it to get there.  In the default "steady" shape the cap is then
+    * re-published every 8 scanlines as "frame target + the SH-2's progress", so
+    * the 68k advances at the SH-2's rate instead of racing ahead.
+    */
+   {
+      /* Frame-granular lockstep, base-relative so the sound thread's late start
+       * is not treated as a permanent deficit.  YAB_68KLOCK=<cycles> shifts the
+       * phase: 0 = the 68k is exactly on the frame's nominal cycle budget,
+       * +188160 = one frame ahead of the SH2, -188160 = one frame behind.
+       * The core option uses the +94080 (half frame) default. */
+      static u64 base68 = 0;
+      static u32 basef = 0;
+      static int inited = 0;
+      static int was_on = 0;
+      int on = yab_68k_lock_on() &&
+               (yab_68k_lock_until() == 0 || (int)yabsys.frame_count < yab_68k_lock_until());
+      /* Every off->on edge re-bases, so the switch can be flipped at runtime
+       * (boot with it on, save a state, switch it off) without the target
+       * running away while it was off. */
+      if (on && !was_on) inited = 0;
+      was_on = on;
+      if (!on)
+      {
+         if (yab_68k_throttle) { yab_68k_throttle = 0; yab_68k_allow = 0; }
+         goto yab_68k_lock_done;
+      }
+      /* The SCSP thread is only started by the first ScspExec(), so on the very
+       * first frames yab_68k_cycles is still 0: the +half-frame target is then
+       * unreachable and the wait below just times out (seen through minarch:
+       * "[68KLOCK] gave up at f=1 (0 < 94080)"), which leaves the phase wrong
+       * for the whole run and the game black.  Re-base until the thread has
+       * actually produced cycles. */
+      if (!inited) {
+         if (yab_68k_cycles == 0) goto yab_68k_lock_done;
+         inited = 1; base68 = yab_68k_cycles; basef = yabsys.frame_count;
+         printf("[68KLOCK] engaged at f=%u base=%llu off=%ld modethrottle=%d phase=%d stv=%d\n",
+                (unsigned)yabsys.frame_count, (unsigned long long)base68,
+                (long)yab_68k_lock_off(), (int)(g_scsp_main_mode != 0),
+                (int)yab_stv_sound_cpu_phase, (int)yab_stv_mode);
+         fflush(stdout);
+      }
+      {
+         long off = (long)yab_68k_lock_off();
+         u64 want = base68 + (u64)(yabsys.frame_count - basef) * 188160ull;
+         int spins = 0;
+         if (off >= 0) want += (u64)off;
+         else          want -= (u64)(-off);
+         /* Discontinuity guard: a savestate load restores frame_count (and thus
+          * moves the target) without rewinding the sound thread's cycle
+          * counter, and the sound thread is only started on the first
+          * ScspExec().  If the target is more than two frames away from where
+          * the 68k actually is, re-base instead of waiting or -- worse --
+          * publishing a cap below the current cycle count, which would wedge
+          * the sound thread. */
+         {
+            u64 d = (yab_68k_cycles > want) ? (yab_68k_cycles - want) : (want - yab_68k_cycles);
+            if (d > 2ull * 188160ull)
+            {
+               base68 = yab_68k_cycles; basef = yabsys.frame_count;
+               want = base68;
+               if (off >= 0) want += (u64)off; else want -= (u64)(-off);
+               printf("[68KLOCK] re-based at f=%u (%llu)\n",
+                      (unsigned)yabsys.frame_count, (unsigned long long)base68);
+               fflush(stdout);
+            }
+         }
+         /* The throttle only makes sense for the realtime (wall-clock paced)
+          * sound thread; mode 0 already has a per-frame handshake through
+          * q_scsp_frame_start/q_scsp_finish in SyncCPUtoSCSP(). */
+         int thr_mode = yab_68k_throttle_mode();
+         int throttled = (g_scsp_main_mode != 0) && (thr_mode != 3);
+         {
+            static int tr = -1;
+            if (tr < 0) { const char *e = getenv("YAB_68KTRACE"); tr = (e && *e) ? 1 : 0; }
+            if (tr && (yabsys.frame_count <= 16 || yabsys.frame_count % 240 == 0))
+            {
+               printf("[68KTR] f=%u thr=%d mode=%d main=%u phase=%d stv=%d allow=%llu cyc=%llu\n",
+                      (unsigned)yabsys.frame_count, throttled, thr_mode,
+                      (unsigned)g_scsp_main_mode, (int)yab_stv_sound_cpu_phase, (int)yab_stv_mode,
+                      (unsigned long long)__atomic_load_n(&yab_68k_allow, __ATOMIC_ACQUIRE),
+                      (unsigned long long)yab_68k_cycles);
+               fflush(stdout);
+            }
+         }
+         if (throttled)
+         {
+            /* Never publish a cap below where the sound CPU already is: that
+             * would block it until the target catches up (and with it the
+             * per-frame audio refill). */
+            u64 cap = (want > yab_68k_cycles) ? want : yab_68k_cycles;
+            __atomic_store_n(&yab_68k_allow, cap, __ATOMIC_RELEASE);
+            __atomic_store_n(&yab_68k_throttle, 1, __ATOMIC_RELEASE);
+            yab_68k_kick();
+         }
+         /* Wait for the 68k thread to reach the target.  2000 x 200 us = 400 ms
+          * cap; with the throttle engaged this is normally a no-op because the
+          * sound thread has been racing towards `want` all through the previous
+          * frame. */
+         while (yab_68k_cycles < want && spins < 2000) { YabThreadUSleep(200); spins++; }
+         if (spins >= 2000)
+         {
+            static int warned = 0;
+            if (!warned) { printf("[68KLOCK] gave up at f=%u (%llu < %llu)\n",
+                                  (unsigned)yabsys.frame_count,
+                                  (unsigned long long)yab_68k_cycles, (unsigned long long)want);
+                           fflush(stdout); warned = 1; }
+         }
+         if (throttled)
+         {
+            /* What happens to the cap after the wait decides the shape:
+             *   frame/wall -> one frame of slack (default);
+             *   steady     -> no slack, the per-scanline publish below grows the
+             *                 cap in step with the SH-2;
+             *   sync       -> no slack and no per-scanline publish. */
+            extern volatile int yab_68k_keepclock;
+            u64 slack = (thr_mode >= 1 && thr_mode <= 2) ? 188160ull : 0ull;
+            yab_68k_keepclock = (thr_mode == 2);
+            /* steady: no frame of slack, the per-scanline publish below grows
+             * the cap in step with the SH-2 instead. */
+            yab_68k_line_want = want;
+            yab_68k_line_cap = (thr_mode == 0);
+            __atomic_store_n(&yab_68k_allow, want + slack, __ATOMIC_RELEASE);
+            yab_68k_kick();
+            /* YAB_68KLOG=<every N frames>: phase telemetry (off by default). */
+            {
+               static int log_init = 0, log_every = 0;
+               if (!log_init) { const char *e = getenv("YAB_68KLOG"); log_init = 1;
+                                if (e && *e) log_every = atoi(e); }
+               if (log_every > 0 && ((u32)yabsys.frame_count % (u32)log_every) == 0)
+               {
+                  printf("[68KTHR] f=%u 68k=%llu want=%llu lead=%lld spins=%d allow=%llu gate=%llu thr=%d mode=%d\n",
+                         (unsigned)yabsys.frame_count, (unsigned long long)yab_68k_cycles,
+                         (unsigned long long)want,
+                         (long long)(yab_68k_cycles - want), spins,
+                         (unsigned long long)__atomic_load_n(&yab_68k_allow, __ATOMIC_ACQUIRE),
+                         (unsigned long long)yab_68k_gate_n, (int)yab_68k_throttle, thr_mode);
+                  fflush(stdout);
+               }
+            }
+         }
+      }
+   }
+yab_68k_lock_done: ;
    #if !(defined(__LIBRETRO__))
    PlayRecorder_proc(yabsys.frame_count);
    #endif
@@ -870,6 +1126,21 @@ int YabauseEmulate(void) {
          PROFILE_START("SCSP");
          ScspExec();
          PROFILE_STOP("SCSP");
+         /* Steady 68k pacing: let the cap grow with the SH-2's progress inside
+          * the frame instead of releasing a whole frame at the boundary.  The
+          * seabass boot depends on the sound CPU advancing *alongside* the
+          * SH-2 (that is what the wall-clock paced sound thread did in the
+          * headless harness, which booted 8/8), not on it racing a frame ahead
+          * inside the frame.  Published every 8 scanlines (~5.7k cycles) so the
+          * sound thread does not have to wake up for every line. */
+         if (yab_68k_line_cap && (local_line & 7) == 0)
+         {
+            unsigned mlc = yabsys.MaxLineCount ? yabsys.MaxLineCount : 263;
+            __atomic_store_n(&yab_68k_allow,
+                             yab_68k_line_want + (u64)local_line * 188160ull / (u64)mlc,
+                             __ATOMIC_RELEASE);
+            yab_68k_kick();
+         }
          yabsys.DecilineCount = 0;
          yabsys.LineCount++;
          local_line++;

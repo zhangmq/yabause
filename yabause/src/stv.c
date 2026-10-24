@@ -2590,6 +2590,14 @@ int copyBios(JZFile *zip, void* id) {
                 if (biosloaded > i && (biosLink.entry->blobs[i].region & availableGames[gameId].entry->regions) == biosLink.entry->blobs[i].region
                 && (stv_favorite_region == biosLink.entry->blobs[i].region || (availableGames[gameId].entry->regions & stv_favorite_region) != stv_favorite_region)) {
                   LOGSTV("Load bios %s\n", filename);
+                  /* One line per boot: which BIOS blob was picked and why.  A
+                   * region mismatch is otherwise invisible (an all-region cart
+                   * silently gets its favourite region, and e.g. Radiant
+                   * Silvergun then runs its 2-button overseas mode). */
+                  printf("[STV] BIOS %s region=%d (cart allows 0x%x, favourite %d)\n",
+                         filename, (int)biosLink.entry->blobs[i].region,
+                         (unsigned)availableGames[gameId].entry->regions, (int)stv_favorite_region);
+                  fflush(stdout);
                   for (j=0; j<biosLink.entry->blobs[i].length;j++) {
                     T1WriteByte(BiosRom, biosLink.entry->blobs[i].offset+j, data[j]);
                   }

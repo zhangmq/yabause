@@ -59,7 +59,7 @@ struct retro_core_option_v2_definition option_defs_us[] = {
       "yabasanshiro_async_rendering",
       "Async Renderer",
       NULL,
-      "Run VDP1/VDP2 rendering on its own thread, drawing into the framebuffer through a shared GL context. Faster on heavy titles, but the emulated machine then depends on host scheduling: some ST-V games boot to a black screen at full speed. Disable to render inline (deterministic, slower). Core restart required.",
+      "Run VDP1/VDP2 on a worker thread. Faster. Core restart required.",
       NULL,
       "video",
       {
@@ -82,6 +82,36 @@ struct retro_core_option_v2_definition option_defs_us[] = {
          { NULL, NULL },
       },
       "4M_extended_ram"
+   },
+{
+      "yabasanshiro_stv_sound_cpu_lead",
+      "Sound CPU Lead (experimental)",
+      NULL,
+      "ST-V only, experimental: holds the sound CPU half a frame ahead of the SH-2. Some carts need it.",
+      NULL,
+      "system",
+      {
+         { "off",        "Off (sound CPU free-runs)" },
+         { "half_frame", "Half frame ahead" },
+         { NULL, NULL },
+      },
+      "off"
+   },
+{
+      "yabasanshiro_stv_region",
+      "ST-V BIOS Region",
+      NULL,
+      "ST-V only: BIOS region to boot with. Some games need a specific region. Restart required.",
+      NULL,
+      "system",
+      {
+         { "EU", "Europe" },
+         { "US", "USA" },
+         { "JP", "Japan" },
+         { "TW", "Taiwan" },
+         { NULL, NULL },
+      },
+      "EU"
    },
 {
       "yabasanshiro_sh2coretype",

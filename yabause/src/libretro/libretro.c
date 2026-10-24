@@ -56,6 +56,13 @@ static char stv_eeprom_dir[PATH_MAX];
 static char *stvgame = NULL;
 static bool stv_mode = false;
 static int stv_favorite_region = STV_REGION_EU;
+/* ST-V sound CPU phase: hold the sound CPU a fixed half frame ahead of the
+ * SH-2 frame while it is on.  Read by yabause.c; see the core option
+ * yabasanshiro_stv_sound_cpu_lead (an ST-V workaround, not a timing model). */
+int yab_stv_sound_cpu_phase = 0;
+/* Mirror of the stv_mode flag for yabause.c, so the option really is a no-op
+ * outside ST-V mode (see yabasanshiro_stv_sound_cpu_lead). */
+int yab_stv_mode = 0;
 static bool service_enabled = false;   /* kronos_service_enabled: Test/Service/Pause keys */
 static char bup_path[PATH_MAX];
 
@@ -1672,6 +1679,42 @@ void check_variables(void)
 {
    struct retro_variable var;
 
+   /* ST-V: which region's BIOS from stvbios.zip to run a Titan cart with.  The
+    * loader in stv.c only ever picks a BIOS whose region the cart header allows,
+    * so this is a preference among legal choices, not an override -- it exists
+    * because some Japanese carts (e.g. seabass V0.001) only come up on the JP
+    * BIOS.  Kronos has the same option as kronos_stv_favorite_region. */
+   var.key = "yabasanshiro_stv_region";
+   var.value = NULL;
+   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+   {
+      if (strcmp(var.value, "US") == 0)      stv_favorite_region = STV_REGION_US;
+      else if (strcmp(var.value, "JP") == 0) stv_favorite_region = STV_REGION_JP;
+      else if (strcmp(var.value, "TW") == 0) stv_favorite_region = STV_REGION_TW;
+      else                                   stv_favorite_region = STV_REGION_EU;
+   }
+   /* YAB_STV_REGION=eu|us|jp|tw still wins, so the headless harness (which has
+    * no core options) can test regions without a separate build. */
+   {
+      const char *e = getenv("YAB_STV_REGION");
+      if (e && *e)
+      {
+         if (!strcmp(e, "us"))      stv_favorite_region = STV_REGION_US;
+         else if (!strcmp(e, "jp")) stv_favorite_region = STV_REGION_JP;
+         else if (!strcmp(e, "tw")) stv_favorite_region = STV_REGION_TW;
+         else if (!strcmp(e, "eu")) stv_favorite_region = STV_REGION_EU;
+      }
+   }
+
+   /* ST-V: hold the sound CPU a fixed half frame ahead of the SH-2 frame.
+    * Off by default; the point is to switch it to half_frame for a ST-V boot
+    * and then back to off (or load a state saved after the boot) so the
+    * frame-rate cost is only paid while booting.  YAB_68KLOCK (probe) wins. */
+   var.key = "yabasanshiro_stv_sound_cpu_lead";
+   var.value = NULL;
+   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+      yab_stv_sound_cpu_phase = (strcmp(var.value, "half_frame") == 0);
+
    var.key = "yabasanshiro_force_hle_bios";
    var.value = NULL;
    if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
@@ -2406,6 +2449,7 @@ bool retro_load_game(const struct retro_game_info *info)
    snprintf(stv_bios_path, sizeof(stv_bios_path), "%s%cstvbios.zip", g_system_dir, slash);
    stvgame = NULL;
    stv_mode = false;
+   yab_stv_mode = 0;
    {
       const char *ext = path_get_extension(info->path);
 
@@ -2415,6 +2459,7 @@ bool retro_load_game(const struct retro_game_info *info)
          if (stvgame != NULL)
          {
             stv_mode = true;
+            yab_stv_mode = 1;
             log_cb(RETRO_LOG_INFO, "ST-V game detected: %s\n", stvgame);
          }
          else
@@ -2722,6 +2767,10 @@ bool retro_load_game(const struct retro_game_info *info)
       yinit.stvbiospath         = stv_bios_path;
       yinit.eepromdir           = stv_eeprom_dir;
       yinit.stv_favorite_region = stv_favorite_region;
+      log_cb(RETRO_LOG_INFO, "ST-V preferred BIOS region: %s\n",
+             stv_favorite_region == STV_REGION_JP ? "JP" :
+             stv_favorite_region == STV_REGION_US ? "US" :
+             stv_favorite_region == STV_REGION_TW ? "TW" : "EU");
       yinit.carttype            = CART_ROMSTV;
       yinit.cartpath            = NULL;
       yinit.cdcoretype          = CDCORE_DUMMY;

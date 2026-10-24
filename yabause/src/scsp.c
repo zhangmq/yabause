@@ -5631,6 +5631,52 @@ void ScspAsynMainCpuTime( void * p ){
 }
 
 
+/* YAB_68KRATE: how many 68k cycles does the sound CPU actually get per
+ * emulated frame?  The real rate is 11289600 Hz = 188160 cycles per 60 Hz
+ * frame, so a delta well below that means the sound CPU is starving. */
+u64 yab_68k_cycles = 0;
+
+/* 68k throttle, driven by the main thread (core option
+ * yabasanshiro_stv_sound_cpu_lead, see yabause.c).
+ *
+ * The realtime SCSP thread normally paces the sound CPU against the wall
+ * clock: it runs one emulated frame of 68k cycles as fast as it can and then
+ * sleeps until the next 1/60 s boundary.  That is not a lockstep with the
+ * SH-2: on the device the 68k was measured 3.5 frames ahead of the SH-2 at
+ * frame 100 and 5.5 ahead at frame 600, so a "wait for the 68k" phase lock on
+ * the main thread never fires (spins=0) and the phase is whatever the two
+ * wall clocks happen to produce.
+ *
+ * With the throttle on, the main thread owns the phase: it publishes
+ * yab_68k_allow (an absolute yab_68k_cycles value) and waits until the sound
+ * CPU reaches it, and this thread may never run past the published value.
+ * The default shape ("steady") republishes the cap every 8 scanlines as
+ * "frame target + the SH-2's progress inside the frame", so the 68k advances
+ * at the SH-2's rate and the two stay offset by a constant phase -- that is
+ * what makes the seabass boot reproducible (5/5 on the device, see
+ * .notes/stv/STV-LIBRARY-SWEEP.md).  yab_68k_allow == 0 with the throttle off
+ * means "unlimited", i.e. the old wall-clock pacing. */
+volatile int yab_68k_throttle = 0;
+volatile int yab_68k_keepclock = 0;  /* keep the wall-clock sleep while throttled */
+u64 yab_68k_allow = 0;
+u64 yab_68k_gate_n = 0;   /* diagnostic: gate sleeps */
+
+/* Wake-up channel for the gate below.  The main thread publishes a new cap up
+ * to 33 times per frame (every 8 scanlines) in "steady" mode, and the sound
+ * thread has to react within a scanline (~66 us) or it falls behind the SH-2
+ * and drags the main thread with it; a 100 us usleep poll cannot do that (the
+ * scheduler rounds it up), a condition variable can.  The timed wait keeps a
+ * safety timeout so a dead main thread cannot hang the sound thread. */
+static pthread_mutex_t yab_68k_gate_mtx = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  yab_68k_gate_cnd = PTHREAD_COND_INITIALIZER;
+
+void yab_68k_kick(void)
+{
+  pthread_mutex_lock(&yab_68k_gate_mtx);
+  pthread_cond_broadcast(&yab_68k_gate_cnd);
+  pthread_mutex_unlock(&yab_68k_gate_mtx);
+}
+
 void ScspAsynMainRealtime(void * p) {
 
   s64 before;
@@ -5702,10 +5748,57 @@ void ScspAsynMainRealtime(void * p) {
   before = 0;
   while (thread_running) {
     while (g_scsp_lock) { YabThreadUSleep(1000); }
+    /* 68k throttle: do not run past the cycle count the main thread published.
+     * The main thread publishes the target for the *next* frame before it
+     * starts emulating the current one, then waits for us to reach it, so this
+     * gate is what pins the phase at the frame boundary instead of letting the
+     * wall clock decide.  Bounded (10 s) so a dead main thread cannot hang the
+     * sound thread forever. */
+    if (__atomic_load_n(&yab_68k_throttle, __ATOMIC_ACQUIRE)) {
+      int gate_spins = 0;
+      /* Block while the cap has been reached, i.e. wait while
+       * "cycles >= allow" and run while there is allowance left.  Comparing
+       * the current count (not count+256) matters: the phase offset is half a
+       * frame, 94080 cycles, which is not a multiple of the 256-cycle chunk,
+       * so a "count + 256 <= allow" test can never be satisfied once the 68k
+       * is within one chunk of the target and wedges the sound thread for good
+       * (measured: "[68KLOCK] gave up at f=2 (1975552 < 1975680)", 1.7 fps).
+       * Letting the chunk that crosses the cap run keeps the phase within one
+       * chunk (<= 255 cycles = 0.14% of a frame). */
+      while (thread_running && !g_scsp_lock &&
+             yab_68k_cycles >= __atomic_load_n(&yab_68k_allow, __ATOMIC_ACQUIRE)) {
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        ts.tv_nsec += 200000;                 /* 200 us safety timeout */
+        if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
+        pthread_mutex_lock(&yab_68k_gate_mtx);
+        pthread_cond_timedwait(&yab_68k_gate_cnd, &yab_68k_gate_mtx, &ts);
+        pthread_mutex_unlock(&yab_68k_gate_mtx);
+        yab_68k_gate_n++;
+        if (++gate_spins > 5000) break;
+      }
+      if (!thread_running || g_scsp_lock) continue;
+      {
+        static int tr = -1; static u64 last = 0;
+        if (tr < 0) { const char *e = getenv("YAB_68KTRACE"); tr = (e && *e) ? 1 : 0; }
+        if (tr && yab_68k_gate_n - last >= 2000)
+        {
+          last = yab_68k_gate_n;
+          printf("[68KGATE] cyc=%llu allow=%llu thr=%d lock=%d run=%d\n",
+                 (unsigned long long)yab_68k_cycles,
+                 (unsigned long long)__atomic_load_n(&yab_68k_allow, __ATOMIC_ACQUIRE),
+                 (int)yab_68k_throttle, g_scsp_lock, thread_running);
+          fflush(stdout);
+        }
+      }
+    }
     // Run 1 sample(44100Hz)
     for (i = 0; i < samplecnt; i += step) {
       MM68KExec(step);
       m68kcycle += base_clock;
+      /* Phase base for the main thread's lockstep: the 68k cycles this thread
+       * has actually executed (u64, read by yabause.c). */
+      yab_68k_cycles += step;
     }
 
     wait_clock = 0;
@@ -5736,7 +5829,13 @@ void ScspAsynMainRealtime(void * p) {
       s64 sleepchecktime = 0;
       m68kcycle = 0;
       sh2_read_req = 0;
-      do {
+      /* With the 68k throttle on, the frame rate is normally set by the main
+       * thread's frame boundary handshake, not by the wall clock: sleeping
+       * here would stall the sound CPU (and with it the main thread, which
+       * waits for this thread) whenever the frontend runs slower than 60 Hz.
+       * YAB_68KTHR=wall keeps the sleep to spread the 68k work through the
+       * frame instead of running it in one burst. */
+      if (!yab_68k_throttle || !yab_68k_keepclock) do {
         now = YabauseGetTicks();
         if (now >= before){
           difftime = (now - before) * 1000000000L / yabsys.tickfreq;
