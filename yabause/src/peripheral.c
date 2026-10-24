@@ -112,9 +112,15 @@ u8 IOPortReadByte(u32 addr) {
             return val;
          }
          return IOPORT[PORT_G];
-      case 0x1b: return 0x0;
+      case 0x1b: return 0x0;   /* RS422 COM read status: no data available */
       case 0x1d: return m_ioga_mode;
-      default: return 0x0;
+      /* MAME's ioga_r() initialises the result to 0xFF and only overrides the
+         ports it models, so every unmapped offset reads 0xFF.  The RS422
+         "satellite" link registers (0x13 TXD1, 0x15 TXD2, 0x17 RXD1, 0x19 RXD2,
+         0x1b FLAG) live in that gap, and Technical Bowling / Yatterman Plus
+         poll them: reading 0x00 there says "link jammed" for ever
+         (yattrmnp's own error message is "SATELLITE CHACKER JAM"). */
+      default: return 0xff;
    }
 }
 

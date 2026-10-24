@@ -2066,7 +2066,18 @@ u16 FASTCALL Vdp2ReadWord(u32 addr) {
 u32 FASTCALL Vdp2ReadLong(u32 addr) {
    LOG("VDP2 register long read = %08X\n", addr);
    addr &= 0x1FF;
-   return 0;
+   /* Kronos 11da1047 ("Implement the long rad access on vdp2 register - Fixes
+    * SegaRally start screen"): the register file is 16 bits wide, so a 32-bit
+    * access is two 16-bit reads.  Returning 0 for every long read gave any
+    * game that reads a register this way the wrong data.
+    * Measured: this does NOT fix the plain Sega Rally (USA) logo hang on its
+    * own (it still stops at 352x224 with only the logo), but it is what the
+    * hardware does and what the reference implementation returns. */
+   {
+      u16 hi = Vdp2ReadWord(addr);
+      u16 lo = Vdp2ReadWord((addr + 2) & 0x1FF);
+      return ((u32)hi << 16) | lo;
+   }
 }
 
 //////////////////////////////////////////////////////////////////////////////
