@@ -450,21 +450,16 @@ extern "C" void FASTCALL Vdp1WriteWord(u32 addr, u16 val) {
       {
         if (g_vdp_async)
         {
-          /* Async renderer: hand the direct draw to the VDP worker. */
-          FRAMELOG("[VDP1] VDPEV_DIRECT_DRAW %d/%d", YaGetQueueSize(vdp1_rcv_evqueue), yabsys.LineCount);
-          if ( YaGetQueueSize(vdp1_rcv_evqueue) > 0){
-            yabsys.wait_line_count = -1;
-            do{
-              YabWaitEventQueue(vdp1_rcv_evqueue);
-            } while (YaGetQueueSize(vdp1_rcv_evqueue) != 0);
-          }
+          /* Async emulation: this thread cannot rasterize (GL lives on the
+           * frontend thread), so record the draw in the frame slot and let the
+           * frontend do it when it renders that slot. */
+          FRAMELOG("[VDP1] direct draw deferred to the frame slot");
           Vdp1Regs->EDSR >>= 1;
           yabsys.wait_line_count = yabsys.LineCount + 50;
           yabsys.wait_line_count %= yabsys.MaxLineCount;
           if (yabsys.wait_line_count == 5) { yabsys.wait_line_count = 4; }
           FRAMELOG("SET DIRECT WAIT %d", yabsys.wait_line_count);
-          YabAddEventQueue(evqueue,VDPEV_DIRECT_DRAW);
-          YabThreadYield();
+          yab_frameslot_mark_direct_draw();
         }
         else
         {

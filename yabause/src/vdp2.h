@@ -420,6 +420,25 @@ void Vdp2DeInit(void);
 void Vdp2Reset(void);
 void Vdp2LinesSwap(void);
 int yab_nowait(void);
+
+/* Frame slots: the emulation thread fills one per frame and the frontend thread
+ * renders it (see vdp2.cpp).  All of these are no-ops until yab_frameslot_init()
+ * has run; acquire/wait block, which is what gives us the backpressure. */
+void  yab_frameslot_init(void);
+int   yab_frameslot_acquire(void);
+int   yab_frameslot_tryacquire(void);
+void  yab_frameslot_publish(int idx, unsigned frame_no, int width, int height);
+int   yab_frameslot_wait(void);
+void  yab_frameslot_release(int idx);
+void  yab_frameslot_bind(int idx);
+void  yab_frameslot_lines(int idx, Vdp2 **out_lines);
+unsigned yab_frameslot_frame_no(int idx);
+void  yab_frameslot_set_current(int idx);
+int   yab_frameslot_publish_current(unsigned frame_no, int w, int h);
+void  yab_render_slot(int idx);
+void  yab_bind_live_state(void);
+void  yab_frameslot_mark_direct_draw(void);
+
 extern volatile int vdp_composed_frame;
 extern volatile int yab_pic_pending;
 int vdp2PostStaged(void);

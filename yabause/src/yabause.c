@@ -1174,6 +1174,11 @@ yab_68k_lock_done: ;
             Vdp2VBlankOUT();
             yabsys.LineCount = 0;
             oneframeexec = 1;
+            /* Async emulation (flycast model): the frame's draw list is complete
+             * here, so hand the slot to the frontend thread, which does all the
+             * GL.  Nothing else in this thread touches GL. */
+            if (g_vdp_async)
+               yab_frameslot_publish_current((unsigned)yabsys.frame_count, 0, 0);
             PROFILE_STOP("VDP1/VDP2");
 
          }

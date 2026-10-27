@@ -3463,6 +3463,7 @@ void YglSetVdp2Window()
       glStencilMask(0x01);
       glStencilFunc(GL_ALWAYS, 0x01, 0x01);
       glVertexAttribPointer(_Ygl->windowpg.vertexp, 2, GL_INT, GL_FALSE, 0, (GLvoid *)_Ygl->win0v);
+      
       glDrawArrays(GL_TRIANGLE_STRIP, 0, _Ygl->win0_vertexcnt);
     }
 
@@ -3471,6 +3472,7 @@ void YglSetVdp2Window()
       glStencilMask(0x02);
       glStencilFunc(GL_ALWAYS, 0x02, 0x02);
       glVertexAttribPointer(_Ygl->windowpg.vertexp, 2, GL_INT, GL_FALSE, 0, (GLvoid *)_Ygl->win1v);
+      
       glDrawArrays(GL_TRIANGLE_STRIP, 0, _Ygl->win1_vertexcnt);
     }
 
@@ -3843,6 +3845,7 @@ void YglRenderFrameBuffer(int from, int to)
     glUniformMatrix4fv(_Ygl->renderfb.mtxModelView, 1, GL_FALSE, (GLfloat *)result.m);
     glVertexAttribPointer(_Ygl->renderfb.vertexp, 2, GL_INT, GL_FALSE, 0, (GLvoid *)vertices);
     glVertexAttribPointer(_Ygl->renderfb.texcoordp, 2, GL_FLOAT, GL_FALSE, 0, (GLvoid *)texcord);
+    
     glDrawArrays(GL_TRIANGLES, 0, 6);
 
     glDepthFunc(GL_GREATER);
@@ -3884,6 +3887,7 @@ void YglRenderFrameBuffer(int from, int to)
     glUniformMatrix4fv(_Ygl->renderfb.mtxModelView, 1, GL_FALSE, (GLfloat*)result.m);
     glVertexAttribPointer(_Ygl->renderfb.vertexp, 2, GL_INT, GL_FALSE, 0, (GLvoid *)vertices);
     glVertexAttribPointer(_Ygl->renderfb.texcoordp, 2, GL_FLOAT, GL_FALSE, 0, (GLvoid *)texcord);
+    
     glDrawArrays(GL_TRIANGLES, 0, 6);
 
     glDepthFunc(GL_GEQUAL);
@@ -3929,6 +3933,7 @@ void YglRenderFrameBuffer(int from, int to)
   glUniformMatrix4fv(_Ygl->renderfb.mtxModelView, 1, GL_FALSE, (GLfloat *)result.m);
   glVertexAttribPointer(_Ygl->renderfb.vertexp, 2, GL_INT, GL_FALSE, 0, (GLvoid *)vertices);
   glVertexAttribPointer(_Ygl->renderfb.texcoordp, 2, GL_FLOAT, GL_FALSE, 0, (GLvoid *)texcord);
+  
   glDrawArrays(GL_TRIANGLES, 0, 6);
 
 #if 0
@@ -3937,6 +3942,7 @@ void YglRenderFrameBuffer(int from, int to)
      glUniformMatrix4fv(_Ygl->renderfb.mtxModelView, 1, GL_FALSE, (GLfloat*)result.m);
      glVertexAttribPointer(_Ygl->renderfb.vertexp, 2, GL_INT, GL_FALSE, 0, (GLvoid *)vertices);
      glVertexAttribPointer(_Ygl->renderfb.texcoordp, 2, GL_FLOAT, GL_FALSE, 0, (GLvoid *)texcord);
+     
      glDrawArrays(GL_TRIANGLES, 0, 6);
    }
 #endif
@@ -4013,6 +4019,7 @@ void YglRenderFrameBufferShadow()
   glUniformMatrix4fv(_Ygl->renderfb.mtxModelView, 1, GL_FALSE, (GLfloat *)result.m);
   glVertexAttribPointer(_Ygl->renderfb.vertexp, 2, GL_INT, GL_FALSE, 0, (GLvoid *)vertices);
   glVertexAttribPointer(_Ygl->renderfb.texcoordp, 2, GL_FLOAT, GL_FALSE, 0, (GLvoid *)texcord);
+  
   glDrawArrays(GL_TRIANGLES, 0, 6);
 }
 
@@ -4043,7 +4050,6 @@ void YglRender(void)
   int ccwindow = 0;
 
   YGLLOG("YglRender\n");
-
   FrameProfileAdd("YglRender start");
   if ((Vdp2Regs->TVMD & 0x8000) == 0)
   {
@@ -4270,7 +4276,7 @@ void YglRender(void)
           {
             glVertexAttribPointer(level->prg[j].vaid, 4, GL_FLOAT, GL_FALSE, 0, level->prg[j].vertexAttribute);
           }
-          glDrawArrays(GL_TRIANGLES, 0, level->prg[j].currentQuad / 2);
+            glDrawArrays(GL_TRIANGLES, 0, level->prg[j].currentQuad / 2);
 
           if (level->prg[j].bwin0 != 0 || level->prg[j].bwin1 != 0 || (level->prg[j].blendmode != VDP2_CC_NONE && ccwindow))
           {
@@ -4510,6 +4516,7 @@ int YglCleanUpWindow(YglProgram *prg)
       Ygl_setNormalshader(prg);
       glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, (GLvoid *)prg->quads);
       glVertexAttribPointer(1, 4, GL_FLOAT, GL_FALSE, 0, (GLvoid *)prg->textcoords);
+      
       glDrawArrays(GL_TRIANGLES, 0, prg->currentQuad / 2);
       glDepthFunc(GL_GEQUAL);
       Ygl_cleanupNormal(prg);

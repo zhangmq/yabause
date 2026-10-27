@@ -180,6 +180,198 @@ static void vdp2FramePackageLeave(void)
    vdp2ram_live = NULL;
 }
 
+/* ---------------------------------------------------------------------------
+ * Frame slots (flycast-style handoff).
+ *
+ * The emulation runs on its own thread and fills a slot at the frame boundary;
+ * the frontend thread takes the slot, draws it with GL straight into the
+ * framebuffer the frontend handed us, presents, and gives the slot back.  A
+ * slot is owned by exactly one side at a time, so no locking around the data is
+ * needed: the two event queues below are the whole protocol and they also give
+ * us the backpressure (a full queue blocks the producer).
+ * ------------------------------------------------------------------------- */
+#define YAB_SLOT_COUNT 3
+
+typedef struct
+{
+   u8 vdp1ram[0x80000];
+   u8 vdp2ram[0x80000];
+   u8 cram[0x1000];
+   Vdp2 vdp2regs;
+   Vdp1 vdp1regs;
+   Vdp2 lines[270];
+   unsigned frame_no;
+   int width, height;
+   int direct_draw;      /* PTMR-driven draw happened during this frame */
+} YabFrameSlot;
+
+static YabFrameSlot *yab_slots[YAB_SLOT_COUNT];
+static YabEventQueue *yab_slot_free_q = NULL;   /* tokens for free slots */
+static YabEventQueue *yab_slot_ready_q = NULL;  /* indices of filled slots */
+static int yab_slot_inited = 0;
+
+void yab_frameslot_init(void)
+{
+   int i;
+   if (yab_slot_inited) return;
+   yab_slot_inited = 1;
+   for (i = 0; i < YAB_SLOT_COUNT; i++)
+      yab_slots[i] = (YabFrameSlot *)calloc(1, sizeof(YabFrameSlot));
+   yab_slot_free_q = YabThreadCreateQueue(YAB_SLOT_COUNT);
+   /* Twice the slot count: publishing must never block.  If it could, the
+    * emulation thread would sit inside YabAddEventQueue() and never reach the
+    * pause safe point, while retro_run waits for it to park -- that deadlocked
+    * on the BIOS->game resolution change (measured: the machine stopped at
+    * frame 765 with the audio starving from underrun #1 onwards). */
+   yab_slot_ready_q = YabThreadCreateQueue(YAB_SLOT_COUNT * 2);
+   for (i = 0; i < YAB_SLOT_COUNT; i++)
+      YabAddEventQueue(yab_slot_free_q, i);
+}
+
+/* Emulation thread: blocks until a slot is free. */
+int yab_frameslot_acquire(void)
+{
+   yab_frameslot_init();
+   return YabWaitEventQueue(yab_slot_free_q);
+}
+
+/* Emulation thread: copy the live state the renderer needs into the slot and
+ * hand it over.  Called at the frame boundary, where the state is this frame's. */
+void yab_frameslot_publish(int idx, unsigned frame_no, int width, int height)
+{
+   YabFrameSlot *s;
+   if (idx < 0 || idx >= YAB_SLOT_COUNT) return;
+   s = yab_slots[idx];
+   if (!s) return;
+   /* Copy from the emulation thread's published buffers, not from this thread's
+    * thread-local pointers: the two can diverge (measured: the slot held a
+    * nearly empty VRAM -- checksum 1639 vs 665595 -- and every layer then
+    * sampled nothing, which is the black picture). */
+   memcpy(s->vdp1ram, vdp1ram_main ? vdp1ram_main : Vdp1Ram, 0x80000);
+   memcpy(s->vdp2ram, vdp2ram_main ? vdp2ram_main : Vdp2Ram, 0x80000);
+   memcpy(s->cram, vdp2cram_main ? vdp2cram_main : Vdp2ColorRam, 0x1000);
+   s->vdp2regs = *(vdp2regs_main ? vdp2regs_main : Vdp2Regs);
+   s->vdp1regs = *(vdp1regs_main ? vdp1regs_main : Vdp1Regs);
+   memcpy(s->lines, Vdp2LinesWork, sizeof(s->lines));
+   s->frame_no = frame_no;
+   s->width = width;
+   s->height = height;
+   { static int n = 0; if ((n++ % 60) == 0) { printf("[SLOT] pub f=%u idx=%d\n", frame_no, idx); fflush(stdout); } }
+   YabAddEventQueue(yab_slot_ready_q, idx);
+}
+
+/* Non-blocking variants (single producer / single consumer, so peeking the
+ * queue size first is enough): the emulation thread uses try-acquire so it can
+ * notice a stop request while it would otherwise wait for a free slot. */
+int yab_frameslot_tryacquire(void)
+{
+   yab_frameslot_init();
+   if (YaGetQueueSize(yab_slot_free_q) <= 0) return -1;
+   return YabWaitEventQueue(yab_slot_free_q);
+}
+
+/* Frontend thread: blocks until a frame is ready. */
+int yab_frameslot_wait(void)
+{
+   yab_frameslot_init();
+   return YabWaitEventQueue(yab_slot_ready_q);
+}
+
+/* Frontend thread: give the slot back so the emulation can fill it again. */
+void yab_frameslot_release(int idx)
+{
+   if (idx < 0 || idx >= YAB_SLOT_COUNT) return;
+   YabAddEventQueue(yab_slot_free_q, idx);
+}
+
+/* Make the calling thread see a slot's state (thread-local pointers). */
+void yab_frameslot_bind(int idx)
+{
+   YabFrameSlot *s;
+   if (idx < 0 || idx >= YAB_SLOT_COUNT) return;
+   s = yab_slots[idx];
+   if (!s) return;
+   Vdp1Ram = s->vdp1ram;
+   Vdp2Ram = s->vdp2ram;
+   Vdp2ColorRam = s->cram;
+   Vdp1Regs = &s->vdp1regs;
+   Vdp2Regs = &s->vdp2regs;
+   /* The VDP1 frame-change bookkeeping (swap_frame_buffer / frame_change_plot /
+    * status) decides whether the frame's VDP1 commands are rasterized at all;
+    * the machine thread has moved on by the time we draw, so use the snapshot. */
+   /* Vdp1External stays a shared global: the renderer's frame-change
+    * bookkeeping (current_frame flip, swap_frame_buffer clear) is part of the
+    * machine's state and must flow back to it. */
+}
+
+void yab_frameslot_lines(int idx, Vdp2 **out_lines)
+{
+   if (!out_lines) return;
+   *out_lines = (idx >= 0 && idx < YAB_SLOT_COUNT && yab_slots[idx]) ? yab_slots[idx]->lines : NULL;
+}
+
+
+/* The emulation thread holds one slot while it runs a frame; the frame boundary
+ * (Vdp2VBlankOUT, i.e. yabause.c's MaxLineCount branch) publishes it. */
+static int yab_emu_slot_cur = -1;
+
+void yab_frameslot_set_current(int idx) { yab_emu_slot_cur = idx; }
+
+int yab_frameslot_publish_current(unsigned frame_no, int w, int h)
+{
+   if (yab_emu_slot_cur < 0) return 0;
+   yab_frameslot_publish(yab_emu_slot_cur, frame_no, w, h);
+   yab_emu_slot_cur = -1;
+   return 1;
+}
+
+static int yab_render_slot_idx = -1;   /* slot the frontend is drawing */
+
+static int yab_slot_direct_draw(int idx)
+{
+   return (idx >= 0 && idx < YAB_SLOT_COUNT && yab_slots[idx]) ? yab_slots[idx]->direct_draw : 0;
+}
+
+static void vdp2VBlankOUT(void);   /* renderer-side VOUT (GL) */
+static void vdp2VBlankIN(void);    /* renderer-side VIN (GL)  */
+
+/* Frontend thread: draw one slot.  Everything here is GL and therefore has to
+ * run on the thread that owns the frontend's context -- that is the whole point
+ * of the slot handoff (see the plan in .notes/THREADING-REFACTOR-PLAN-*.md). */
+void yab_render_slot(int idx)
+{
+   Vdp2 *lines = NULL;
+   if (idx < 0) return;
+   yab_frameslot_bind(idx);
+   yab_frameslot_lines(idx, &lines);
+   if (lines) memcpy(Vdp2Lines, lines, sizeof(Vdp2Lines));
+   { static int n = 0; if ((n++ % 30) == 0)
+       { printf("[SLOTD] idx=%d TVMD=%04X BGON=%04X f=%u\n", idx, Vdp2Regs->TVMD, Vdp2Regs->BGON,
+                yab_slots[idx] ? yab_slots[idx]->frame_no : 0); fflush(stdout); } }
+   /* The PTMR direct draws of this frame are rasterized inside vdp2VBlankOUT,
+    * at the same point the synchronous path draws them (after Vdp2DrawStart and
+    * the erase) -- doing it earlier meant the erase wiped the polygons. */
+   yab_render_slot_idx = idx;
+   vdp2VBlankOUT();    /* Vdp2DrawStart, VDP1 raster, Vdp2DrawScreens, Vdp1DrawEnd */
+   vdp2VBlankIN();     /* Vdp2DrawEnd + Sync (this is where the picture is presented) */
+}
+
+/* A PTMR-driven direct draw happened: it is GL, so it cannot run here.  Mark
+ * the slot the emulation is filling and let the frontend do the rasterization
+ * when it renders that slot. */
+volatile int yab_dd_marks = 0, yab_dd_draws = 0;
+
+void yab_frameslot_mark_direct_draw(void)
+{
+   if (yab_emu_slot_cur >= 0 && yab_emu_slot_cur < YAB_SLOT_COUNT && yab_slots[yab_emu_slot_cur])
+      yab_slots[yab_emu_slot_cur]->direct_draw++;
+}
+
+unsigned yab_frameslot_frame_no(int idx)
+{
+   return (idx >= 0 && idx < YAB_SLOT_COUNT && yab_slots[idx]) ? yab_slots[idx]->frame_no : 0;
+}
+
 volatile unsigned yab_drop_busy = 0, yab_drop_pending = 0, yab_post_ok = 0;
 /* Set by the emulation thread while it reconfigures GL for a resolution change:
  * the render thread must not touch GL in that window (it would be using the
@@ -626,10 +818,14 @@ int Vdp2Init(void) {
        * (nowait). */
       vdp2ram_main = Vdp2Ram; vdp2cram_main = Vdp2ColorRam;
       vdp2regs_main = Vdp2Regs; vdp1regs_main = Vdp1Regs; vdp1ram_main = Vdp1Ram;
+      { extern Vdp1External_struct vdp1ext_main; extern int vdp1ext_main_valid;
+        if (!vdp1ext_main_valid) { vdp1ext_main = Vdp1External; vdp1ext_main_valid = 1; } }
       YuiRevokeOGLOnThisThread();
       evqueue = YabThreadCreateQueue(32);
-      vdp_proc_running = 1;
-      YabThreadStart(YAB_THREAD_VDP, "vdp", VdpProc, NULL);
+      /* The GL worker is gone: rendering happens on the frontend thread from
+       * the published frame slots (see yab_render_slot).  The queue stays so the
+       * few remaining notices have somewhere to go, but no thread consumes it. */
+      vdp_proc_running = 0;
    }
    return 0;
 
@@ -786,6 +982,26 @@ void Vdp2Reset(void) {
  * with __thread pointers an unbound thread sees NULL and segfaults on the first
  * T1ReadWord (found via the "vdp rotate" thread, which only draws the RBG0
  * layer once a game switches to a hi-res mode). */
+/* The emulation thread OWNS the live state: bind its thread-local pointers to
+ * the buffers the engine created on the frontend thread during init.  Without
+ * this the new thread sees NULL for all of them (same class of bug that once
+ * crashed the RBG rotation thread). */
+/* Published copy of the frontend thread's Vdp1External, so the emulation thread
+ * can inherit it when it takes over the machine. */
+Vdp1External_struct vdp1ext_main;
+int vdp1ext_main_valid = 0;
+
+extern "C" void yab_bind_live_state(void)
+{
+   if (!vdp2ram_main || !vdp1ram_main) return;
+   Vdp2Ram = vdp2ram_main;
+   Vdp2ColorRam = vdp2cram_main;
+   Vdp1Ram = vdp1ram_main;
+   Vdp2Regs = vdp2regs_main;
+   Vdp1Regs = vdp1regs_main;
+   if (vdp1ext_main_valid) Vdp1External = vdp1ext_main;
+}
+
 extern "C" void yab_bind_state_ptrs(void)
 {
    if (!vdp2ram_main || !vdp1ram_main) return;
@@ -1222,24 +1438,10 @@ void Vdp2VBlankIN(void) {
     Vdp2Regs->TVSTAT |= 0x0008;
     ScuSendVBlankIN();
     vdp_posted_frame = (int)yabsys.frame_count;
-    if (yab_nowait())
-    {
-       /* Adaptive backpressure: when the renderer is still busy with the
-        * previous frame, wait for it here instead of running further ahead.
-        * Titles whose renderer keeps up (Daytona, VF2) never block; ones it
-        * cannot feed (Golden Axe: 7 ms/frame emulation vs ~10 ms/frame render)
-        * fall back to the old wait-per-frame behaviour instead of presenting
-        * mostly stale pictures. */
-       if (vdp_worker_busy)
-          YabWaitEventQueue(rcv_evqueue);
-       vdp2StageFrame();
-    }
-    else
-    {
-       YabAddEventQueue(evqueue,VDPEV_VBLANK_IN);
-
-       YabWaitEventQueue(rcv_evqueue);
-    }
+    /* Async emulation (flycast model): this thread only runs the machine.  The
+     * composite for this frame happens later, on the frontend thread, from the
+     * slot published at the frame boundary -- so there is nothing to post or
+     * wait for here.  The backpressure is the bounded slot queue itself. */
     FrameProfileAdd("VIN sync");
   }
   else
@@ -1437,11 +1639,10 @@ void Vdp2HBlankOUT(void) {
        * frame boundary depends on it, and deferring it deadlocks the machine.
        * Presentation no longer collides with the draw because the core renders
        * into its OWN double-buffered targets and blits at present time. */
-      { extern void vdp_publish_state(void); vdp_publish_state(); }
-      if (yab_nowait()) vdp2FramePackageCapture();
-      YabAddEventQueue(evqueue, VDPEV_VBLANK_OUT);
+      /* Async emulation: the slot was published by yabause.c right after this
+       * call and the frontend thread will draw it.  Nothing is posted to a GL
+       * worker (there is none) and nothing is captured here. */
       YabThreadYield();
-      //YabThreadUSleep(10000);
     }
     else
     {
@@ -1460,16 +1661,20 @@ void Vdp2HBlankOUT(void) {
                Vdp1External.frame_change_plot);
         fflush(stdout);
       }
-      FRAMELOG("**WAIT START %d %d**", yabsys.wait_line_count, YaGetQueueSize(vdp1_rcv_evqueue));
-      YabWaitEventQueue(vdp1_rcv_evqueue); // sync VOUT
-      YabClearEventQueue(vdp1_rcv_evqueue);
-      FRAMELOG("**WAIT END**");
+      /* Async emulation: there is no GL worker to wait for.  The draw itself
+       * happens on the frontend thread from the frame slot; all the machine
+       * needs here is the completion timing, which is derived from VDP1's
+       * status exactly like the synchronous path does. */
       yabsys.wait_line_count = -1;
       FrameProfileAdd("DirectDraw sync");
       if (Vdp1External.status == VDP1_STATUS_IDLE) {
         FRAMELOG("Vdp1Draw end at %d line EDSR=%02X", yabsys.LineCount, Vdp1Regs->EDSR);
         Vdp1Regs->EDSR |= 2;
         ScuSendDrawEnd();
+      }
+      else {
+        yabsys.wait_line_count = yabsys.LineCount + 10;
+        yabsys.wait_line_count %= yabsys.VBlankLineCount;
       }
     }
     else
@@ -1701,6 +1906,15 @@ void vdp2VBlankOUT(void) {
   }
 
 
+  /* Async emulation: the machine already committed this frame's VDP1 command
+   * list into the slot, so rasterize it and swap the front/back buffer every
+   * frame.  Gating on swap_frame_buffer (which the machine sets for its own
+   * frame-change protocol) meant VDP1 rendered only every few dozen frames and
+   * the compositor kept sampling the other buffer -- measured: no track, no
+   * cars, and the geometry counter only ever fired a handful of times. */
+  if (g_vdp_async)
+     Vdp1External.swap_frame_buffer = 1;
+
   // Frame Change
   if (Vdp1External.swap_frame_buffer == 1)
   {
@@ -1720,11 +1934,19 @@ void vdp2VBlankOUT(void) {
     FRAMELOG("[VDP1] Displayed framebuffer changed. EDSR=%02X", Vdp1Regs->EDSR);
 
     // if Plot Trigger mode == 0x02 draw start
-    if (Vdp1External.frame_change_plot == 1 || Vdp1External.status == VDP1_STATUS_RUNNING ){
+    if (Vdp1External.frame_change_plot == 1 || Vdp1External.status == VDP1_STATUS_RUNNING
+        || yab_slot_direct_draw(yab_render_slot_idx) > 0 ){
       FRAMELOG("[VDP1] frame_change_plot == 1 start drawing immidiatly", Vdp1Regs->EDSR);
       LOG("[VDP1] Start Drawing");
       Vdp1Regs->addr = 0;
       Vdp1Regs->COPR = 0;
+      /* Clear the "draw finished" bit before the walk: on the synchronous path
+       * the renderer's VOUT clears it on the machine's own thread, so a render
+       * thread that never runs that code hit Vdp1DrawCommands()'s
+       * `if (regs->EDSR & 0x02) return;` on the first command (12 quads instead
+       * of ~32000 -- no 3D at all). */
+      if (g_vdp_async)
+         Vdp1Regs->EDSR &= ~0x0002;
       Vdp1Draw();
       isrender = 1;
       /* The main CPU only arms the wait line for Plot Trigger mode 2; when we
@@ -1737,7 +1959,8 @@ void vdp2VBlankOUT(void) {
   else {
 
     // Continue from previus frame
-    if ( Vdp1External.status == VDP1_STATUS_RUNNING) {
+    if ( Vdp1External.status == VDP1_STATUS_RUNNING
+         || yab_slot_direct_draw(yab_render_slot_idx) > 0) {
       LOG("[VDP1] Start Drawing continue");
       Vdp1Draw();
       isrender = 1;
@@ -1752,6 +1975,9 @@ void vdp2VBlankOUT(void) {
     if (isrender)
       vdp1NotifyDrawDone();
   }
+
+  if (yab_render_slot_idx >= 0 && yab_slots[yab_render_slot_idx])
+     yab_slots[yab_render_slot_idx]->direct_draw = 0;
 
   if (Vdp2Regs->TVMD & 0x8000) {
      FRAMELOG("Vdp2DrawScreens");
@@ -2988,21 +3214,10 @@ void DisableAutoFrameSkip(void)
 
 
 
-void VdpResume( void ){
-  if (g_vdp_async)
-  {
-	YabAddEventQueue(evqueue,VDPEV_MAKECURRENT);
-  YabWaitEventQueue(command_);
-  }
-}
-
-void VdpRevoke( void ){
-  if (g_vdp_async)
-  {
-	YabAddEventQueue(evqueue,VDPEV_REVOKE);
-  YabWaitEventQueue(command_);
-  }
-}
+/* There is no GL worker to take the context away from any more: the frontend
+ * thread owns it for the whole run. */
+void VdpResume( void ) { }
+void VdpRevoke( void ) { }
 
 
 
