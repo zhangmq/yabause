@@ -437,6 +437,7 @@ void  yab_frameslot_set_current(int idx);
 int   yab_frameslot_publish_current(unsigned frame_no, int w, int h);
 void  yab_render_slot(int idx);
 void  yab_bind_live_state(void);
+void  yab_bind_live_ptrs(void);
 void  yab_frameslot_mark_direct_draw(void);
 
 extern volatile int vdp_composed_frame;

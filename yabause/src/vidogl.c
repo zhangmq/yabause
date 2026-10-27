@@ -63,6 +63,11 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301  USA
 
 static Vdp2 baseVdp2Regs;
 Vdp2 * fixVdp2Regs = NULL;
+
+/* Defined in vdp2.cpp: the asynchronous renderer walks the VDP1 command list
+ * with a slot-local Vdp1Regs, so the registers it derives there are stored back
+ * into the slot for the emulation thread to merge (see the comment there). */
+extern void yab_frameslot_store_derived(Vdp1 *src);
 //#define PERFRAME_LOG
 #ifdef PERFRAME_LOG
 int fount = 0;
@@ -4572,6 +4577,7 @@ void VIDOGLVdp1DrawStart(void)
   _Ygl->msb_shadow_count_[_Ygl->drawframe] = 0;
 
   Vdp1DrawCommands(Vdp1Ram, Vdp1Regs, NULL);
+  yab_frameslot_store_derived(Vdp1Regs);
   FrameProfileAdd("Vdp1Command end ");
 
 }

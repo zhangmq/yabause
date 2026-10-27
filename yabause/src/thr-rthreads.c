@@ -274,6 +274,11 @@ YabEventQueue * YabThreadCreateQueue( int qsize )
 	p->mutex = slock_new();
 	p->cond_full = scond_new();
 	p->cond_empty = scond_new();
+#ifdef YAB_HANGDBG
+	printf("[DBGQ] q=%p cap=%d mutex=%p cond_full=%p cond_empty=%p\n",
+	       (void*)p, qsize, (void*)p->mutex, (void*)p->cond_full, (void*)p->cond_empty);
+	fflush(stdout);
+#endif
 	return (YabEventQueue *)p;
 }
 
@@ -318,6 +323,10 @@ YabMutex * YabThreadCreateMutex()
 {
 	YabMutex_rthreads * mtx = (YabMutex_rthreads *)malloc(sizeof(YabMutex_rthreads));
 	mtx->mutex = slock_new();
+#ifdef YAB_HANGDBG
+	printf("[DBGM] m=%p mutex=%p\n", (void*)mtx, (void*)mtx->mutex);
+	fflush(stdout);
+#endif
 	return (YabMutex *)mtx;
 }
 

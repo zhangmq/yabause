@@ -34,6 +34,11 @@
 //#define YGLLOG yprintf
 
 extern u8 *Vdp1FrameBuffer[];
+#ifdef YAB_VDP1DBG
+int yab_dbg_v1_quads = 0;   /* triangles submitted to the VDP1 framebuffer */
+int yab_dbg_v1_fbpix = -1;  /* non-black pixels in the VDP1 framebuffer */
+u32 yab_dbg_v1_fbsum = 0;
+#endif
 static int rebuild_frame_buffer = 0;
 
 static int YglIsNeedFrameBuffer();
@@ -3332,6 +3337,15 @@ void YglRenderVDP1(void)
   glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, _Ygl->rboid_depth);
   glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_STENCIL_ATTACHMENT, GL_RENDERBUFFER, _Ygl->rboid_stencil);
   status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+#ifdef YAB_VDP1DBG
+  { static int cnt = 0; if ((cnt++ % 10) == 0) {
+      printf("[V4] render fbo_status=%08X w=%d h=%d draw=%d read=%d tex0=%d tex1=%d depth=%d stencil=%d\n",
+             (unsigned)status, _Ygl->width, _Ygl->height,
+             _Ygl->drawframe, _Ygl->readframe,
+             (int)_Ygl->vdp1FrameBuff[0], (int)_Ygl->vdp1FrameBuff[1],
+             (int)_Ygl->rboid_depth, (int)_Ygl->rboid_stencil);
+      fflush(stdout); } }
+#endif
   if (status != GL_FRAMEBUFFER_COMPLETE)
   {
     YGLLOG("YglRenderVDP1: Framebuffer status = %08X\n", status);
@@ -3395,6 +3409,9 @@ void YglRenderVDP1(void)
       {
         glDrawArrays(GL_TRIANGLES, 0, level->prg[j].currentQuad / 2);
       }
+#ifdef YAB_VDP1DBG
+      yab_dbg_v1_quads += level->prg[j].currentQuad / 2;
+#endif
       level->prg[j].currentQuad = 0;
       _Ygl->cpu_framebuffer_write[_Ygl->drawframe] = 0;
     }
@@ -3414,6 +3431,25 @@ void YglRenderVDP1(void)
   }
 
   _Ygl->sync = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+
+#ifdef YAB_VDP1DBG
+  {
+     static unsigned char *fb = NULL;
+     unsigned w = (unsigned)_Ygl->width, h = (unsigned)_Ygl->height;
+     if (w > 0 && h > 0 && w <= 1024 && h <= 1024)
+     {
+        if (!fb) fb = (unsigned char *)malloc(1024 * 1024 * 4);
+        glBindFramebuffer(GL_FRAMEBUFFER, _Ygl->vdp1fbo);
+        glReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, fb);
+        { unsigned i, n = w * h * 4, nz = 0; u32 sum = 0;
+          for (i = 0; i < n; i += 4) {
+             if (fb[i] | fb[i+1] | fb[i+2]) { nz++; sum += fb[i] + fb[i+1] + fb[i+2]; }
+          }
+          yab_dbg_v1_fbpix = (int)nz; yab_dbg_v1_fbsum = sum;
+        }
+     }
+  }
+#endif
 
   glBindFramebuffer(GL_FRAMEBUFFER, _Ygl->default_fbo);
   glEnable(GL_DEPTH_TEST);

@@ -19,6 +19,9 @@
 
 #include <unistd.h>
 #include <time.h>
+#ifdef YAB_HANGDBG
+#include <sys/syscall.h>
+#endif
 #include "vdp1.h"
 #include "vdp2.h"
 #include "smpc.h"
@@ -3075,6 +3078,11 @@ static volatile int yab_emu_parked = 1;
 static void *yab_emu_main(void *arg)
 {
    (void)arg;
+#ifdef YAB_HANGDBG
+   printf("[DBGT] emu thread tid=%d\n", (int)syscall(SYS_gettid));
+   fflush(stdout);
+   YABEMU("emu:start");
+#endif
    /* This thread owns the live machine state; bind its thread-local copies. */
    yab_bind_live_state();
    for (;;)
@@ -3094,6 +3102,7 @@ static void *yab_emu_main(void *arg)
       if (!yab_emu_running) break;
       yab_emu_parked = 0;
 
+      YABEMU("emu:tryacquire");
       idx = yab_frameslot_tryacquire();
       if (idx < 0) { usleep(200); continue; }
 
@@ -3101,10 +3110,17 @@ static void *yab_emu_main(void *arg)
       /* Re-bind every frame: the engine can recreate its state buffers (a second
        * context_reset does exactly that), and a stale binding means the machine
        * writes VRAM into buffers nobody renders from -- measured as a nearly
-       * empty VRAM in the published slot and a black picture. */
-      yab_bind_live_state();
+       * empty VRAM in the published slot and a black picture.
+       * Pointers only: the full bind also restores Vdp1External from the
+       * init-time snapshot, and doing that here wiped the VDP1 frame-change
+       * handshake (frame_change_plot/status/swap) that this thread updates once
+       * per frame and the frontend needs when it draws the slot -- measured as
+       * a title screen with no VDP1 layer at all. */
+      yab_bind_live_ptrs();
+      YABEMU("emu:handle-events");
       if (PERCore)
          PERCore->HandleEvents();          /* one machine frame */
+      YABEMU("emu:after-events");
       yab_frameslot_set_current(-1);
       sram_sync();
    }
@@ -3120,6 +3136,9 @@ static void yab_emu_start(void)
    yab_emu_parked = 0;
    yab_emu_running = 1;
    pthread_create(&yab_emu_tid, NULL, yab_emu_main, NULL);
+#ifdef YAB_HANGDBG
+   yab_dbg_watchdog_start();
+#endif
 }
 
 static void yab_emu_stop(void)
@@ -3180,6 +3199,14 @@ void retro_run(void)
    bool updated  = false;
    one_frame_rendered = false;
 
+#ifdef YAB_HANGDBG
+   {
+      static int once = 0;
+      if (!once) { once = 1; printf("[DBGT] front thread tid=%d\n", (int)syscall(SYS_gettid)); fflush(stdout); }
+   }
+   YABFRONT("retro_run:begin");
+#endif
+
    if (!all_devices_ready)
    {
       // Running first frame, so we can assume all devices id were set
@@ -3228,7 +3255,10 @@ void retro_run(void)
       }
 
       {
-         int idx = yab_frameslot_wait();
+         int idx;
+         YABFRONT("retro_run:wait-slot");
+         idx = yab_frameslot_wait();
+         YABFRONT("retro_run:render-slot");
          yab_render_slot(idx);       /* GL + YuiSwapBuffers -> video_cb */
          if (!one_frame_rendered)
             /* Display off for this frame (Vdp2DrawEnd returns before YglRender,
@@ -3240,7 +3270,9 @@ void retro_run(void)
             /* The frontend advanced its hw-render ring inside that video_cb, so
              * pick up the texture it will show next. */
             yk_adopt_front_fbo();
+         YABFRONT("retro_run:release-slot");
          yab_frameslot_release(idx);
+         YABFRONT("retro_run:end");
       }
       return;
    }

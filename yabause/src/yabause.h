@@ -101,6 +101,27 @@ typedef struct
  * Latched at load time; see the comment on the definition in yabause.c. */
 extern int g_vdp_async;
 
+/* ---------------------------------------------------------------------------
+ * HANGDBG (diagnostic builds only, -DYAB_HANGDBG): stage markers + a watchdog
+ * that dumps the machine state when the emulation thread stops advancing.
+ * Used to locate machine-side stalls that happen inside a frame (no publish,
+ * frontend blocked in the slot wait).  Compiled out by default.
+ * ------------------------------------------------------------------------- */
+#ifdef YAB_HANGDBG
+extern volatile const char *yab_dbg_emu_mark;
+extern volatile const char *yab_dbg_front_mark;
+void yab_dbg_mark_emu(const char *s);
+void yab_dbg_mark_front(const char *s);
+void yab_dbg_watchdog_start(void);
+void yab_dbg_slot_state(int *cur, int *qfree, int *qready);
+void yab_dbg_vdpq_state(int *rcv, int *vdp1, int *ev);
+#define YABEMU(s)  yab_dbg_mark_emu(s)
+#define YABFRONT(s) yab_dbg_mark_front(s)
+#else
+#define YABEMU(s)  ((void)0)
+#define YABFRONT(s) ((void)0)
+#endif
+
 #define CLKTYPE_26MHZ           0
 #define CLKTYPE_28MHZ           1
 
