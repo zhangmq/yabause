@@ -101,6 +101,14 @@ typedef struct
  * Latched at load time; see the comment on the definition in yabause.c. */
 extern int g_vdp_async;
 
+/* VDP1 framebuffer readback (core option "yabasanshiro_vdp1_fb_readback", off
+ * by default).  The SH-2 reaches this through Vdp1FrameBufferReadWord() when a
+ * game reads the framebuffer window.  With the async renderer the SH-2 thread
+ * owns no GL context, so the read either decodes a CPU snapshot that the render
+ * thread publishes every frame (enabled) or the CPU shadow buffer (disabled;
+ * only what the game itself wrote through the CPU -- usually blank). */
+extern int yab_vdp1_fb_readback;
+
 /* ---------------------------------------------------------------------------
  * HANGDBG (diagnostic builds only, -DYAB_HANGDBG): stage markers + a watchdog
  * that dumps the machine state when the emulation thread stops advancing.

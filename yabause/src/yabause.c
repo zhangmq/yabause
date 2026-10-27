@@ -144,6 +144,7 @@ static u32 g_scsp_main_mode = 1;
  * vdp2VBlankOUT / VdpResume / VdpRevoke), vdp1.cpp (PTMR direct draw) and
  * libretro.c (shared context, mirror FBO, frame delivery). */
 int g_vdp_async = 1;
+int yab_vdp1_fb_readback = 0;
 
 /* ---------------------------------------------------------------------------
  * HANGDBG: stage markers + stall watchdog (diagnostic builds only).

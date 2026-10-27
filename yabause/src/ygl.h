@@ -600,6 +600,14 @@ typedef struct {
    GLuint smallfbotex;
    GLuint vdp1pixelBufferID;
    void * pFrameBuffer;
+   /* VDP1 framebuffer readback (async renderer): per-drawframe CPU snapshots.
+      vdp1_fb_cpu is the published copy the SH-2 decodes, vdp1_fb_back the one
+      the render thread fills; the two are swapped only after a complete copy. */
+   unsigned char * vdp1_fb_cpu[2];
+   unsigned char * vdp1_fb_back[2];
+   int vdp1_fb_w[2];
+   int vdp1_fb_h[2];
+   volatile int vdp1_fb_ready[2];
 
    GLuint fxaa_fbo;
    GLuint fxaa_fbotex;
@@ -767,6 +775,9 @@ int YglBlitFXAA(u32 sourceTexture, float w, float h);
 int YglWindowFramebuffer(u32 srcTexture, u32 targetFbo, float w, float h, float ww, float hh);
 
 void YglRenderVDP1(void);
+/* Render thread: publish a CPU copy of the just-rasterised VDP1 framebuffer
+   (async renderer + "yabasanshiro_vdp1_fb_readback" only). */
+void YglVdp1PublishCpu(int df);
 
 u32 * YglGetLineColorPointer();
 void YglSetLineColor(u32 * pbuf, int size);

@@ -4442,7 +4442,16 @@ int VIDOGLInit(void)
 
   SetSaturnResolution(320, 224);
 
-  g_rgb0.async = 1;
+  /* RBG0 (rotation background) can be built on its own worker thread.  That
+   * thread issues GL and, through yab_bind_state_ptrs(), reads the live /
+   * snapshot VDP2 state rather than the frame slot the frontend is drawing.
+   * The asynchronous renderer keeps all GL on the frontend thread and renders
+   * from a self-contained slot, so the worker breaks both invariants: measured
+   * in Sega Rally's in-game RBG0 sky, the layer was rebuilt from a different
+   * frame every frame and flickered while VDP1 and the non-rotation VDP2
+   * layers were correct.  Keep RBG0 synchronous in that mode (it is also
+   * faster there: 38.1 fps vs 25.8 fps with the worker's handshake). */
+  g_rgb0.async = g_vdp_async ? 0 : 1;
   g_rgb0.rgb_type = 0;
   g_rgb0.vdp2_sync_flg = -1;
   g_rgb0.rotate_mval_h = 1.0;
@@ -4588,6 +4597,10 @@ void VIDOGLVdp1DrawEnd(void)
 {
   YglTmPush(YglTM);
   YglRenderVDP1();
+  /* Async renderer + readback option: keep a CPU copy of the frame that was
+   * just rasterised, so the SH-2 never has to issue GL from its own thread.
+   * Must run here, on the GL thread, while the framebuffer texture is complete. */
+  YglVdp1PublishCpu(_Ygl->drawframe);
   _Ygl->vpd1_running = 0;
 }
 
@@ -8399,7 +8412,12 @@ void VIDOGLSetSettingValueMode(int type, int value) {
   
   case VDP_SETTING_RBG_USE_COMPUTESHADER:
 	  _Ygl->rbg_use_compute_shader = value;
-	  if (_Ygl->rbg_use_compute_shader) {
+	  /* Async renderer: never put RBG0 back on its worker thread, whatever
+	   * the compute-shader option says (see VIDOGLInit). */
+	  if (g_vdp_async) {
+		  g_rgb0.async = 0;
+	  }
+	  else if (_Ygl->rbg_use_compute_shader) {
 		  g_rgb0.async = 0;
 	  }
 	  else {

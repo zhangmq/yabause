@@ -2038,6 +2038,25 @@ void check_variables(void)
       if (e && *e && e[0] != '0')
          g_vdp_async_opt = 0;
    }
+
+   /* VDP1 framebuffer readback.  Off by default: most titles never read the
+      framebuffer, and the async renderer then pays nothing.  When off the pixel
+      read returns 0 (no buffer is kept); when on the render thread copies the
+      frame it just rasterised to CPU, at one glReadPixels+PBO map per frame. */
+   var.key = "yabasanshiro_vdp1_fb_readback";
+   var.value = NULL;
+   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+   {
+      if (strcmp(var.value, "enabled") == 0)
+         yab_vdp1_fb_readback = 1;
+      else if (strcmp(var.value, "disabled") == 0)
+         yab_vdp1_fb_readback = 0;
+   }
+   {
+      const char *e = getenv("YAB_VDP1_FB_READBACK");
+      if (e && *e)
+         yab_vdp1_fb_readback = (e[0] != '0');
+   }
 }
 
 void retro_get_system_av_info(struct retro_system_av_info *info)
