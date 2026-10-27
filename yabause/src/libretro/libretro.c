@@ -2921,13 +2921,26 @@ void retro_run(void)
       }
    }
 
-   //YabauseExec(); runs from handle events
-   if(PERCore)
+   /* Present-loop: keep advancing whole machine frames until one is actually
+    * presented, then return.  A retro_run that produced no new picture only
+    * makes the frontend re-present the previous frame and count it as a frame,
+    * which is why the frontend's fps read as the machine rate instead of the
+    * real picture rate.  Two things produce such a frame: the VDP2 frameskip
+    * (drawing replaced by VIDDummy) and a blanked display (TVMD bit15 clear).
+    *
+    * No iteration cap: if the machine never presents, it never returns -- the
+    * same wedge would happen inside the frontend's own loop anyway. */
+   for (;;)
+   {
+      if (!PERCore) break;
       PERCore->HandleEvents();
 
-   /* Keep the frontend's SAVE_RAM (.srm) and the live backup RAM in sync.  Runs
-    * on the same thread that just emulated the frame, so no locking is needed. */
-   sram_sync();
+      /* Keep the frontend's SAVE_RAM (.srm) and the live backup RAM in sync.
+       * Runs on the same thread that just emulated the frame, no locking. */
+      sram_sync();
+
+      if (yk.frame_pending || one_frame_rendered) break;   /* a picture exists */
+   }
 
    /* Async renderer only: the VDP thread just marks frames, and the libretro
     * contract wants video_cb (and the frontend's shader chain + swap it
@@ -2987,8 +3000,11 @@ void retro_run(void)
       /* The frontend presented in video_cb() and advanced its hw-render ring
        * slot; adopt the new slot's texture so the VDP thread's NEXT frame lands
        * in a different slot than the one just presented (YuiRetargetFB applies
-       * it at the top of the next YglRender). */
-      yk_adopt_front_fbo();
+       * it at the top of the next YglRender).  When nothing was presented the
+       * ring did not move: adopting here would point the mirror at the slot
+       * that is currently on screen (tearing). */
+      if (one_frame_rendered)
+         yk_adopt_front_fbo();
       yk.frame_pending = 0;
    }
    else

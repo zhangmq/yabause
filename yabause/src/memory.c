@@ -1926,6 +1926,7 @@ int YabLoadStateStream(FILE *fp)
    if (StateCheckRetrieveHeader(fp, "CART", &version, &chunksize) != 0)
    {
       // Revert back to old state here
+      printf("[state] bad chunk %s\n", "CART"); fflush(stdout);
       return -3;
    }
    CartLoadState(fp, version, chunksize);
@@ -1933,6 +1934,7 @@ int YabLoadStateStream(FILE *fp)
    if (StateCheckRetrieveHeader(fp, "CS2 ", &version, &chunksize) != 0)
    {
       // Revert back to old state here
+      printf("[state] bad chunk %s\n", "CS2 "); fflush(stdout);
       return -3;
    }
    Cs2LoadState(fp, version, chunksize);
@@ -1940,6 +1942,7 @@ int YabLoadStateStream(FILE *fp)
    if (StateCheckRetrieveHeader(fp, "MSH2", &version, &chunksize) != 0)
    {
       // Revert back to old state here
+      printf("[state] bad chunk %s\n", "MSH2"); fflush(stdout);
       return -3;
    }
    SH2LoadState(MSH2, fp, version, chunksize);
@@ -1947,6 +1950,7 @@ int YabLoadStateStream(FILE *fp)
    if (StateCheckRetrieveHeader(fp, "SSH2", &version, &chunksize) != 0)
    {
       // Revert back to old state here
+      printf("[state] bad chunk %s\n", "SSH2"); fflush(stdout);
       return -3;
    }
    SH2LoadState(SSH2, fp, version, chunksize);
@@ -1954,6 +1958,7 @@ int YabLoadStateStream(FILE *fp)
    if (StateCheckRetrieveHeader(fp, "SCSP", &version, &chunksize) != 0)
    {
       // Revert back to old state here
+      printf("[state] bad chunk %s\n", "SCSP"); fflush(stdout);
       return -3;
    }
    SoundLoadState(fp, version, chunksize);
@@ -1961,6 +1966,7 @@ int YabLoadStateStream(FILE *fp)
    if (StateCheckRetrieveHeader(fp, "SCU ", &version, &chunksize) != 0)
    {
       // Revert back to old state here
+      printf("[state] bad chunk %s\n", "SCU "); fflush(stdout);
       return -3;
    }
    ScuLoadState(fp, version, chunksize);
@@ -1968,6 +1974,7 @@ int YabLoadStateStream(FILE *fp)
    if (StateCheckRetrieveHeader(fp, "SMPC", &version, &chunksize) != 0)
    {
       // Revert back to old state here
+      printf("[state] bad chunk %s\n", "SMPC"); fflush(stdout);
       return -3;
    }
    SmpcLoadState(fp, version, chunksize);
@@ -1975,6 +1982,7 @@ int YabLoadStateStream(FILE *fp)
    if (StateCheckRetrieveHeader(fp, "VDP1", &version, &chunksize) != 0)
    {
       // Revert back to old state here
+      printf("[state] bad chunk %s\n", "VDP1"); fflush(stdout);
       return -3;
    }
    Vdp1LoadState(fp, version, chunksize);
@@ -1982,6 +1990,7 @@ int YabLoadStateStream(FILE *fp)
    if (StateCheckRetrieveHeader(fp, "VDP2", &version, &chunksize) != 0)
    {
       // Revert back to old state here
+      printf("[state] bad chunk %s\n", "VDP2"); fflush(stdout);
       return -3;
    }
    Vdp2LoadState(fp, version, chunksize);
@@ -1989,6 +1998,7 @@ int YabLoadStateStream(FILE *fp)
    if (StateCheckRetrieveHeader(fp, "OTHR", &version, &chunksize) != 0)
    {
       // Revert back to old state here
+      printf("[state] bad chunk %s\n", "OTHR"); fflush(stdout);
       return -3;
    }
    // Other data

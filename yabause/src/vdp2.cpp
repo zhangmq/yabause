@@ -860,6 +860,33 @@ void VDP2SetFrameLimit(int mode) {
 }
 
 void frameSkipAndLimit() {
+#if defined(__LIBRETRO__)
+  /* libretro: the frontend paces retro_run, so the core must neither sleep nor
+   * spin here -- doing both made every frame pay the core-side limiter as well,
+   * and its one-second accumulator was only clamped on the positive side, so
+   * once the game ran slower than the nominal rate it went negative and the
+   * sleep grew every frame (measured: a 13 s stretch at 1.1 fps inside
+   * YabNanosleep(), VdpProc -> frameSkipAndLimit).
+   *
+   * The *frameskip decision* is kept: yabasanshiro_frameskip is wired to
+   * autoframeskipenab, and this is the only place that arms skipnextframe.
+   * Skipping here skips only the drawing (VIDDummy), the machine still advances
+   * one frame -- that is what keeps a title from losing speed when the
+   * renderer cannot keep up.  Removing it silently disabled the core option.
+   */
+  if (FrameAdvanceVariable == 0 && autoframeskipenab)
+  {
+     curticks = YabauseGetTicks();
+     diffticks = curticks - lastticks;
+     if (diffticks > (s64)(yabsys.OneFrameTime >> frameLimitShift))
+     {
+        skipnextframe = 1;
+        framestoskip = 1;
+     }
+     lastticks = curticks;
+  }
+  return;
+#else
   if (FrameAdvanceVariable == 0 && enableFrameLimit )
   {
     const u32 fps = (yabsys.IsPal ? 50 : 60) << frameLimitShift ;
@@ -868,7 +895,10 @@ void frameSkipAndLimit() {
     if (framecount > fps)
     {
       onesecondticks -= yabsys.tickfreq;
-      if (onesecondticks > (s64)( (yabsys.OneFrameTime>>frameLimitShift)  * 4)) {
+      /* Clamp BOTH ends.  Negative meant "the previous second overran", and
+       * carrying that forward only inflated the next sleep (see above). */
+      if (onesecondticks > (s64)( (yabsys.OneFrameTime>>frameLimitShift)  * 4) ||
+          onesecondticks < 0) {
         onesecondticks = 0;
       }
       framecount = 1;
@@ -918,6 +948,7 @@ void frameSkipAndLimit() {
     onesecondticks += diffticks;
     lastticks = curticks;
   }
+#endif
 
 }
 
