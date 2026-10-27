@@ -276,7 +276,7 @@ static u32 FASTCALL FetchHWram(u32 addr)
 //#endif
 }
 
-extern u8 * Vdp1Ram;
+extern __thread u8 * Vdp1Ram;
 static u32 FASTCALL FetchVram(u32 addr)
 {
   addr &= 0x07FFFF;

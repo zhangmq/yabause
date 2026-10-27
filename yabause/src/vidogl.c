@@ -3531,6 +3531,7 @@ static INLINE void ReadVdp2ColorOffset(Vdp2 * regs, vdp2draw_struct *info, int m
  Rotate Screen drawing
  ------------------------------------------------------------------------------*/
 void Vdp2DrawRotationThread(void * p) {
+  { extern void yab_bind_state_ptrs(void); yab_bind_state_ptrs(); }
 #if RBG_PROFILE
   u64 before;
   u64 now;
@@ -3545,6 +3546,7 @@ void Vdp2DrawRotationThread(void * p) {
   }
 
   while (Vdp2DrawRotationThread_running) {
+    { extern void yab_bind_state_ptrs(void); yab_bind_state_ptrs(); }
     YabThreadLock(g_rotate_mtx);
     if (Vdp2DrawRotationThread_running == 0) {
       break;

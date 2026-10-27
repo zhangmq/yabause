@@ -61,9 +61,14 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301  USA
 #include <atomic>
 #include "vulkan/VIDVulkanCInterface.h"
 
-u8 * Vdp2Ram;
-u8 * Vdp2ColorRam;
-Vdp2 * Vdp2Regs;
+__thread u8 * Vdp2Ram;
+/* Plain globals holding what the emulation thread bound, so the render thread
+ * can bind its own __thread copies to either those or the snapshot. */
+u8 *vdp2ram_main = NULL, *vdp2cram_main = NULL, *vdp1ram_main = NULL;
+Vdp2 *vdp2regs_main = NULL;
+Vdp1 *vdp1regs_main = NULL;
+__thread u8 * Vdp2ColorRam;
+__thread Vdp2 * Vdp2Regs;
 Vdp2Internal_struct Vdp2Internal;
 Vdp2External_struct Vdp2External;
 
@@ -72,6 +77,33 @@ u8 A0_Updated = 0;
 u8 A1_Updated = 0;
 u8 B0_Updated = 0;
 u8 B1_Updated = 0;
+
+/* Async renderer, no per-frame wait (core option "yabasanshiro_render_ahead",
+ * default enabled; env YAB_NOWAIT=0 forces the old synchronous handshake for
+ * on-device A/B).  The emulation thread runs ahead of
+ * the render thread instead of blocking on it every vblank.  A frame whose
+ * picture is still being drawn is simply dropped (the frontend re-presents the
+ * previous one), which is what a real frameskip looks like. */
+volatile int vdp_worker_busy = 0;
+volatile int yab_pic_pending = 0;     /* a finished picture the frontend has not presented */
+volatile int vdp_posted_frame = 0;    /* frame number handed to the worker */
+volatile int vdp_composed_frame = 0;  /* frame the worker is composing */
+/* Set from the core option "yabasanshiro_render_ahead" (see check_variables),
+ * default ON: the renderer is asynchronous, the emulation thread does not block
+ * on it every frame.  YAB_NOWAIT=0 is a debug-only escape hatch. */
+int yab_render_ahead = 1;
+
+/* Raised (never cleared) when a game changes resolution: see yab_nowait(). */
+
+int yab_nowait(void)
+{
+   static int v = -1;
+   if (v < 0) {
+      const char *e = getenv("YAB_NOWAIT");
+      v = (e && *e) ? (e[0] != '0') : yab_render_ahead;
+   }
+   return v;
+}
 
 struct CellScrollData cell_scroll_data[270];
 Vdp2 Vdp2Lines[270];      /* FRONT: what the render thread reads */
@@ -88,6 +120,115 @@ static Vdp2 *Vdp2LinesW = Vdp2LinesWork;
 void Vdp2LinesSwap(void)
 {
    memcpy(Vdp2Lines, Vdp2LinesWork, sizeof(Vdp2Lines));
+}
+
+/* nowait: publish only when the worker is idle, and post the frame right after,
+ * so the worker always reads a complete table and the main thread never copies
+ * over a table that is being read. */
+/* ---------------------------------------------------------------------------
+ * Frame package (YAB_NOWAIT): everything the GL compositor reads besides the
+ * per-line register table, captured at the vblank while the worker is idle and
+ * handed to it as its own copy.  Without this the emulation thread runs ahead
+ * and rewrites VRAM / VDP1 registers while the worker is still composing the
+ * previous frame -- measured: the presented picture no longer matched any
+ * frame of the baseline run.
+ * ------------------------------------------------------------------------- */
+static u8 *vdp2ram_snap = NULL, *cram_snap = NULL, *vdp1ram_snap = NULL;
+static Vdp2 *vdp2regs_snap = NULL;
+static Vdp1 *vdp1regs_snap = NULL;
+static u8 *vdp2ram_live = NULL, *cram_live = NULL, *vdp1ram_live = NULL;
+static Vdp2 *vdp2regs_live = NULL;
+static Vdp1 *vdp1regs_live = NULL;
+
+static int vdp2FramePackageInit(void)
+{
+   if (vdp2ram_snap) return 0;
+   vdp2ram_snap = (u8 *)malloc(0x80000);
+   cram_snap = (u8 *)malloc(0x1000);
+   vdp1ram_snap = (u8 *)malloc(0x80000);
+   vdp2regs_snap = (Vdp2 *)malloc(sizeof(Vdp2));
+   vdp1regs_snap = (Vdp1 *)malloc(sizeof(Vdp1));
+   return (vdp2ram_snap && cram_snap && vdp1ram_snap && vdp2regs_snap && vdp1regs_snap) ? 0 : -1;
+}
+
+static void vdp2FramePackageCapture(void)
+{
+   if (vdp2FramePackageInit() != 0) return;
+   memcpy(vdp2ram_snap, Vdp2Ram, 0x80000);
+   memcpy(cram_snap, Vdp2ColorRam, 0x1000);
+   memcpy(vdp1ram_snap, Vdp1Ram, 0x80000);
+   *vdp2regs_snap = *Vdp2Regs;
+   *vdp1regs_snap = *Vdp1Regs;
+}
+
+static void vdp2FramePackageEnter(void)
+{
+   if (!vdp2ram_snap) return;
+   vdp2ram_live = Vdp2Ram;      Vdp2Ram = vdp2ram_snap;
+   cram_live = Vdp2ColorRam;    Vdp2ColorRam = cram_snap;
+   vdp1ram_live = Vdp1Ram;      Vdp1Ram = vdp1ram_snap;
+   vdp2regs_live = Vdp2Regs;    Vdp2Regs = vdp2regs_snap;
+   vdp1regs_live = Vdp1Regs;    Vdp1Regs = vdp1regs_snap;
+}
+
+static void vdp2FramePackageLeave(void)
+{
+   if (!vdp2ram_live) return;
+   Vdp2Ram = vdp2ram_live;      Vdp2ColorRam = cram_live;
+   Vdp1Ram = vdp1ram_live;
+   Vdp2Regs = vdp2regs_live;    Vdp1Regs = vdp1regs_live;
+   vdp2ram_live = NULL;
+}
+
+volatile unsigned yab_drop_busy = 0, yab_drop_pending = 0, yab_post_ok = 0;
+/* Set by the emulation thread while it reconfigures GL for a resolution change:
+ * the render thread must not touch GL in that window (it would be using the
+ * same EGL context from another thread, which crashes libmali). */
+static volatile int vdp_frame_staged = 0;   /* VIN staged */
+static volatile int vdp_out_staged = 0;     /* VOUT staged */
+
+/* Stage this frame at the vblank: publish the register table and capture the
+ * frame package now (the emulation state is still this frame's).  The actual
+ * event is posted from retro_run, AFTER the previous picture has been handed to
+ * the frontend -- posting here would race the present that follows a few lines
+ * later (the vblank sits at the end of a frame), so the worker would never
+ * finish in time and every other frame was dropped. */
+static void vdp2StageFrame(void)
+{
+   /* Only the per-line register table is published here: the register/VRAM
+    * snapshot has to be taken by the worker AFTER it has rasterized this
+    * frame's VDP1 commands (Vdp2VBlankOUT does that), otherwise the package
+    * handed to the compositor can be older than the geometry it draws. */
+   memcpy(Vdp2Lines, Vdp2LinesWork, sizeof(Vdp2Lines));
+   vdp_frame_staged = 1;
+}
+
+/* Called from retro_run (nowait) right after the present: start this frame's
+ * VDP1 drawing (it now targets a slot the frontend is done with). */
+int vdp2PostStagedOut(void)
+{
+   if (!vdp_out_staged) return 0;
+   vdp_out_staged = 0;
+   YabAddEventQueue(evqueue, VDPEV_VBLANK_OUT);
+   YabThreadYield();
+   return 1;
+}
+
+/* Called from retro_run (nowait), after the frontend got the finished picture. */
+int vdp2PostStaged(void)
+{
+   if (!vdp_frame_staged) return 0;
+   if (vdp_worker_busy) { yab_drop_busy++; return 0; }
+   /* No "picture not presented yet" gate here: with the core's own double
+    * buffering the worker always draws into the OTHER target, so an unpresented
+    * picture cannot be overwritten -- it is simply superseded by this newer one
+    * when the flip happens.  Gating on it halved the picture rate on titles the
+    * renderer can keep up with (Golden Axe: 1094 pictures for 4577 calls). */
+   vdp_frame_staged = 0;
+   vdp_worker_busy = 1;
+   yab_post_ok++;
+   YabAddEventQueue(evqueue, VDPEV_VBLANK_IN);
+   return 1;
 }
 
 
@@ -479,6 +620,12 @@ int Vdp2Init(void) {
 
    if (g_vdp_async)
    {
+      /* Publish the emulation thread's (live) pointers for the render thread:
+       * the render thread has its own __thread copies and either follows these
+       * (baseline, synchronous per-frame handshake) or the snapshot buffers
+       * (nowait). */
+      vdp2ram_main = Vdp2Ram; vdp2cram_main = Vdp2ColorRam;
+      vdp2regs_main = Vdp2Regs; vdp1regs_main = Vdp1Regs; vdp1ram_main = Vdp1Ram;
       YuiRevokeOGLOnThisThread();
       evqueue = YabThreadCreateQueue(32);
       vdp_proc_running = 1;
@@ -628,9 +775,65 @@ void Vdp2Reset(void) {
 
 
 ///////////////////////////////////////////////////////////////////////////////
+#include <time.h>
+
+/* The emulation thread publishes its (live) state pointers; the render thread
+ * refreshes its thread-local copies from them every frame.  This matters after
+ * a resolution change: the engine re-creates its buffers there, and a stale
+ * pointer in the render thread reads freed memory (crashed in Vdp2PatternAddr). */
+/* Bind this thread's thread-local state pointers for the mode in force.
+ * Every engine thread that touches Vdp1/Vdp2 state must call this at start:
+ * with __thread pointers an unbound thread sees NULL and segfaults on the first
+ * T1ReadWord (found via the "vdp rotate" thread, which only draws the RBG0
+ * layer once a game switches to a hi-res mode). */
+extern "C" void yab_bind_state_ptrs(void)
+{
+   if (!vdp2ram_main || !vdp1ram_main) return;
+   if (yab_nowait() && vdp2regs_snap)
+   {
+      Vdp2Ram = vdp2ram_snap; Vdp2ColorRam = cram_snap;
+      Vdp1Ram = vdp1ram_snap; Vdp2Regs = vdp2regs_snap; Vdp1Regs = vdp1regs_snap;
+   }
+   else
+   {
+      Vdp2Ram = vdp2ram_main; Vdp2ColorRam = vdp2cram_main;
+      Vdp1Ram = vdp1ram_main; Vdp2Regs = vdp2regs_main; Vdp1Regs = vdp1regs_main;
+   }
+}
+
+void vdp_publish_state(void)
+{
+   vdp2ram_main = Vdp2Ram; vdp2cram_main = Vdp2ColorRam;
+   vdp2regs_main = Vdp2Regs; vdp1regs_main = Vdp1Regs; vdp1ram_main = Vdp1Ram;
+}
+
 extern "C" void * VdpProc( void *arg ){
 
   int evcode;
+
+  if (!yab_nowait() && vdp2ram_main)
+  {
+     /* Baseline: the render thread works on the SAME state as the emulation
+      * thread, exactly as before the thread-local split. */
+     Vdp2Ram = vdp2ram_main;
+     Vdp2ColorRam = vdp2cram_main;
+     Vdp1Ram = vdp1ram_main;
+     Vdp2Regs = vdp2regs_main;
+     Vdp1Regs = vdp1regs_main;
+  }
+  else if (yab_nowait() && vdp2FramePackageInit() == 0)
+  {
+     /* Thread-local state: the render thread sees the SNAPSHOT of this frame
+      * while the emulation thread keeps its own (live) pointers.  No pointer
+      * swapping across threads -- that was the bug that broke Golden Axe. */
+     Vdp2Ram = vdp2ram_snap;
+     Vdp2ColorRam = cram_snap;
+     Vdp1Ram = vdp1ram_snap;
+     Vdp2Regs = vdp2regs_snap;
+     Vdp1Regs = vdp1regs_snap;
+     printf("[nowait] render thread bound to the frame snapshot\n");
+     fflush(stdout);
+  }
 
   if( YuiUseOGLOnThisThread() < 0 ){
     LOG("VDP2 Fail to USE GL");
@@ -641,7 +844,9 @@ extern "C" void * VdpProc( void *arg ){
     YabThreadSetCurrentThreadAffinityMask(YabThreadGetFastestCpuIndex());
   }
 
-  while( vdp_proc_running ){
+  while( vdp_proc_running )
+  {
+    yab_bind_state_ptrs();   /* the emulation thread can flip the mode at any time */
     evcode = YabWaitEventQueue(evqueue);
     switch(evcode){
     case VDPEV_VBLANK_IN:
@@ -651,6 +856,8 @@ extern "C" void * VdpProc( void *arg ){
       break;
     case VDPEV_VBLANK_OUT:
       FrameProfileAdd("VOUT start");
+      /* The render thread works on its own (thread-local) state: the snapshot
+       * when render-ahead is on, the live pointers otherwise. */
       vdp2VBlankOUT();
       FrameProfileAdd("VOUT end");
       //YabAddEventQueue(vout_rcv_evqueue, 0);
@@ -874,6 +1081,18 @@ void frameSkipAndLimit() {
    * one frame -- that is what keeps a title from losing speed when the
    * renderer cannot keep up.  Removing it silently disabled the core option.
    */
+  /* With the asynchronous renderer frameskip has no value and only hurts:
+   * the emulation no longer waits for the picture, so the pipeline already
+   * drops/duplicates pictures when the renderer falls behind, while skipping
+   * here swaps the video core's draw functions for VIDDummy and leaves the
+   * frame's layers half-updated (measured symptom: a picture with the VDP2
+   * background only).  So: never arm a skip while the renderer is async. */
+  if (yab_nowait())
+  {
+     skipnextframe = 0;
+     framestoskip = 0;
+     return;
+  }
   if (FrameAdvanceVariable == 0 && autoframeskipenab)
   {
      curticks = YabauseGetTicks();
@@ -963,18 +1182,26 @@ void vdp2VBlankIN(void) {
    now we're lying a little here as we're not swapping the framebuffers. */
    //if (Vdp1External.manualchange) Vdp1Regs->EDSR >>= 1;
 
+   vdp_composed_frame = vdp_posted_frame;
    VIDCore->Vdp2DrawEnd();
    frameSkipAndLimit();
    VIDCore->Sync();
-   Vdp2Regs->TVSTAT |= 0x0008;
-
-   ScuSendVBlankIN();
+   /* TVSTAT / ScuSendVBlankIN() moved to the main thread's Vdp2VBlankIN():
+    * they are CPU-side effects and must not run on the render thread. */
 
    //if (yabsys.IsSSH2Running)
    //   SH2SendInterrupt(SSH2, 0x43, 0x6);
    FrameProfileAdd("VIN flag");
    FRAMELOG("**** VIN(T) *****\n");
-   YabAddEventQueue(rcv_evqueue, 0);
+   if (yab_nowait())
+   {
+      vdp_worker_busy = 0;
+      /* Completion notice for the backpressure above; coalescing (a full queue
+       * only means the emulation thread is already behind). */
+      YabTryAddEventQueue(rcv_evqueue, 0);
+   }                 /* no completion handshake in nowait */
+   else
+      YabAddEventQueue(rcv_evqueue, 0);
    
 
 }
@@ -989,9 +1216,30 @@ void Vdp2VBlankIN(void) {
      * finished drawing it (the worker pushes rcv_evqueue at the end of
      * vdp2VBlankIN). */
     FrameProfileAdd("VIN event");
-    YabAddEventQueue(evqueue,VDPEV_VBLANK_IN);
+    /* The VBLANK-IN status bit and the SCU VBLANK-IN interrupt belong to the
+     * CPU side: raise them here, at the vblank, instead of on the render
+     * thread after the picture is finished. */
+    Vdp2Regs->TVSTAT |= 0x0008;
+    ScuSendVBlankIN();
+    vdp_posted_frame = (int)yabsys.frame_count;
+    if (yab_nowait())
+    {
+       /* Adaptive backpressure: when the renderer is still busy with the
+        * previous frame, wait for it here instead of running further ahead.
+        * Titles whose renderer keeps up (Daytona, VF2) never block; ones it
+        * cannot feed (Golden Axe: 7 ms/frame emulation vs ~10 ms/frame render)
+        * fall back to the old wait-per-frame behaviour instead of presenting
+        * mostly stale pictures. */
+       if (vdp_worker_busy)
+          YabWaitEventQueue(rcv_evqueue);
+       vdp2StageFrame();
+    }
+    else
+    {
+       YabAddEventQueue(evqueue,VDPEV_VBLANK_IN);
 
-    YabWaitEventQueue(rcv_evqueue);
+       YabWaitEventQueue(rcv_evqueue);
+    }
     FrameProfileAdd("VIN sync");
   }
   else
@@ -1048,7 +1296,10 @@ void Vdp2HBlankOUT(void) {
     
     Vdp2Regs->TVSTAT &= ~0x0004;
     u32 cell_scroll_table_start_addr = (Vdp2Regs->VCSTA.all & 0x7FFFE) << 1;
-    memcpy(Vdp2Lines + yabsys.LineCount, Vdp2Regs, sizeof(Vdp2));
+    /* Write the BACK table: the render thread reads the FRONT one, which
+     * Vdp2LinesSwap() publishes once per frame.  Writing the front table here
+     * (as it used to) means the worker can read a half-updated table. */
+    memcpy(Vdp2LinesWork + yabsys.LineCount, Vdp2Regs, sizeof(Vdp2));
     for (i = 0; i < 88; i++)
     {
       cell_scroll_data[yabsys.LineCount].data[i] = Vdp2RamReadLong(cell_scroll_table_start_addr + i * 4);
@@ -1178,6 +1429,16 @@ void Vdp2HBlankOUT(void) {
       }
 
       FRAMELOG("YabAddEventQueue(evqueue, VDPEV_VBLANK_OUT)");
+      /* Frame boundary: the emulation thread is between frames here, so this is
+       * the one moment a consistent frame package exists.  Capture it, then let
+       * the worker draw and composite from it. */
+      /* nowait: capture the frame package at the frame boundary.  The draw is
+       * still posted here (immediately): the VDP1 completion handshake at the
+       * frame boundary depends on it, and deferring it deadlocks the machine.
+       * Presentation no longer collides with the draw because the core renders
+       * into its OWN double-buffered targets and blits at present time. */
+      { extern void vdp_publish_state(void); vdp_publish_state(); }
+      if (yab_nowait()) vdp2FramePackageCapture();
       YabAddEventQueue(evqueue, VDPEV_VBLANK_OUT);
       YabThreadYield();
       //YabThreadUSleep(10000);

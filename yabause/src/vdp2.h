@@ -49,8 +49,8 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301  USA
 extern "C" {
 #endif
 
-extern u8 * Vdp2Ram;
-extern u8 * Vdp2ColorRam;
+extern __thread u8 * Vdp2Ram;
+extern __thread u8 * Vdp2ColorRam;
 extern u8 Vdp2ColorRamUpdated;
 extern u8 A0_Updated;
 extern u8 A1_Updated;
@@ -382,7 +382,7 @@ typedef struct {
    u16 COBB;   // 0x25F8011E
 } Vdp2;
 
-extern Vdp2 * Vdp2Regs;
+extern __thread Vdp2 * Vdp2Regs;
 
 typedef struct {
    int ColorMode;
@@ -419,6 +419,11 @@ int Vdp2Init(void);
 void Vdp2DeInit(void);
 void Vdp2Reset(void);
 void Vdp2LinesSwap(void);
+int yab_nowait(void);
+extern volatile int vdp_composed_frame;
+extern volatile int yab_pic_pending;
+int vdp2PostStaged(void);
+int vdp2PostStagedOut(void);   /* TEMPORARY: post the staged frame from retro_run */   /* TEMPORARY EXPERIMENT: run ahead of the render thread */
 void Vdp2VBlankIN(void);
 void Vdp2HBlankIN(void);
 void Vdp2HBlankOUT(void);

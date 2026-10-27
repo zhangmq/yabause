@@ -750,6 +750,12 @@ static struct {
    void (*Finish)(void);
    void (*ReadPixels)(YK_Int, YK_Int, YK_Int, YK_Int, YK_Enum, YK_Enum, void *);
    YK_Uint mirror_color_tex;
+   /* YAB_NOWAIT double buffering: the core renders into its own pair of colour
+    * textures (textures are shared between the two EGL contexts, FBOs are NOT),
+    * so the worker can draw frame N+1 while the frontend still samples frame N. */
+   YK_Uint rt_tex[2], rt_fbo[2], rt_read_fbo, rt_present_fbo;
+   int rt_back, rt_front, rt_w, rt_h, rt_ok;
+   volatile int rt_attached;      /* this frame's renders went to an RT */
 } yk;
 
 #define YK_EGL_NONE              0x3038
@@ -913,6 +919,7 @@ static void yk_mirror_depth(void)
  * YabauseInit()/VIDOGLInit() create the engine's GL objects here. */
 static void yk_load(void)
 {
+
    YK_Config cfgs[64];
    YK_Int ncfg = 0, i, prev_fbo = 0, type = -1, name = 0;
    YK_Int pbattr[5], ctxattr[5];
@@ -1267,7 +1274,7 @@ static void yk_adopt_front_fbo(void)
       yk.front_tex = name;
       yk.retarget  = 1;
       yk_query_front_size((YK_Uint)name);
-      if (yk.ring_adopt_log < 400)
+      if (yk.ring_adopt_log < 4)   /* one-time confirmation that the ring is followed */
       {
          log_cb(RETRO_LOG_INFO, "[YK] ring adopt: front fbo=%u tex=%u\n",
                (unsigned)fbo, (unsigned)name);
@@ -1290,13 +1297,161 @@ static void yk_adopt_front_fbo(void)
  * frontend hands the frame back.  Done unconditionally, once per frame: three
  * cheap GL calls, and it also covers a ring slot whose colour texture the
  * frontend replaced without changing the FBO name. */
+/* ---------------------------------------------------------------------------
+ * YAB_NOWAIT render targets
+ *
+ * Decoupling presentation from rendering means the renderer must not draw into
+ * the slot the frontend is presenting, and the frontend's ring only ever hands
+ * out ONE slot at a time.  So the core owns two colour textures (shared between
+ * the EGL contexts) and alternates them: the worker draws into rt_tex[rt_back],
+ * flips to it when the frame is complete, and the frontend thread blits the
+ * finished one into the slot the frontend is about to show.
+ * ------------------------------------------------------------------------- */
+/* The worker recreates these textures on a resolution change while the
+ * frontend thread may be blitting the previous ones -- deleting a texture in
+ * flight presents black.  The sections are tiny (a few GL calls, one blit), so a
+ * plain mutex is enough. */
+/* Spinlock: the critical sections are a few GL calls, and the case only happens
+ * on a resolution change.  (pthread.h cannot be included here: the port's own
+ * rthreads layer redefines part of it.) */
+static volatile int yk_rt_mtx = 0;
+static void yk_rt_lock(void) { while (__atomic_exchange_n(&yk_rt_mtx, 1, __ATOMIC_ACQUIRE)) { } }
+static void yk_rt_unlock(void) { __atomic_store_n(&yk_rt_mtx, 0, __ATOMIC_RELEASE); }
+
+static int yk_rt_ensure(int w, int h)
+{
+   if (!yk.GenFramebuffers || !yk.BindFramebuffer || !yk.FramebufferTexture2D)
+      return -1;
+   if (w <= 0 || h <= 0) return -1;
+   /* Never shrink and never recreate: the resolution wobbles between modes (e.g.
+    * 320x240 <-> 352x224) and recreating the textures mid-stream leaves the
+    * frontend's read FBO pointing at a deleted id -- measured: whole runs
+    * presenting black.  Allocate once, grow only. */
+   if (yk.rt_ok && w <= yk.rt_w && h <= yk.rt_h) return 0;
+   yk_rt_lock();
+   if (yk.rt_ok && w <= yk.rt_w && h <= yk.rt_h) { yk_rt_unlock(); return 0; }
+   for (int i = 0; i < 2; i++)
+   {
+      if (!yk.rt_tex[i]) glGenTextures(1, &yk.rt_tex[i]);
+      glBindTexture(GL_TEXTURE_2D, yk.rt_tex[i]);
+      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+      glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+      if (!yk.rt_fbo[i]) yk.GenFramebuffers(1, &yk.rt_fbo[i]);
+      yk.BindFramebuffer(YK_GL_FRAMEBUFFER, yk.rt_fbo[i]);
+      yk.FramebufferTexture2D(YK_GL_FRAMEBUFFER, YK_GL_COLOR_ATTACHMENT0,
+            YK_GL_TEXTURE_2D, yk.rt_tex[i], 0);
+      if (yk.mirror_rb && yk.FramebufferRenderbuffer)
+      {
+         yk.FramebufferRenderbuffer(YK_GL_FRAMEBUFFER, YK_GL_DEPTH_STENCIL_ATTACHMENT,
+               YK_GL_RENDERBUFFER, yk.mirror_rb);
+      }
+   }
+   yk.BindFramebuffer(YK_GL_FRAMEBUFFER, 0);
+   if (w > yk.rt_w) yk.rt_w = w;
+   if (h > yk.rt_h) yk.rt_h = h;
+   if (!yk.rt_ok) { yk.rt_back = 0; yk.rt_front = 1; }
+   yk.rt_ok = 1;
+   yk_rt_unlock();
+   return 0;
+}
+
+static YK_Uint yk_rt_acquire(int w, int h)
+{
+   if (yk_rt_ensure(w, h) != 0) return 0;
+   yk.BindFramebuffer(YK_GL_FRAMEBUFFER, yk.rt_fbo[yk.rt_back]);
+   if (yk.mirror_rb && yk.FramebufferRenderbuffer)
+   {
+      yk.FramebufferRenderbuffer(YK_GL_FRAMEBUFFER, YK_GL_DEPTH_STENCIL_ATTACHMENT,
+            YK_GL_RENDERBUFFER, yk.mirror_rb);
+   }
+   return yk.rt_fbo[yk.rt_back];
+}
+
+static void yk_rt_flip(void)
+{
+   yk_rt_lock();
+   if (yk.rt_ok) {
+      yk.rt_front = yk.rt_back;
+      yk.rt_back ^= 1;
+   }
+   yk_rt_unlock();
+}
+
+/* Worker side: copy the finished render target into the frontend's colour
+ * texture.  Textures are shared across the two contexts, so the core can do this
+ * with its own FBO; doing it here (after the composite and its glFinish) means
+ * the frontend thread only has to present what is already in its FBO. */
+static void yk_rt_blit_to_front(int w, int h)
+{
+   if (!yk.rt_ok || !yk.front_tex) return;
+   /* The render targets only ever grow, so after a resolution SHRINK they are
+    * larger than the picture: copy exactly the area the engine renders
+    * (current_width x current_height), never the whole target -- blitting the
+    * full target scaled the picture up by 352/320 and shifted every pixel
+    * (measured: 75% of the pixels differing from the baseline at the same
+    * machine frame). */
+   if (w > yk.rt_w) w = yk.rt_w;
+   if (h > yk.rt_h) h = yk.rt_h;
+   yk_rt_lock();
+   if (!yk.rt_present_fbo) yk.GenFramebuffers(1, &yk.rt_present_fbo);
+   yk.BindFramebuffer(GL_READ_FRAMEBUFFER, yk.rt_fbo[yk.rt_front]);
+   yk.BindFramebuffer(GL_DRAW_FRAMEBUFFER, yk.rt_present_fbo);
+   yk.FramebufferTexture2D(GL_DRAW_FRAMEBUFFER, YK_GL_COLOR_ATTACHMENT0,
+         YK_GL_TEXTURE_2D, yk.front_tex, 0);
+   glBlitFramebuffer(0, 0, w, h, 0, 0, w, h, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+   yk.BindFramebuffer(YK_GL_FRAMEBUFFER, 0);
+   yk_rt_unlock();
+
+}
+
+static void yk_rt_present_to(unsigned dst_fbo, int w, int h)
+{
+   yk_rt_lock();
+   if (!yk.rt_ok || !yk.rt_tex[yk.rt_front]) { yk_rt_unlock(); return; }
+   if (!yk.rt_read_fbo) yk.GenFramebuffers(1, &yk.rt_read_fbo);
+   yk.BindFramebuffer(GL_READ_FRAMEBUFFER, yk.rt_read_fbo);
+   yk.FramebufferTexture2D(GL_READ_FRAMEBUFFER, YK_GL_COLOR_ATTACHMENT0,
+         YK_GL_TEXTURE_2D, yk.rt_tex[yk.rt_front], 0);
+   yk.BindFramebuffer(GL_DRAW_FRAMEBUFFER, dst_fbo);
+   glBlitFramebuffer(0, 0, yk.rt_w, yk.rt_h, 0, 0, w, h,
+         GL_COLOR_BUFFER_BIT, GL_NEAREST);
+   yk.BindFramebuffer(GL_FRAMEBUFFER, dst_fbo);
+   yk_rt_unlock();
+}
+
 void YuiRetargetFB(void)
 {
    if (g_vdp_async && yk.state == 1 && yk.front_tex)
    {
       yk.BindFramebuffer(YK_GL_FRAMEBUFFER, yk.mirror_fbo);
-      yk.FramebufferTexture2D(YK_GL_FRAMEBUFFER, YK_GL_COLOR_ATTACHMENT0,
-            YK_GL_TEXTURE_2D, yk.front_tex, 0);
+      if (yab_nowait())
+      {
+         /* nowait: the engine's cached FBO keeps its identity; only the colour
+          * attachment alternates, so the worker draws frame N+1 into one texture
+          * while the frontend still samples frame N from the other. */
+         if (yk_rt_ensure(current_width, current_height) == 0)
+         {
+            yk.FramebufferTexture2D(YK_GL_FRAMEBUFFER, YK_GL_COLOR_ATTACHMENT0,
+                  YK_GL_TEXTURE_2D, yk.rt_tex[yk.rt_back], 0);
+            yk.rt_attached = 1;
+         }
+         else
+         {
+            /* No render target yet (resolution not known): render zero-copy into
+             * the frontend's texture.  The presenter must NOT blit in that case
+             * or it would copy an empty RT over the picture (measured: a black
+             * screen for the first few hundred frames after a state load). */
+            yk.FramebufferTexture2D(YK_GL_FRAMEBUFFER, YK_GL_COLOR_ATTACHMENT0,
+                  YK_GL_TEXTURE_2D, yk.front_tex, 0);
+            yk.rt_attached = 0;
+         }
+      }
+      else
+         yk.FramebufferTexture2D(YK_GL_FRAMEBUFFER, YK_GL_COLOR_ATTACHMENT0,
+               YK_GL_TEXTURE_2D, yk.front_tex, 0);
       yk_mirror_depth();
       if (yk.retarget && yk.ring_log < 24)
       {
@@ -1313,6 +1468,7 @@ int YuiGetFB(void)
   /* async: the engine renders into the core's mirror FBO, which attaches the
    * frontend's colour texture (re-pointed per frame by YuiRetargetFB).
    * sync: the engine renders straight into the frontend's hw-render FBO. */
+
   if (g_vdp_async && yk.mirror_fbo)
      return (int)yk.mirror_fbo;
   return hw_render.get_current_framebuffer();
@@ -1422,7 +1578,22 @@ void YuiSwapBuffers(void)
       {
          static unsigned yk_dump_frame = 0;
       }
+      if (yab_nowait())
+      {
+         /* The flip must happen on EVERY frame: skipping it once desynchronises
+          * which buffer the next frame draws into, and every later presentation
+          * then shows a frame from several frames ago (measured: 73% of the
+          * pixels differing from the baseline at the same machine frame). */
+         yk_rt_flip();
+         /* The blit, on the other hand, only makes sense for frames that really
+          * rendered into a target: when the engine fell back to zero-copy the
+          * frontend's texture already holds the picture and copying an empty
+          * target over it showed a solid green screen (Golden Axe). */
+         if (yk.rt_attached)
+            yk_rt_blit_to_front(current_width, current_height);
+      }
       yk.frame_pending = 1;
+      yab_pic_pending = 1;
       one_frame_rendered = true;
       return;
    }
@@ -1866,6 +2037,13 @@ void check_variables(void)
          polygon_mode = CPU_TESSERATION;
    }
 #endif
+
+   { extern int yab_render_ahead;
+     var.key = "yabasanshiro_render_ahead";
+     var.value = NULL;
+     if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+        yab_render_ahead = (strcmp(var.value, "enabled") == 0);
+   }
 
    var.key = "yabasanshiro_async_rendering";
    var.value = NULL;
@@ -2872,6 +3050,36 @@ void reset_global_gl_state()
  * black and one that does not: the PC sequence up to that point is identical, so
  * the first differing line is where the machine took a different path. */
 
+
+/* Present the picture the VDP worker finished, if any (async renderer).  With
+ * YAB_NOWAIT this runs at the START of retro_run: the worker had a whole frame
+ * to finish the picture posted at the previous vblank, so it is always ready
+ * and the hw-render slot it would render into next has already been presented
+ * (no overwriting of an unpresented picture). */
+static void stream_present(void)
+{
+   if (yk.frame_pending)
+   {
+
+      /* The worker has already blitted the finished frame into this slot's
+       * colour texture (yk_rt_blit_to_front), so presenting is just announcing
+       * the hw framebuffer. */
+      video_cb(RETRO_HW_FRAME_BUFFER_VALID, current_width, current_height, 0);
+      one_frame_rendered = true;
+   }
+   if (!one_frame_rendered)
+      video_cb(NULL, current_width, current_height, 0);
+   yab_pic_pending = 0;
+   /* The frontend advances its hw-render ring slot on every presented frame, so
+    * the core has to follow it in BOTH modes: without this the worker keeps
+    * blitting into the slot it saw at init while the frontend presents the next
+    * one (measured on Golden Axe: a solid green screen, because the slot being
+    * shown was never written). */
+   if (one_frame_rendered)
+      yk_adopt_front_fbo();
+   yk.frame_pending = 0;
+}
+
 void retro_run(void)
 {
    unsigned i;
@@ -2921,6 +3129,15 @@ void retro_run(void)
       }
    }
 
+   if (g_vdp_async && yab_nowait())
+   {
+      /* Order matters: hand the finished picture to the frontend first, then
+       * post this frame, so the worker renders into a slot the frontend is done
+       * with and has a whole frame to do it. */
+      stream_present();
+      vdp2PostStaged();      /* composite of the frame staged at the last vblank */
+   }
+
    /* Present-loop: keep advancing whole machine frames until one is actually
     * presented, then return.  A retro_run that produced no new picture only
     * makes the frontend re-present the previous frame and count it as a frame,
@@ -2939,6 +3156,10 @@ void retro_run(void)
        * Runs on the same thread that just emulated the frame, no locking. */
       sram_sync();
 
+      /* YAB_NOWAIT=1: the render thread is not waited for, so a picture may not
+       * exist yet; run exactly one machine frame per call and let the video
+       * path below send a dupe (the frontend re-presents the last picture). */
+      if (yab_nowait()) break;
       if (yk.frame_pending || one_frame_rendered) break;   /* a picture exists */
    }
 
@@ -2950,6 +3171,17 @@ void retro_run(void)
       yk.res_pending = 0;
       YK_TRACE("res_pending begin cur_w=%dx%d now=%p", game_width, game_height,
             (void *)(yk.GetCurrentContext ? yk.GetCurrentContext() : NULL));
+      /* Render-ahead and resolution changes do not mix yet: the resize re-attaches
+       * the mirror's depth/stencil and rebuilds the engine's GL objects, and doing
+       * that while the render thread keeps drawing crashes libmali (measured:
+       * SEGV right after "mirror depth/stencil" in every title that switches
+       * resolution, while the same title on the sync path is fine).  Fall back to
+       * the proven sync path for the rest of this session -- VdpRevoke() then
+       * serialises with the render thread exactly as before. */
+      /* The resolution change itself is safe now that every engine thread binds
+       * its own state pointers; the old "fall back to sync forever" workaround is
+       * no longer needed (it disabled render-ahead for any title that switches
+       * modes, which is nearly all of them). */
       VdpRevoke();
       {
          int attach_ok = yk_attach();
@@ -2963,6 +3195,14 @@ void retro_run(void)
                    yk.mirror_rb_w, yk.mirror_rb_h,
                    (unsigned)yk.front_fbo, (unsigned)yk.front_tex,
                    yk.front_tex_w, yk.front_tex_h);
+         /* yk_attach returns 0 on success (including "already ours") and -1 on
+          * failure; with a failed attach, GL must not be touched at all. */
+         if (attach_ok < 0)
+         {
+            yk.res_pending = 1;   /* retry on the next frame */
+            VdpResume();
+            goto res_done;
+         }
       }
       YK_TRACE("res_pending engine-GL start now=%p (sub=%p)", 
             (void *)(yk.GetCurrentContext ? yk.GetCurrentContext() : NULL), (void *)yk.ctx_sub);
@@ -2988,24 +3228,16 @@ void retro_run(void)
       yk_detach();
       VdpResume();
    }
+res_done:;
+   /* Async picture delivery: at the END of the call normally, at the START
+    * when YAB_NOWAIT is on (see stream_present()). */
    if (g_vdp_async)
    {
-      if (yk.frame_pending)
-      {
-         video_cb(RETRO_HW_FRAME_BUFFER_VALID, current_width, current_height, 0);
-         one_frame_rendered = true;
-      }
-      if (!one_frame_rendered)
-         video_cb(NULL, current_width, current_height, 0);
-      /* The frontend presented in video_cb() and advanced its hw-render ring
-       * slot; adopt the new slot's texture so the VDP thread's NEXT frame lands
-       * in a different slot than the one just presented (YuiRetargetFB applies
-       * it at the top of the next YglRender).  When nothing was presented the
-       * ring did not move: adopting here would point the mirror at the slot
-       * that is currently on screen (tearing). */
-      if (one_frame_rendered)
-         yk_adopt_front_fbo();
-      yk.frame_pending = 0;
+      /* nowait: the picture was already handed over at the START of this call,
+       * so nothing is delivered here (the old `else` below also ran for nowait
+       * and sent a second, dupe video_cb for every call). */
+      if (!yab_nowait())
+         stream_present();
    }
    else
    {

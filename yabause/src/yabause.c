@@ -1160,7 +1160,7 @@ yab_68k_lock_done: ;
              * frame), so the publish cannot tear a table the worker is reading.
              * (Doing it at frame end raced: the worker renders VDPEV_VBLANK_OUT
              * while the main thread memcpy's over the table it is reading.) */
-            Vdp2LinesSwap();
+            if (!yab_nowait()) Vdp2LinesSwap();
 #if defined(ASYNC_SCSP)
             SyncCPUtoSCSP();
 #endif

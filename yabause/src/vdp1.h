@@ -123,7 +123,7 @@ typedef struct
 extern VideoInterface_struct *VIDCore;
 extern VideoInterface_struct VIDDummy;
 
-extern u8 * Vdp1Ram;
+extern __thread u8 * Vdp1Ram;
 
 u8 FASTCALL	Vdp1RamReadByte(u32);
 u16 FASTCALL	Vdp1RamReadWord(u32);
@@ -141,7 +141,7 @@ void FASTCALL Vdp1FrameBufferWriteLong(u32, u32);
 void Vdp1DrawCommands(u8 * ram, Vdp1 * regs, u8* back_framebuffer);
 void Vdp1FakeDrawCommands(u8 * ram, Vdp1 * regs);
 
-extern Vdp1 * Vdp1Regs;
+extern __thread Vdp1 * Vdp1Regs;
 
 enum VDP1STATUS {
   VDP1_STATUS_IDLE = 0,

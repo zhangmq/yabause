@@ -70,6 +70,20 @@ struct retro_core_option_v2_definition option_defs_us[] = {
       "enabled"
    },
 {
+      "yabasanshiro_render_ahead",
+      "Render Ahead",
+      NULL,
+      "Let the emulation start the next frame before the renderer finished the previous one. Same picture, a little faster. Needs the Async Renderer.",
+      NULL,
+      "video",
+      {
+         { "enabled",  NULL },
+         { "disabled", NULL },
+         { NULL, NULL },
+      },
+      "enabled"
+   },
+{
       "yabasanshiro_addon_cart",
       "Addon Cartridge",
       NULL,

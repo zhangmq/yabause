@@ -62,12 +62,12 @@ using std::mutex;
 namespace chrono = std::chrono;
 
 extern "C" {
-u8 * Vdp1Ram;
+__thread u8 * Vdp1Ram;
 u8 * Vdp1FrameBuffer[2];
 VideoInterface_struct *VIDCore = NULL;
 extern VideoInterface_struct *VIDCoreList[];
 extern YabEventQueue * rcv_evqueue;
-Vdp1 * Vdp1Regs;
+__thread Vdp1 * Vdp1Regs;
 Vdp1External_struct Vdp1External = { 0 };
 }
 
