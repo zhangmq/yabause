@@ -2033,6 +2033,22 @@ void check_variables(void)
       if (strcmp(var.value, "auto") == 0 || strcmp(var.value, "enabled") == 0)
          g_frameskip = 1;
 
+   /* SH-2 CPU clock percentage ("cycle rate").  Applied live: the per-line
+    * SH-2 budget is re-derived between frames, the counters are untouched. */
+   var.key = "yabasanshiro_cpu_clock";
+   var.value = NULL;
+   if (!yab_cpu_clock_env && environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+   {
+      int pct = atoi(var.value);
+      if (pct < 25) pct = 25;
+      else if (pct > 100) pct = 100;
+      if (pct != yab_cpu_clock_pct)
+      {
+         yab_cpu_clock_pct = pct;
+         YabauseApplyCpuClock();
+      }
+   }
+
    /* VDP1 framebuffer readback.  Off by default: most titles never read the
       framebuffer, and the async renderer then pays nothing.  When off the pixel
       read returns 0 (no buffer is kept); when on the render thread copies the

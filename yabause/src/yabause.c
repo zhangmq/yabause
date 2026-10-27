@@ -273,7 +273,30 @@ void print_usage(const char *program_name) {
 
 //////////////////////////////////////////////////////////////////////////////
 
-void YabauseChangeTiming(int freqtype) {
+/* SH-2 "cycle rate": percentage of the real 28.6/25.5 MHz clock.  The SH-2 gets
+ * DecilineStop cycles per deciline, so scaling that value gives the emulated CPU
+ * proportionally fewer cycles per frame while VDP2 keeps counting lines -- the
+ * same lever MAME's clock slider, Dolphin's "CPU clock override" and PPSSPP's
+ * "CPU clock" expose.  Games with idle time are unaffected (they finish early
+ * either way); CPU-bound ones run slower.  100 = real hardware.
+ * YAB_CPUCLOCK=<pct> is the probe override for headless A/B runs. */
+int yab_cpu_clock_pct = 100;
+int yab_cpu_clock_env = 0;   /* YAB_CPUCLOCK was used: it wins over the option */
+
+static void yab_cpu_clock_init(void) {
+   static int init = 0;
+   if (init) return;
+   init = 1;
+   {
+      const char *e = getenv("YAB_CPUCLOCK");
+      if (e && *e) {
+         int pct = atoi(e);
+         if (pct >= 10 && pct <= 200) { yab_cpu_clock_pct = pct; yab_cpu_clock_env = 1; }
+      }
+   }
+}
+
+static void yab_timing_set(int freqtype, int preserve_counters) {
    // Setup all the variables related to timing
 
    const double freq_base = yabsys.IsPal ? 28437500.0
@@ -283,15 +306,37 @@ void YabauseChangeTiming(int freqtype) {
    const double usec_shifted = 1.0e6 * (1 << YABSYS_TIMING_BITS);
    const double deciline_time = yabsys.IsPal ? 1.0 /  50        / 313 / 10
                                              : 1.0 / (60/1.001) / 263 / 10;
+   const double clock = (double)yab_cpu_clock_pct / 100.0;
 
-   yabsys.DecilineCount = 0;
-   yabsys.LineCount = 0;
+   if (!preserve_counters) {
+      yabsys.DecilineCount = 0;
+      yabsys.LineCount = 0;
+   }
    yabsys.CurSH2FreqType = freqtype;
-   yabsys.DecilineStop = (u32) (freq_shifted * deciline_time + 0.5);
+   yabsys.DecilineStop = (u32) (freq_shifted * deciline_time * clock + 0.5);
    yabsys.SH2CycleFrac = 0;
+   /* The usec scale is the 68k/SCSP side and is not tied to the SH-2 clock. */
    yabsys.DecilineUsec = (u32) (usec_shifted * deciline_time + 0.5);
    yabsys.UsecFrac = 0;
 }
+
+void YabauseChangeTiming(int freqtype) {
+   yab_cpu_clock_init();
+   yab_timing_set(freqtype, 0);
+   if (yab_cpu_clock_env)   /* probe only: keep player logs clean */
+   {
+      printf("[CLK] sh2 clock %d%% -> decilinestop %u\n",
+             yab_cpu_clock_pct, (unsigned)yabsys.DecilineStop);
+      fflush(stdout);
+   }
+}
+
+/* Re-derive the per-line SH-2 budget after yab_cpu_clock_pct changed, without
+ * rewinding the line/field counters (called between frames). */
+void YabauseApplyCpuClock(void) {
+   yab_timing_set(yabsys.CurSH2FreqType, 1);
+}
+
 
 //////////////////////////////////////////////////////////////////////////////
 extern int tweak_backup_file_size;

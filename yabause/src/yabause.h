@@ -141,6 +141,12 @@ void print_usage(const char *program_name);
 #endif
 
 void YabauseChangeTiming(int freqtype);
+/* SH-2 clock percentage (100 = real hardware).  Scale it to trade emulated CPU
+ * cycles for host time; YabauseApplyCpuClock() re-derives the per-line budget
+ * between frames without rewinding the counters. */
+extern int yab_cpu_clock_pct;
+extern int yab_cpu_clock_env;   /* YAB_CPUCLOCK probe wins over the option */
+void YabauseApplyCpuClock(void);
 int YabauseInit(yabauseinit_struct *init);
 void YabFlushBackups(void);
 void YabauseDeInit(void);
