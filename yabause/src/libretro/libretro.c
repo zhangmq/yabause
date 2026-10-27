@@ -3177,6 +3177,14 @@ static double yab_draw_ratio = 1.0;      /* draws per emulated frame */
 static double yab_draw_acc = 0.0;
 static int yab_skip_calls = 0;
 static int yab_skip_env = -2;            /* YAB_RENDER_SKIP override */
+/* CONTRACT with the frontend (minarch-gl's machine-fps counter depends on it):
+ * retro_run() calls video_cb exactly ONCE per emulated frame -- a real picture
+ * (RETRO_HW_FRAME_BUFFER_VALID) when the frame was drawn, NULL when it was not
+ * (frameskip above, or the display being blanked).  The frontend counts every
+ * video_cb as a machine frame and only the non-NULL ones as pictures, so
+ * "one call per frame, NULL = dupe" is what makes its two fps numbers add up.
+ * Do not skip the callback and do not call it twice in one retro_run().
+ */
 static int yab_render_skip(void)
 {
    if (yab_skip_env == -2)
@@ -3418,13 +3426,19 @@ void retro_run(void)
          }
          else
             idx = yab_frameslot_wait();
-         /* Auto Frameskip: skip the draw, keep the emulation.  No video_cb at
-          * all -- a duplicate would make the frontend's counter (and the user's
-          * eye) read the machine rate instead of the real picture rate. */
+         /* Auto Frameskip: skip the draw, keep the emulation, and hand the
+          * frontend a duplicate picture (video_cb(NULL)) so its per-present
+          * accounting still ticks every emulated frame.  The frontend is
+          * expected to recognise the NULL as "do not present, count it as a
+          * machine frame only"; that is what lets it report the machine rate
+          * (frames) and the real picture rate (new pictures) side by side.
+          * Until it does, the duplicate is presented as-is (the same path a
+          * blanked display already uses), which reads as the machine rate. */
          if (yab_render_skip())
          {
             YABFRONT("retro_run:skip-slot");
             yab_frameslot_release(idx);
+            video_cb(NULL, current_width, current_height, 0);
             yab_ft_report();
             return;
          }
