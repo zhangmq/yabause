@@ -883,25 +883,38 @@ static int yab_68k_throttle_mode(void)
    return mode;
 }
 
-/* The lock is on when the core option is enabled, or when the YAB_68KLOCK probe
- * variable is present.  "off"/"no" (and an empty value) disable the probe;
- * any number -- including 0 -- enables the lock with that phase offset. */
+/* The lock is on when the YAB_68KLOCK probe is present (any number -- including
+ * 0 -- sets the phase; "off"/"no" forces it off), when the precise sync mode is
+ * active (async renderer disabled, Saturn), or when the ST-V lead option is
+ * enabled.  The probe wins so an A/B run can still disable or re-phase it. */
 static int yab_68k_lock_on(void)
 {
-   static int init = 0, env_on = 0;
+   static int init = 0, env_on = 0, env_off = 0;
    if (!init)
    {
       const char *e = getenv("YAB_68KLOCK");
       init = 1;
-      if (e && *e && strcmp(e, "off") && strcmp(e, "no")) env_on = 1;
+      if (e && *e)
+      {
+         if (!strcmp(e, "off") || !strcmp(e, "no")) env_off = 1;
+         else env_on = 1;
+      }
    }
+   if (env_off) return 0;
    if (env_on) return 1;
+   /* Precise sync mode: the renderer runs on the emulation thread, so the 68k
+    * must not free-run on wall-clock pacing -- otherwise the same save state
+    * produces different video phases (measured on Sega Rally).  ST-V keeps its
+    * own lead workaround: do not disturb its tuned phase. */
+   if (!g_vdp_async && !yab_stv_mode) return 1;
    return yab_stv_sound_cpu_phase && yab_stv_mode;
 }
 
-/* Phase offset in 68k cycles.  The default is half of the 188160-cycle frame:
- * measured on seabass, only +94080 boots (0 / +47040 / +141120 / +188160 all
- * stay black), i.e. the sound CPU has to lead the SH-2 frame by half a frame. */
+/* Phase offset in 68k cycles.  The ST-V lead workaround uses half of the
+ * 188160-cycle frame: measured on seabass, only +94080 boots (0 / +47040 /
+ * +141120 / +188160 all stay black), i.e. the sound CPU has to lead the SH-2
+ * frame by half a frame.  The precise sync mode uses phase 0; YAB_68KLOCK can
+ * override both for A/B runs. */
 static long yab_68k_lock_off(void)
 {
    static int init = 0; static long off = 94080;
@@ -909,7 +922,12 @@ static long yab_68k_lock_off(void)
    {
       const char *e = getenv("YAB_68KLOCK");
       init = 1;
-      if (e && *e && strcmp(e, "off") && strcmp(e, "no")) off = strtol(e, NULL, 10);
+      if (e && *e)
+      {
+         if (strcmp(e, "off") && strcmp(e, "no")) off = strtol(e, NULL, 10);
+      }
+      else if (!g_vdp_async && !yab_stv_mode)
+         off = 0;
    }
    return off;
 }
@@ -1265,13 +1283,10 @@ yab_68k_lock_done: ;
             YABEMU("vblank-in");
             SmpcINTBACKEnd();
             Vdp2VBlankIN();
-            /* Publish the frame's snapshot table HERE, not at frame end: this
-             * runs right after Vdp2VBlankIN() has synchronised with the VDP
-             * worker (the worker blocks on its event queue until the next
-             * frame), so the publish cannot tear a table the worker is reading.
-             * (Doing it at frame end raced: the worker renders VDPEV_VBLANK_OUT
-             * while the main thread memcpy's over the table it is reading.) */
-            if (!yab_nowait()) Vdp2LinesSwap();
+            /* The sync renderer publishes its per-line table and AC_VRAM inside
+             * Vdp2VBlankIN(), before the composite.  The async renderer copies
+             * the slot's table itself and derives AC_VRAM in
+             * yab_frameslot_bind(), so nothing may be published here. */
 #if defined(ASYNC_SCSP)
             SyncCPUtoSCSP();
 #endif

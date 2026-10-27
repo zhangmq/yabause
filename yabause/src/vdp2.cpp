@@ -65,7 +65,6 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301  USA
 #include "vulkan/VIDVulkanCInterface.h"
 
 void VDP2genVRamCyclePattern(void);
-void Vdp2UpdateAC_VRAM(const Vdp2 *regs);
 
 __thread u8 * Vdp2Ram;
 /* Plain globals holding what the emulation thread bound, so the render thread
@@ -1445,11 +1444,14 @@ static void Vdp2ComputeCyclePattern(const Vdp2 *regs, int publish) {
 
 void VDP2genVRamCyclePattern(void)
 {
-   /* The emulation thread would clobber the mapping the renderer is using for
-    * the slot it is drawing (it reaches this at line 1 of the NEXT frame, i.e.
-    * a few hundred microseconds after the publish), so in async mode only the
-    * renderer publishes the mapping -- from the slot's own registers. */
-   Vdp2ComputeCyclePattern(Vdp2Regs, g_vdp_async ? 0 : 1);
+   /* Only compute cpu_cycle_a/b here (they are log-only).  AC_VRAM is owned by
+    * the renderer now: the async path derives it per slot in
+    * yab_frameslot_bind(), the sync path derives it in Vdp2VBlankIN() from the
+    * per-line table it is about to draw.  Publishing it here would overwrite
+    * the mapping the renderer is using -- in sync mode that happens at line 1
+    * of the NEXT frame, while the VOUT draw still uses the previous frame's
+    * table, which is exactly the plane/bank mismatch that blacks NBG0 out. */
+   Vdp2ComputeCyclePattern(Vdp2Regs, 0);
 }
 
 /* Rebuild AC_VRAM from one specific register snapshot.  The renderer passes
@@ -1631,6 +1633,14 @@ void Vdp2VBlankIN(void) {
   }
   else
   {
+    /* Sync renderer: the frame's per-line table is complete here.  Publish it
+     * (and derive AC_VRAM from the same line-0 registers the compositor uses)
+     * BEFORE the composite.  Doing it after Vdp2VBlankIN() -- the old worker
+     * ordering -- left the sync renderer one frame behind: the plane address
+     * and the bank mapping then came from different frames and NBG0 went black
+     * at video-frame changes (the same defect the async slot path had). */
+    Vdp2LinesSwap();
+    Vdp2UpdateAC_VRAM(&Vdp2Lines[0]);
     /* Sync renderer: draw on this thread. */
 	FrameProfileAdd("VIN start");
    /* this should be done after a frame change or a plot trigger */

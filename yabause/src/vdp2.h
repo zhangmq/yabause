@@ -419,6 +419,10 @@ int Vdp2Init(void);
 void Vdp2DeInit(void);
 void Vdp2Reset(void);
 void Vdp2LinesSwap(void);
+/* Rebuild Vdp2External.AC_VRAM from one register snapshot.  The renderer passes
+ * line 0 of the frame's per-line table so the VRAM bank mapping matches the
+ * layer registers the compositor uses. */
+void Vdp2UpdateAC_VRAM(const Vdp2 *regs);
 int yab_nowait(void);
 
 /* Frame slots: the emulation thread fills one per frame and the frontend thread
