@@ -70,6 +70,62 @@ struct retro_core_option_v2_definition option_defs_us[] = {
       "enabled"
    },
 {
+      "yabasanshiro_frameskip",
+      "Auto Frameskip",
+      NULL,
+      "Skip drawing (not emulation) when one frame takes longer than 1/60 s: the machine still runs every VBlank, so game speed and timers are unaffected, only the picture repeats. The factor follows the measured draw time.",
+      NULL,
+      "video",
+      {
+         { "disabled", NULL },
+         { "auto",     NULL },
+         { NULL, NULL },
+      },
+      "disabled"
+   },
+{
+      "yabasanshiro_cpu_clock",
+      "SH-2 CPU Clock",
+      NULL,
+      "Run the SH-2 at a lower clock to cut emulation cost. Games with idle time are unaffected; CPU-bound ones run slower. 100% = real hardware.",
+      NULL,
+      "system",
+      {
+         { "100", NULL },
+         { "95",  NULL },
+         { "90",  NULL },
+         { "85",  NULL },
+         { "80",  NULL },
+         { "75",  NULL },
+         { "70",  NULL },
+         { "65",  NULL },
+         { "60",  NULL },
+         { "55",  NULL },
+         { "50",  NULL },
+         { "45",  NULL },
+         { "40",  NULL },
+         { "35",  NULL },
+         { "30",  NULL },
+         { "25",  NULL },
+         { NULL, NULL },
+      },
+      "100"
+   },
+{
+      "yabasanshiro_vdp1_fb_readback",
+      "VDP1 Framebuffer Readback",
+      NULL,
+      "Let the SH-2 read back the VDP1 framebuffer, used by some games for screen transitions. Async Renderer: download it to CPU every frame (small constant cost). Off: the SH-2 gets an empty value (no GPU pixels, no shadow).",
+      NULL,
+      "video",
+      {
+         { "disabled", NULL },
+         { "enabled",  NULL },
+         { NULL, NULL },
+      },
+      "disabled"
+   },
+{
       "yabasanshiro_addon_cart",
       "Addon Cartridge",
       NULL,
@@ -140,20 +196,6 @@ struct retro_core_option_v2_definition option_defs_us[] = {
          { NULL, NULL },
       },
       "disabled"
-   },
-{
-      "yabasanshiro_frameskip",
-      "Auto Frameskip",
-      NULL,
-      "Skip frames to maintain full speed (prevents audio glitches during fast-forward).",
-      NULL,
-      "video",
-      {
-         { "enabled",  NULL },
-         { "disabled", NULL },
-         { NULL, NULL },
-      },
-      "enabled"
    },
 {
       "yabasanshiro_resolution_mode",

@@ -49,8 +49,8 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301  USA
 extern "C" {
 #endif
 
-extern u8 * Vdp2Ram;
-extern u8 * Vdp2ColorRam;
+extern __thread u8 * Vdp2Ram;
+extern __thread u8 * Vdp2ColorRam;
 extern u8 Vdp2ColorRamUpdated;
 extern u8 A0_Updated;
 extern u8 A1_Updated;
@@ -382,7 +382,7 @@ typedef struct {
    u16 COBB;   // 0x25F8011E
 } Vdp2;
 
-extern Vdp2 * Vdp2Regs;
+extern __thread Vdp2 * Vdp2Regs;
 
 typedef struct {
    int ColorMode;
@@ -419,6 +419,35 @@ int Vdp2Init(void);
 void Vdp2DeInit(void);
 void Vdp2Reset(void);
 void Vdp2LinesSwap(void);
+/* Rebuild Vdp2External.AC_VRAM from one register snapshot.  The renderer passes
+ * line 0 of the frame's per-line table so the VRAM bank mapping matches the
+ * layer registers the compositor uses. */
+void Vdp2UpdateAC_VRAM(const Vdp2 *regs);
+int yab_nowait(void);
+
+/* Frame slots: the emulation thread fills one per frame and the frontend thread
+ * renders it (see vdp2.cpp).  All of these are no-ops until yab_frameslot_init()
+ * has run; acquire/wait block, which is what gives us the backpressure. */
+void  yab_frameslot_init(void);
+int   yab_frameslot_acquire(void);
+int   yab_frameslot_tryacquire(void);
+void  yab_frameslot_publish(int idx, unsigned frame_no, int width, int height);
+int   yab_frameslot_wait(void);
+void  yab_frameslot_release(int idx);
+void  yab_frameslot_bind(int idx);
+void  yab_frameslot_lines(int idx, Vdp2 **out_lines);
+unsigned yab_frameslot_frame_no(int idx);
+void  yab_frameslot_set_current(int idx);
+int   yab_frameslot_publish_current(unsigned frame_no, int w, int h);
+void  yab_render_slot(int idx);
+void  yab_bind_live_state(void);
+void  yab_bind_live_ptrs(void);
+void  yab_frameslot_mark_direct_draw(void);
+
+extern volatile int vdp_composed_frame;
+extern volatile int yab_pic_pending;
+int vdp2PostStaged(void);
+int vdp2PostStagedOut(void);   /* TEMPORARY: post the staged frame from retro_run */   /* TEMPORARY EXPERIMENT: run ahead of the render thread */
 void Vdp2VBlankIN(void);
 void Vdp2HBlankIN(void);
 void Vdp2HBlankOUT(void);

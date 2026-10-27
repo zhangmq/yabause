@@ -62,18 +62,32 @@ using std::mutex;
 namespace chrono = std::chrono;
 
 extern "C" {
-u8 * Vdp1Ram;
+__thread u8 * Vdp1Ram;
 u8 * Vdp1FrameBuffer[2];
 VideoInterface_struct *VIDCore = NULL;
 extern VideoInterface_struct *VIDCoreList[];
 extern YabEventQueue * rcv_evqueue;
-Vdp1 * Vdp1Regs;
+__thread Vdp1 * Vdp1Regs;
 Vdp1External_struct Vdp1External = { 0 };
+#ifdef YAB_VDP1DBG
+/* Diagnostic counters (YAB_VDP1DBG builds only): how much of the command list
+ * each rendered frame actually walked.  Reset by yab_render_slot(). */
+int yab_dbg_v1_calls = 0;        /* Vdp1Draw()/Vdp1DrawCommands entries */
+int yab_dbg_v1_cmds = 0;         /* commands walked in the last list */
+int yab_dbg_v1_nodraw = 0;       /* Vdp1NoDraw() (VDP1 display off) */
+int yab_dbg_v1_early = 0;        /* early returns: addr error / immediate end */
+u32 yab_dbg_v1_addr = 0;         /* list start address */
+u16 yab_dbg_v1_first = 0;        /* first command word */
+#endif
 }
 
 atomic<int> vdp1_clock{ 0 };
 condition_variable vdp1_clock_cv;
 mutex vdp1_clock_mtx;
+
+/* Defined in vdp2.cpp: invalidates derived-register values computed from a
+ * state that a reset / savestate load is replacing. */
+extern "C" void yab_vdp1_generation_bump(void);
 
 
 void Vdp1_onHblank() {
@@ -357,6 +371,9 @@ extern "C" void Vdp1Reset(void) {
 
    vdp1_clock = 0;
 
+   /* Drop derived-register values the render thread computed before the
+    * reset; the next slots must not inherit them. */
+   yab_vdp1_generation_bump();
 }
 
 extern "C" int VideoSetSetting( int type, int value )
@@ -450,21 +467,16 @@ extern "C" void FASTCALL Vdp1WriteWord(u32 addr, u16 val) {
       {
         if (g_vdp_async)
         {
-          /* Async renderer: hand the direct draw to the VDP worker. */
-          FRAMELOG("[VDP1] VDPEV_DIRECT_DRAW %d/%d", YaGetQueueSize(vdp1_rcv_evqueue), yabsys.LineCount);
-          if ( YaGetQueueSize(vdp1_rcv_evqueue) > 0){
-            yabsys.wait_line_count = -1;
-            do{
-              YabWaitEventQueue(vdp1_rcv_evqueue);
-            } while (YaGetQueueSize(vdp1_rcv_evqueue) != 0);
-          }
+          /* Async emulation: this thread cannot rasterize (GL lives on the
+           * frontend thread), so record the draw in the frame slot and let the
+           * frontend do it when it renders that slot. */
+          FRAMELOG("[VDP1] direct draw deferred to the frame slot");
           Vdp1Regs->EDSR >>= 1;
           yabsys.wait_line_count = yabsys.LineCount + 50;
           yabsys.wait_line_count %= yabsys.MaxLineCount;
           if (yabsys.wait_line_count == 5) { yabsys.wait_line_count = 4; }
           FRAMELOG("SET DIRECT WAIT %d", yabsys.wait_line_count);
-          YabAddEventQueue(evqueue,VDPEV_DIRECT_DRAW);
-          YabThreadYield();
+          yab_frameslot_mark_direct_draw();
         }
         else
         {
@@ -513,16 +525,27 @@ extern "C" void Vdp1DrawCommands(u8 * ram, Vdp1 * regs, u8* back_framebuffer)
 {
   std::unique_lock<std::mutex> lk(vdp1_clock_mtx);
   LOG("VDP1: DrawCommands - %08X\n", regs->addr);
+#ifdef YAB_VDP1DBG
+  yab_dbg_v1_calls++;
+  yab_dbg_v1_addr = regs->addr;
+  yab_dbg_v1_first = T1ReadWord(ram, regs->addr);
+#endif
   regs->COPR = regs->addr >> 3;
   if (regs->addr > 0x7FFFF) {
     Vdp1External.status = VDP1_STATUS_IDLE;
     LOG("VDP1: Address error - %08X\n", regs->addr);
+#ifdef YAB_VDP1DBG
+    yab_dbg_v1_early++;
+#endif
     return; // address error
   }
    u16 command = T1ReadWord(ram, regs->addr );
    if (command & 0x8000) {
      Vdp1External.status = VDP1_STATUS_IDLE;
      LOG("VDP1: Imidiate Finish - %08X\n", regs->addr);
+#ifdef YAB_VDP1DBG
+     yab_dbg_v1_early++;
+#endif
      return;
    }
 
@@ -648,6 +671,9 @@ extern "C" void Vdp1DrawCommands(u8 * ram, Vdp1 * regs, u8* back_framebuffer)
       }
    }
 
+#ifdef YAB_VDP1DBG
+   yab_dbg_v1_cmds += command_count;
+#endif
    if (Vdp1External.status == VDP1_STATUS_RUNNING) {
      LOG("VDP1: Readched to max comand count = %d", command_count);
    }
@@ -804,6 +830,9 @@ extern "C" void Vdp1Draw(void)
 //////////////////////////////////////////////////////////////////////////////
 
 extern "C" void Vdp1NoDraw(void) {
+#ifdef YAB_VDP1DBG
+   yab_dbg_v1_nodraw++;
+#endif
    // beginning of a frame (ST-013-R3-061694 page 53)
    // BEF <- CEF
    // CEF <- 0
@@ -910,6 +939,9 @@ extern "C" int Vdp1LoadState(FILE *fp, UNUSED int version, int size)
    VIDCore->Vdp1WriteFrameBuffer = Vdp1WriteFrameBuffer;
 
 #endif
+   /* The loaded registers replace whatever the renderer derived from the state
+    * that was running before the load. */
+   yab_vdp1_generation_bump();
    return size;
 }
 

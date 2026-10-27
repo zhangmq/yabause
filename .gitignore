@@ -21,3 +21,6 @@ yabause/src/android/app/.settings/*
 # 维护者笔记（不追踪）
 AGENTS.md
 .notes/
+
+# RAX 调试转储（.notes/rax-test/parse-rax.py 的输出目录，勿提交）
+/raxdump/

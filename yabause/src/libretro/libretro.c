@@ -18,6 +18,10 @@
 #include <file/file_path.h>
 
 #include <unistd.h>
+#include <time.h>
+#ifdef YAB_HANGDBG
+#include <sys/syscall.h>
+#endif
 #include "vdp1.h"
 #include "vdp2.h"
 #include "smpc.h"
@@ -74,6 +78,12 @@ static int current_width;
 static int current_height;
 
 static bool renderer_running = false;
+
+/* Async emulation thread control (defined next to retro_run). */
+static void yab_emu_start(void);
+static void yab_emu_stop(void);
+static void yab_emu_pause(void);
+static void yab_emu_resume(void);
 static bool hle_bios_force = false;
 static bool one_frame_rendered = false;
 
@@ -86,12 +96,15 @@ static int g_sh2coretype = 3;
 static int g_sh2coretype = SH2CORE_INTERPRETER;
 #endif
 
-static int g_frame_skip = 1;
 /* Async renderer (core option "yabasanshiro_async_rendering").  _opt is the
  * option's intent, refreshed by check_variables(); the real g_vdp_async is
  * latched from it in retro_load_game(), because the GL context and the VDP
  * worker are created once per machine boot (context_reset -> YabauseInit). */
 static int g_vdp_async_opt = 1;
+/* Auto Frameskip (core option "yabasanshiro_frameskip"): 0 = off, 1 = auto.
+ * Declared here because check_variables() (below) reads it; the skip logic
+ * lives next to the async frame-slot code. */
+static int g_frameskip = 0;
 static int g_rbg_resolution_mode = 0;
 static int g_rbg_use_compute_shader = 1;
 static int addon_cart_type = CART_DRAM32MBIT;
@@ -750,6 +763,12 @@ static struct {
    void (*Finish)(void);
    void (*ReadPixels)(YK_Int, YK_Int, YK_Int, YK_Int, YK_Enum, YK_Enum, void *);
    YK_Uint mirror_color_tex;
+   /* YAB_NOWAIT double buffering: the core renders into its own pair of colour
+    * textures (textures are shared between the two EGL contexts, FBOs are NOT),
+    * so the worker can draw frame N+1 while the frontend still samples frame N. */
+   YK_Uint rt_tex[2], rt_fbo[2], rt_read_fbo, rt_present_fbo;
+   int rt_back, rt_front, rt_w, rt_h, rt_ok;
+   volatile int rt_attached;      /* this frame's renders went to an RT */
 } yk;
 
 #define YK_EGL_NONE              0x3038
@@ -913,6 +932,7 @@ static void yk_mirror_depth(void)
  * YabauseInit()/VIDOGLInit() create the engine's GL objects here. */
 static void yk_load(void)
 {
+
    YK_Config cfgs[64];
    YK_Int ncfg = 0, i, prev_fbo = 0, type = -1, name = 0;
    YK_Int pbattr[5], ctxattr[5];
@@ -1012,21 +1032,16 @@ static void yk_load(void)
    yk.pb = yk.CreatePbufferSurface(yk.dpy, yk.cfg, pbattr);
    if (!yk.pb) { yk_log("eglCreatePbufferSurface failed"); return; }
 
-   ctxattr[0] = YK_EGL_CONTEXT_CLIENT_VERSION; ctxattr[1] = 3;
-   ctxattr[2] = YK_EGL_NONE;
-   yk.ctx_sub = yk.CreateContext(yk.dpy, yk.cfg, yk.ctx_front, ctxattr);
-   if (!yk.ctx_sub)
-   {
-      ctxattr[1] = 2;
-      yk.ctx_sub = yk.CreateContext(yk.dpy, yk.cfg, yk.ctx_front, ctxattr);
-   }
-   if (!yk.ctx_sub) { yk_log("eglCreateContext(share) failed"); return; }
-
-   /* KEY: the engine (YabauseInit -> VIDOGLInit -> YglInit) must create its GL
-    * objects in THIS context -- FBOs are not shared across contexts, so objects
-    * built in the frontend's context are invalid names for the VDP thread. */
-   if (!yk.MakeCurrent(yk.dpy, yk.pb, yk.pb, yk.ctx_sub))
-   { yk_log("eglMakeCurrent(share) on emulation thread failed"); return; }
+   /* ONE context for everything: the frontend's.  With the flycast-style split
+    * (machine on its own thread, all GL + presentation on the frontend thread)
+    * there is no second thread to share objects with any more, so the engine
+    * creates its GL objects in the frontend's context -- which is exactly what
+    * the sync path always did.  Creating a private context here is what made
+    * every draw land on objects the frontend's context cannot see (measured:
+    * a completely black picture while the frame rate went up). */
+   yk.ctx_sub = yk.ctx_front;
+   yk.cfg     = yk.cfg;   /* config stays the frontend's */
+   (void)ctxattr;
 
    yk.GenFramebuffers(1, &yk.mirror_fbo);
    yk.BindFramebuffer(YK_GL_FRAMEBUFFER, yk.mirror_fbo);
@@ -1267,7 +1282,7 @@ static void yk_adopt_front_fbo(void)
       yk.front_tex = name;
       yk.retarget  = 1;
       yk_query_front_size((YK_Uint)name);
-      if (yk.ring_adopt_log < 400)
+      if (yk.ring_adopt_log < 4)   /* one-time confirmation that the ring is followed */
       {
          log_cb(RETRO_LOG_INFO, "[YK] ring adopt: front fbo=%u tex=%u\n",
                (unsigned)fbo, (unsigned)name);
@@ -1290,11 +1305,143 @@ static void yk_adopt_front_fbo(void)
  * frontend hands the frame back.  Done unconditionally, once per frame: three
  * cheap GL calls, and it also covers a ring slot whose colour texture the
  * frontend replaced without changing the FBO name. */
+/* ---------------------------------------------------------------------------
+ * YAB_NOWAIT render targets
+ *
+ * Decoupling presentation from rendering means the renderer must not draw into
+ * the slot the frontend is presenting, and the frontend's ring only ever hands
+ * out ONE slot at a time.  So the core owns two colour textures (shared between
+ * the EGL contexts) and alternates them: the worker draws into rt_tex[rt_back],
+ * flips to it when the frame is complete, and the frontend thread blits the
+ * finished one into the slot the frontend is about to show.
+ * ------------------------------------------------------------------------- */
+/* The worker recreates these textures on a resolution change while the
+ * frontend thread may be blitting the previous ones -- deleting a texture in
+ * flight presents black.  The sections are tiny (a few GL calls, one blit), so a
+ * plain mutex is enough. */
+/* Spinlock: the critical sections are a few GL calls, and the case only happens
+ * on a resolution change.  (pthread.h cannot be included here: the port's own
+ * rthreads layer redefines part of it.) */
+static volatile int yk_rt_mtx = 0;
+static void yk_rt_lock(void) { while (__atomic_exchange_n(&yk_rt_mtx, 1, __ATOMIC_ACQUIRE)) { } }
+static void yk_rt_unlock(void) { __atomic_store_n(&yk_rt_mtx, 0, __ATOMIC_RELEASE); }
+
+static int yk_rt_ensure(int w, int h)
+{
+   if (!yk.GenFramebuffers || !yk.BindFramebuffer || !yk.FramebufferTexture2D)
+      return -1;
+   if (w <= 0 || h <= 0) return -1;
+   /* Never shrink and never recreate: the resolution wobbles between modes (e.g.
+    * 320x240 <-> 352x224) and recreating the textures mid-stream leaves the
+    * frontend's read FBO pointing at a deleted id -- measured: whole runs
+    * presenting black.  Allocate once, grow only. */
+   if (yk.rt_ok && w <= yk.rt_w && h <= yk.rt_h) return 0;
+   yk_rt_lock();
+   if (yk.rt_ok && w <= yk.rt_w && h <= yk.rt_h) { yk_rt_unlock(); return 0; }
+   for (int i = 0; i < 2; i++)
+   {
+      if (!yk.rt_tex[i]) glGenTextures(1, &yk.rt_tex[i]);
+      glBindTexture(GL_TEXTURE_2D, yk.rt_tex[i]);
+      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+      glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+      glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+      if (!yk.rt_fbo[i]) yk.GenFramebuffers(1, &yk.rt_fbo[i]);
+      yk.BindFramebuffer(YK_GL_FRAMEBUFFER, yk.rt_fbo[i]);
+      yk.FramebufferTexture2D(YK_GL_FRAMEBUFFER, YK_GL_COLOR_ATTACHMENT0,
+            YK_GL_TEXTURE_2D, yk.rt_tex[i], 0);
+      if (yk.mirror_rb && yk.FramebufferRenderbuffer)
+      {
+         yk.FramebufferRenderbuffer(YK_GL_FRAMEBUFFER, YK_GL_DEPTH_STENCIL_ATTACHMENT,
+               YK_GL_RENDERBUFFER, yk.mirror_rb);
+      }
+   }
+   yk.BindFramebuffer(YK_GL_FRAMEBUFFER, 0);
+   if (w > yk.rt_w) yk.rt_w = w;
+   if (h > yk.rt_h) yk.rt_h = h;
+   if (!yk.rt_ok) { yk.rt_back = 0; yk.rt_front = 1; }
+   yk.rt_ok = 1;
+   yk_rt_unlock();
+   return 0;
+}
+
+static YK_Uint yk_rt_acquire(int w, int h)
+{
+   if (yk_rt_ensure(w, h) != 0) return 0;
+   yk.BindFramebuffer(YK_GL_FRAMEBUFFER, yk.rt_fbo[yk.rt_back]);
+   if (yk.mirror_rb && yk.FramebufferRenderbuffer)
+   {
+      yk.FramebufferRenderbuffer(YK_GL_FRAMEBUFFER, YK_GL_DEPTH_STENCIL_ATTACHMENT,
+            YK_GL_RENDERBUFFER, yk.mirror_rb);
+   }
+   return yk.rt_fbo[yk.rt_back];
+}
+
+static void yk_rt_flip(void)
+{
+   yk_rt_lock();
+   if (yk.rt_ok) {
+      yk.rt_front = yk.rt_back;
+      yk.rt_back ^= 1;
+   }
+   yk_rt_unlock();
+}
+
+/* Worker side: copy the finished render target into the frontend's colour
+ * texture.  Textures are shared across the two contexts, so the core can do this
+ * with its own FBO; doing it here (after the composite and its glFinish) means
+ * the frontend thread only has to present what is already in its FBO. */
+static void yk_rt_blit_to_front(int w, int h)
+{
+   if (!yk.rt_ok || !yk.front_tex) return;
+   /* The render targets only ever grow, so after a resolution SHRINK they are
+    * larger than the picture: copy exactly the area the engine renders
+    * (current_width x current_height), never the whole target -- blitting the
+    * full target scaled the picture up by 352/320 and shifted every pixel
+    * (measured: 75% of the pixels differing from the baseline at the same
+    * machine frame). */
+   if (w > yk.rt_w) w = yk.rt_w;
+   if (h > yk.rt_h) h = yk.rt_h;
+   yk_rt_lock();
+   if (!yk.rt_present_fbo) yk.GenFramebuffers(1, &yk.rt_present_fbo);
+   yk.BindFramebuffer(GL_READ_FRAMEBUFFER, yk.rt_fbo[yk.rt_front]);
+   yk.BindFramebuffer(GL_DRAW_FRAMEBUFFER, yk.rt_present_fbo);
+   yk.FramebufferTexture2D(GL_DRAW_FRAMEBUFFER, YK_GL_COLOR_ATTACHMENT0,
+         YK_GL_TEXTURE_2D, yk.front_tex, 0);
+   glBlitFramebuffer(0, 0, w, h, 0, 0, w, h, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+   yk.BindFramebuffer(YK_GL_FRAMEBUFFER, 0);
+   yk_rt_unlock();
+
+}
+
+static void yk_rt_present_to(unsigned dst_fbo, int w, int h)
+{
+   yk_rt_lock();
+   if (!yk.rt_ok || !yk.rt_tex[yk.rt_front]) { yk_rt_unlock(); return; }
+   if (!yk.rt_read_fbo) yk.GenFramebuffers(1, &yk.rt_read_fbo);
+   yk.BindFramebuffer(GL_READ_FRAMEBUFFER, yk.rt_read_fbo);
+   yk.FramebufferTexture2D(GL_READ_FRAMEBUFFER, YK_GL_COLOR_ATTACHMENT0,
+         YK_GL_TEXTURE_2D, yk.rt_tex[yk.rt_front], 0);
+   yk.BindFramebuffer(GL_DRAW_FRAMEBUFFER, dst_fbo);
+   glBlitFramebuffer(0, 0, yk.rt_w, yk.rt_h, 0, 0, w, h,
+         GL_COLOR_BUFFER_BIT, GL_NEAREST);
+   yk.BindFramebuffer(GL_FRAMEBUFFER, dst_fbo);
+   yk_rt_unlock();
+}
+
+
 void YuiRetargetFB(void)
 {
    if (g_vdp_async && yk.state == 1 && yk.front_tex)
    {
       yk.BindFramebuffer(YK_GL_FRAMEBUFFER, yk.mirror_fbo);
+      /* Zero copy: draw straight into the frontend's colour texture.  With the
+       * flycast-style split (machine on its own thread, all GL and presentation
+       * on the frontend thread) nothing else can be drawing from, or rotating,
+       * the frontend's ring while this frame is being rendered, so the
+       * double-buffered render target and the present-time blit are not needed
+       * -- and while they were still in the path the picture came out black. */
       yk.FramebufferTexture2D(YK_GL_FRAMEBUFFER, YK_GL_COLOR_ATTACHMENT0,
             YK_GL_TEXTURE_2D, yk.front_tex, 0);
       yk_mirror_depth();
@@ -1313,7 +1460,14 @@ int YuiGetFB(void)
   /* async: the engine renders into the core's mirror FBO, which attaches the
    * frontend's colour texture (re-pointed per frame by YuiRetargetFB).
    * sync: the engine renders straight into the frontend's hw-render FBO. */
-  if (g_vdp_async && yk.mirror_fbo)
+
+  /* Draw through the core's mirror FBO: it is the frontend's colour texture
+   * plus our own depth/stencil attachments, which VDP2's compositing needs
+   * (stencil windows, priority).  The cross-thread reason for the mirror is
+   * gone, but the attachment reason is not -- without it some titles render a
+   * flat background only.  Same context, same thread, so this is still one GL
+   * thread. */
+  if (yk.mirror_fbo)
      return (int)yk.mirror_fbo;
   return hw_render.get_current_framebuffer();
 }
@@ -1400,32 +1554,26 @@ void YuiSwapBuffers(void)
    if (GlWidth  > game_width)  game_width  = GlWidth;
    if ((prev_game_width != game_width) || (prev_game_height != game_height))
    {
-      if (g_vdp_async && yk.state == 1 && yk.worker_valid && (pthread_self() == yk.worker))
+      if (g_vdp_async)
       {
-         /* VIDCore->Resize() + the AV-info env callback must run on the
-          * frontend's thread (retro_run); block hashing/GL here would also
-          * fight the VDP thread for the shared context.  Defer it. */
+         /* VIDOGLResize() runs YglGLInit(), i.e. a full GL re-init (FBOs,
+          * textures, shaders).  We are inside YglRender's call stack here, so
+          * doing it now tears down objects the ongoing render is still using --
+          * measured on cotton2: the frontend thread never came back after the
+          * 352x224 -> 352x246 switch.  Defer it to retro_run, outside the
+          * render, with the machine parked. */
          yk.res_pending = 1;
       }
       else
          retro_set_resolution();
    }
    audio_size = soundlen;
-   if (g_vdp_async && yk.state == 1 && yk.worker_valid && (pthread_self() == yk.worker))
-   {
-      /* video_cb -> frontend video_refresh -> shader chain + swap: those run
-       * with the FRONTEND's context on the FRONTEND's thread, so only mark
-       * the frame here and let retro_run() deliver it.  Finish first: the
-       * frontend samples the texture this thread just rendered into. */
-      if (yk.Finish)
-         yk.Finish();
-      {
-         static unsigned yk_dump_frame = 0;
-      }
-      yk.frame_pending = 1;
-      one_frame_rendered = true;
-      return;
-   }
+   /* There is no GL worker any more: with the machine on its own thread and all
+    * GL on the frontend thread, this function always runs on the thread that
+    * must present, so video_cb is called unconditionally.  The old early-return
+    * ("mark the frame and let retro_run deliver it") belongs to the worker
+    * model; left in place it silently stopped presenting after a resolution
+    * change on cotton2/shienryu/seabass -- frames kept coming, no video_cb. */
    video_cb(RETRO_HW_FRAME_BUFFER_VALID, current_width, current_height, 0);
    one_frame_rendered = true;
 }
@@ -1586,6 +1734,8 @@ static void context_reset(void)
             (void *)(yk.GetCurrentContext ? yk.GetCurrentContext() : NULL), outer_borrow);
       if (!outer_borrow)
          yk_restore_front();
+      /* Engine is fully up: start the machine on its own thread. */
+      yab_emu_start();
    }
 }
 
@@ -1596,6 +1746,7 @@ static void context_destroy(void)
     * shared context on this thread for the engine's GL teardown.  yk_attach()
     * remembers the frontend's context and yk_detach() hands it back, so the
     * frontend keeps drawing with the context it thinks it owns. */
+   yab_emu_stop();
    Vdp2StopRenderThread();
    if (g_vdp_async)
       yk_attach();
@@ -1723,16 +1874,6 @@ void check_variables(void)
          hle_bios_force = false;
       else if (strcmp(var.value, "enabled") == 0 && !hle_bios_force)
          hle_bios_force = true;
-   }
-
-   var.key = "yabasanshiro_frameskip";
-   var.value = NULL;
-   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
-   {
-      if (strcmp(var.value, "enabled") == 0)
-         g_frame_skip = 1;
-      else if (strcmp(var.value, "disabled") == 0)
-         g_frame_skip = 0;
    }
 
    var.key = "yabasanshiro_rbg_resolution_mode";
@@ -1883,6 +2024,49 @@ void check_variables(void)
       if (e && *e && e[0] != '0')
          g_vdp_async_opt = 0;
    }
+
+   /* Auto Frameskip: skip drawing, never emulation.  See yab_render_skip(). */
+   var.key = "yabasanshiro_frameskip";
+   var.value = NULL;
+   g_frameskip = 0;
+   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+      if (strcmp(var.value, "auto") == 0 || strcmp(var.value, "enabled") == 0)
+         g_frameskip = 1;
+
+   /* SH-2 CPU clock percentage ("cycle rate").  Applied live: the per-line
+    * SH-2 budget is re-derived between frames, the counters are untouched. */
+   var.key = "yabasanshiro_cpu_clock";
+   var.value = NULL;
+   if (!yab_cpu_clock_env && environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+   {
+      int pct = atoi(var.value);
+      if (pct < 25) pct = 25;
+      else if (pct > 100) pct = 100;
+      if (pct != yab_cpu_clock_pct)
+      {
+         yab_cpu_clock_pct = pct;
+         YabauseApplyCpuClock();
+      }
+   }
+
+   /* VDP1 framebuffer readback.  Off by default: most titles never read the
+      framebuffer, and the async renderer then pays nothing.  When off the pixel
+      read returns 0 (no buffer is kept); when on the render thread copies the
+      frame it just rasterised to CPU, at one glReadPixels+PBO map per frame. */
+   var.key = "yabasanshiro_vdp1_fb_readback";
+   var.value = NULL;
+   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+   {
+      if (strcmp(var.value, "enabled") == 0)
+         yab_vdp1_fb_readback = 1;
+      else if (strcmp(var.value, "disabled") == 0)
+         yab_vdp1_fb_readback = 0;
+   }
+   {
+      const char *e = getenv("YAB_VDP1_FB_READBACK");
+      if (e && *e)
+         yab_vdp1_fb_readback = (e[0] != '0');
+   }
 }
 
 void retro_get_system_av_info(struct retro_system_av_info *info)
@@ -1989,9 +2173,19 @@ bool retro_serialize(void *data, size_t size)
    size_t out_size = 0;
    int error;
 
+   /* The machine now runs on its own thread: park it so the state we save is a
+    * between-frames state, not one being mutated under us. */
+   yab_emu_pause();
+   /* Bind the thread-local state POINTERS only: the state API must read the
+    * machine's buffers, but the full bind also restores Vdp1External from its
+    * init-time snapshot, which zeroes the live VDP1 frame-change handshake
+    * (frame_change_plot / swap_frame_buffer).  Measured: saving a state froze
+    * the picture (machine still running) exactly because of that clobber. */
+   yab_bind_live_ptrs();
    ScspMuteAudio(SCSP_MUTE_SYSTEM);
    error = YabSaveStateBuffer (&buffer, &out_size);
    ScspUnMuteAudio(SCSP_MUTE_SYSTEM);
+   yab_emu_resume();
 
    if (error || !buffer)
       return false;
@@ -2053,7 +2247,18 @@ static int apply_state_buffer(const void *data, size_t size)
 
 bool retro_unserialize(const void *data, size_t size)
 {
-   return apply_state_buffer(data, size) == 0;
+   bool ok;
+   yab_emu_pause();
+   /* A state load restores VRAM/registers through the thread-local pointers: bind
+    * them to the machine's buffers first, otherwise the restored data lands in
+    * this thread's own pointers and the machine keeps running with empty VRAM
+    * (measured: every layer sampled nothing and the picture was black).
+    * Pointers only -- the full bind would zero the live VDP1 handshake, the same
+    * way it did on the save path. */
+   yab_bind_live_ptrs();
+   ok = apply_state_buffer(data, size) == 0;
+   yab_emu_resume();
+   return ok;
 }
 
 void retro_cheat_reset(void)
@@ -2104,6 +2309,15 @@ void retro_init(void)
 
    if (environ_cb(RETRO_ENVIRONMENT_GET_PERF_INTERFACE, &perf_cb))
       perf_get_cpu_features_cb = perf_cb.get_cpu_features;
+
+   /* The machine runs on its own thread and reads input from there, so ask the
+    * frontend to poll BEFORE retro_run (libretro's POLL_TYPE_EARLY -- the same
+    * request mupen64plus-next makes when its threaded renderer is on; minarch-gl
+    * honours it, see minarch.c:294-311). */
+   { unsigned poll_early = 1; /* RA poll_type_override_t: 1 = EARLY.  The
+                                * command is a RetroArch extension (0x800004) that
+                                * this tree's libretro.h predates. */
+     environ_cb(0x800004u, &poll_early); }
 
    if (environ_cb(RETRO_ENVIRONMENT_GET_SYSTEM_DIRECTORY, &dir) && dir)
    {
@@ -2392,7 +2606,7 @@ bool retro_load_game_common()
    yinit.m68kcoretype              = M68KCORE_C68K;
 #endif
    yinit.mpegpath                  = NULL;
-   yinit.frameskip                 = g_frame_skip;
+   yinit.frameskip                 = 0;   /* Auto Frameskip option removed (see frameSkipAndLimit) */
    yinit.rbg_resolution_mode       = g_rbg_resolution_mode;
    yinit.rbg_use_compute_shader    = g_rbg_use_compute_shader;
    yinit.usethreads                = 0;
@@ -2847,7 +3061,10 @@ void retro_deinit(void)
 
 void retro_reset(void)
 {
+   yab_emu_pause();
+   yab_bind_live_state();
    YabauseReset();
+   yab_emu_resume();
    VdpResume();
    // The following function crashes the core when you use "restart"
    //YabauseResetButton();
@@ -2872,11 +3089,288 @@ void reset_global_gl_state()
  * black and one that does not: the PC sequence up to that point is identical, so
  * the first differing line is where the machine took a different path. */
 
+
+/* Present the picture the VDP worker finished, if any (async renderer).  With
+ * YAB_NOWAIT this runs at the START of retro_run: the worker had a whole frame
+ * to finish the picture posted at the previous vblank, so it is always ready
+ * and the hw-render slot it would render into next has already been presented
+ * (no overwriting of an unpresented picture). */
+/* ---------------------------------------------------------------------------
+ * Async emulation (flycast model).
+ *
+ * The machine runs on this thread; the frontend thread (retro_run) does ALL the
+ * GL and the presentation, from the frame slots the machine publishes at each
+ * frame boundary.  That is what keeps every GL call and the frontend's
+ * hw-render ring rotation on the same thread, which is the property flycast and
+ * mupen64plus-next both rely on -- see .notes/THREADING-REFACTOR-PLAN-*.md.
+ * ------------------------------------------------------------------------- */
+static pthread_t yab_emu_tid;
+static volatile int yab_emu_running = 0;
+static volatile int yab_emu_paused = 0;
+static volatile int yab_emu_parked = 1;
+
+/* YAB_FT=<n>: debug-only per-frame cost split, off unless set.
+ *
+ * When the host cannot emulate 59.94 VBlanks per second the game runs slow, and
+ * the only questions that matter are "which stage is the ceiling" and "how much
+ * of the frame is fixed overhead".  The async path has two independent stages
+ * that overlap -- the machine thread's frame (PERCore->HandleEvents) and the
+ * frontend thread's slot render (yab_render_slot) -- so the frame rate is
+ * max(machine, render) plus the queue handover, not their sum.  This probe
+ * prints the average of both (plus how long the frontend waited for a slot,
+ * i.e. the backpressure) over <n> frames, so a slow title can be attributed
+ * instead of guessed at. */
+static u64 yab_ft_machine_ns = 0, yab_ft_render_ns = 0, yab_ft_wait_ns = 0;
+static int yab_ft_frames = 0, yab_ft_every = -1;
+static u64 yab_ft_now(void)
+{
+   struct timespec ts;
+   clock_gettime(CLOCK_MONOTONIC, &ts);
+   return (u64)ts.tv_sec * 1000000000ull + (u64)ts.tv_nsec;
+}
+static int yab_ft_on(void)
+{
+   if (yab_ft_every < 0)
+   {
+      const char *e = getenv("YAB_FT");
+      yab_ft_every = 0;
+      if (e && *e) { yab_ft_every = atoi(e); if (yab_ft_every <= 0) yab_ft_every = 60; }
+   }
+   return yab_ft_every;
+}
+static void yab_ft_report(void)
+{
+   int n = yab_ft_on();
+   if (!n) return;
+   if (++yab_ft_frames < n) return;
+   printf("[FT] n=%d machine=%.2fms render=%.2fms wait=%.2fms\n",
+          n,
+          (double)yab_ft_machine_ns / (double)n / 1e6,
+          (double)yab_ft_render_ns  / (double)n / 1e6,
+          (double)yab_ft_wait_ns    / (double)n / 1e6);
+   fflush(stdout);
+   yab_ft_machine_ns = yab_ft_render_ns = yab_ft_wait_ns = 0;
+   yab_ft_frames = 0;
+}
+
+/* Auto Frameskip (core option yabasanshiro_frameskip = disabled | auto), the
+ * async-path successor of the old VIDDummy frameskip.
+ *
+ * It skips the *draw*, never the emulation: the machine still publishes one slot
+ * per VBlank and retro_run still consumes one per call, so the game keeps running
+ * on the 59.94 Hz axis and its timers are untouched.  A skipped frame hands the
+ * slot straight back without calling video_cb at all (no duplicate!), so the
+ * frontend's present counter shows the real picture rate.
+ *
+ * How much to draw: a picture is only worth drawing while one draw still fits in
+ * the frame the emulation actually achieves, and that frame is
+ * max(machine frame time, 1/60 s) -- not 1/60 s alone.  When the machine is the
+ * slower side (it is on this device) cutting the draw budget down to 16.7 ms
+ * throws pictures away for nothing, so:
+ *     ratio = min(1, max(machine_ms, 16.7) / draw_ms)
+ * and a ratio accumulator draws when it crosses 1, which spreads the skips
+ * evenly instead of bunching them.  Both costs are measured, so the ratio
+ * follows the scene.  YAB_RENDER_SKIP=<n> forces a fixed every-n-th cadence. */
+static double yab_machine_ms_ema = 0.0;  /* one machine frame, exponential average */
+static double yab_render_ms_ema  = 0.0;  /* one draw, exponential average */
+static double yab_draw_ratio = 1.0;      /* draws per emulated frame */
+static double yab_draw_acc = 0.0;
+static int yab_skip_calls = 0;
+static int yab_skip_env = -2;            /* YAB_RENDER_SKIP override */
+/* CONTRACT with the frontend (minarch-gl's machine-fps counter depends on it):
+ * retro_run() calls video_cb exactly ONCE per emulated frame -- a real picture
+ * (RETRO_HW_FRAME_BUFFER_VALID) when the frame was drawn, NULL when it was not
+ * (frameskip above, or the display being blanked).  The frontend counts every
+ * video_cb as a machine frame and only the non-NULL ones as pictures, so
+ * "one call per frame, NULL = dupe" is what makes its two fps numbers add up.
+ * Do not skip the callback and do not call it twice in one retro_run().
+ */
+static int yab_render_skip(void)
+{
+   if (yab_skip_env == -2)
+   {
+      const char *e = getenv("YAB_RENDER_SKIP");
+      yab_skip_env = (e && *e) ? atoi(e) : -1;
+   }
+
+   if (yab_skip_env >= 1)                 /* probe: fixed every-n-th cadence */
+   {
+      static int i = 0;
+      if (++i >= yab_skip_env) i = 0;
+      return i != 0;
+   }
+   if (!g_frameskip) return 0;
+
+   if (yab_skip_calls++ >= 30)
+   {
+      double period = (yab_machine_ms_ema > 16.7) ? yab_machine_ms_ema : 16.7;
+      double ratio  = (yab_render_ms_ema > 0.0) ? period / yab_render_ms_ema : 1.0;
+      yab_skip_calls = 0;
+      if (ratio > 1.0) ratio = 1.0;
+      if (ratio < 0.2) ratio = 0.2;       /* never fewer than 1 draw in 5 */
+      if (ratio != yab_draw_ratio)
+      {
+         printf("[FS] machine=%.2fms draw=%.2fms -> %.2f draws/frame (1 of %.2f)\n",
+                yab_machine_ms_ema, yab_render_ms_ema, ratio,
+                ratio > 0.0 ? 1.0 / ratio : 0.0);
+         fflush(stdout);
+      }
+      yab_draw_ratio = ratio;
+   }
+
+   yab_draw_acc += yab_draw_ratio;
+   if (yab_draw_acc >= 1.0) { yab_draw_acc -= 1.0; return 0; }   /* draw */
+   return 1;                                                     /* skip */
+}
+
+static void *yab_emu_main(void *arg)
+{
+   (void)arg;
+#ifdef YAB_HANGDBG
+   printf("[DBGT] emu thread tid=%d\n", (int)syscall(SYS_gettid));
+   fflush(stdout);
+   YABEMU("emu:start");
+#endif
+   /* This thread owns the live machine state; bind its thread-local copies. */
+   yab_bind_live_state();
+   for (;;)
+   {
+      int idx;
+      /* SAFE POINT: not touching machine state, so a pause request can be
+       * honoured here.  It has to be checked BEFORE waiting for a slot: while
+       * the frontend is parked it is not giving slots back, and a thread waiting
+       * for one would never reach the check (that deadlocked the first save
+       * state load). */
+      yab_emu_parked = 1;
+      while (yab_emu_paused)
+      {
+         if (!yab_emu_running) break;
+         usleep(500);
+      }
+      if (!yab_emu_running) break;
+      yab_emu_parked = 0;
+
+      YABEMU("emu:tryacquire");
+      idx = yab_frameslot_tryacquire();
+      if (idx < 0) { usleep(200); continue; }
+
+      yab_frameslot_set_current(idx);
+      /* Re-bind every frame: the engine can recreate its state buffers (a second
+       * context_reset does exactly that), and a stale binding means the machine
+       * writes VRAM into buffers nobody renders from -- measured as a nearly
+       * empty VRAM in the published slot and a black picture.
+       * Pointers only: the full bind also restores Vdp1External from the
+       * init-time snapshot, and doing that here wiped the VDP1 frame-change
+       * handshake (frame_change_plot/status/swap) that this thread updates once
+       * per frame and the frontend needs when it draws the slot -- measured as
+       * a title screen with no VDP1 layer at all. */
+      yab_bind_live_ptrs();
+      YABEMU("emu:handle-events");
+      if (yab_ft_on() || g_frameskip)
+      {
+         /* Also feeds the auto-frameskip ratio: the picture is only worth
+          * drawing while a draw fits in the frame the machine actually
+          * achieves. */
+         u64 _t0 = yab_ft_now();
+         if (PERCore) PERCore->HandleEvents();       /* one machine frame */
+         {
+            u64 _dt = yab_ft_now() - _t0;
+            double ms = (double)_dt / 1e6;
+            yab_machine_ms_ema = (yab_machine_ms_ema <= 0.0)
+                                   ? ms
+                                   : yab_machine_ms_ema + 0.1 * (ms - yab_machine_ms_ema);
+            if (yab_ft_on())
+               __atomic_add_fetch(&yab_ft_machine_ns, _dt, __ATOMIC_RELAXED);
+         }
+      }
+      else if (PERCore)
+         PERCore->HandleEvents();                    /* one machine frame */
+      YABEMU("emu:after-events");
+      yab_frameslot_set_current(-1);
+      sram_sync();
+   }
+   yab_emu_parked = 1;
+   return NULL;
+}
+
+static void yab_emu_start(void)
+{
+   if (yab_emu_running) return;
+   yab_frameslot_init();
+   yab_emu_paused = 0;
+   yab_emu_parked = 0;
+   yab_emu_running = 1;
+   pthread_create(&yab_emu_tid, NULL, yab_emu_main, NULL);
+#ifdef YAB_HANGDBG
+   yab_dbg_watchdog_start();
+#endif
+}
+
+static void yab_emu_stop(void)
+{
+   if (!yab_emu_running) return;
+   yab_emu_running = 0;
+   yab_emu_paused = 0;
+   pthread_join(yab_emu_tid, NULL);
+   yab_emu_parked = 1;
+}
+
+/* Stop the machine between frames so the frontend thread can touch state it
+ * owns (save states, reset, option changes that resize GL objects). */
+static void yab_emu_pause(void)
+{
+   int spins = 0;
+   if (!yab_emu_running) return;
+   yab_emu_paused = 1;
+   /* Bounded: if the machine cannot reach its safe point (it may be inside a
+    * long call), carry on after ~300 ms rather than blocking the frontend for
+    * ever.  A resize that races one frame is recoverable; a frozen frontend is
+    * not (measured: cold boot froze at the BIOS->game resolution change). */
+   while (!yab_emu_parked && ++spins < 1500) usleep(200);
+}
+
+static void yab_emu_resume(void)
+{
+   yab_emu_paused = 0;
+}
+
+static void stream_present(void)
+{
+   if (yk.frame_pending)
+   {
+
+      /* The worker has already blitted the finished frame into this slot's
+       * colour texture (yk_rt_blit_to_front), so presenting is just announcing
+       * the hw framebuffer. */
+      video_cb(RETRO_HW_FRAME_BUFFER_VALID, current_width, current_height, 0);
+      one_frame_rendered = true;
+   }
+   if (!one_frame_rendered)
+      video_cb(NULL, current_width, current_height, 0);
+   yab_pic_pending = 0;
+   /* The frontend advances its hw-render ring slot on every presented frame, so
+    * the core has to follow it in BOTH modes: without this the worker keeps
+    * blitting into the slot it saw at init while the frontend presents the next
+    * one (measured on Golden Axe: a solid green screen, because the slot being
+    * shown was never written). */
+   if (one_frame_rendered)
+      yk_adopt_front_fbo();
+   yk.frame_pending = 0;
+}
+
 void retro_run(void)
 {
    unsigned i;
    bool updated  = false;
    one_frame_rendered = false;
+
+#ifdef YAB_HANGDBG
+   {
+      static int once = 0;
+      if (!once) { once = 1; printf("[DBGT] front thread tid=%d\n", (int)syscall(SYS_gettid)); fflush(stdout); }
+   }
+   YABFRONT("retro_run:begin");
+#endif
 
    if (!all_devices_ready)
    {
@@ -2886,17 +3380,102 @@ void retro_run(void)
       set_descriptors();
    }
 
+   /* Async emulation (flycast model): the machine runs on the emu thread and
+    * has already published this frame, so all that is left here is the GL draw
+    * and the present.  Everything the frontend owns (its hw-render ring, the
+    * GL context) is therefore touched by one thread only. */
+   if (g_vdp_async)
+   {
+      if (yk.res_pending)
+      {
+         /* Deferred resolution change: outside the render call stack and with
+          * the machine parked, so YglGLInit() does not tear down GL objects a
+          * frame in progress is using. */
+         yk.res_pending = 0;
+         yab_emu_pause();
+         retro_set_resolution();
+         yab_emu_resume();
+      }
+      if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE_UPDATE, &updated) && updated)
+      {
+         /* Option changes rebuild GL objects and may resize the engine's
+          * framebuffers: park the machine so it is not mid-frame. */
+         int prev_resolution_mode = resolution_mode;
+         int prev_multitap[2] = {multitap[0],multitap[1]};
+         bool prev_service_enabled = service_enabled;
+         yab_emu_pause();
+         check_variables();
+         if(prev_resolution_mode != resolution_mode)
+            retro_set_resolution();
+         VIDCore->SetSettingValue(VDP_SETTING_RBG_RESOLUTION_MODE, g_rbg_resolution_mode);
+         VIDCore->SetSettingValue(VDP_SETTING_RBG_USE_COMPUTESHADER, g_rbg_use_compute_shader);
+         if(PERCore && (prev_multitap[0] != multitap[0] || prev_multitap[1] != multitap[1]
+                        || prev_service_enabled != service_enabled))
+            PERCore->Init();
+         yab_emu_resume();
+      }
+
+      {
+         int idx;
+         YABFRONT("retro_run:wait-slot");
+         if (yab_ft_on())
+         {
+            u64 _t0 = yab_ft_now();
+            idx = yab_frameslot_wait();
+            __atomic_add_fetch(&yab_ft_wait_ns, yab_ft_now() - _t0, __ATOMIC_RELAXED);
+         }
+         else
+            idx = yab_frameslot_wait();
+         /* Auto Frameskip: skip the draw, keep the emulation, and hand the
+          * frontend a duplicate picture (video_cb(NULL)) so its per-present
+          * accounting still ticks every emulated frame.  The frontend is
+          * expected to recognise the NULL as "do not present, count it as a
+          * machine frame only"; that is what lets it report the machine rate
+          * (frames) and the real picture rate (new pictures) side by side.
+          * Until it does, the duplicate is presented as-is (the same path a
+          * blanked display already uses), which reads as the machine rate. */
+         if (yab_render_skip())
+         {
+            YABFRONT("retro_run:skip-slot");
+            yab_frameslot_release(idx);
+            video_cb(NULL, current_width, current_height, 0);
+            yab_ft_report();
+            return;
+         }
+         YABFRONT("retro_run:render-slot");
+         {
+            u64 _t0 = yab_ft_now();
+            yab_render_slot(idx);    /* GL + YuiSwapBuffers -> video_cb */
+            {
+               u64 _dt = yab_ft_now() - _t0;
+               double ms = (double)_dt / 1e6;
+               yab_render_ms_ema = (yab_render_ms_ema <= 0.0)
+                                     ? ms
+                                     : yab_render_ms_ema + 0.1 * (ms - yab_render_ms_ema);
+               if (yab_ft_on())
+                  __atomic_add_fetch(&yab_ft_render_ns, _dt, __ATOMIC_RELAXED);
+            }
+         }
+         if (!one_frame_rendered)
+            /* Display off for this frame (Vdp2DrawEnd returns before YglRender,
+             * so nothing presents): hand the frontend a duplicate so it keeps
+             * its own clock and overlay alive instead of freezing on the last
+             * picture. */
+            video_cb(NULL, current_width, current_height, 0);
+         else
+            /* The frontend advanced its hw-render ring inside that video_cb, so
+             * pick up the texture it will show next. */
+            yk_adopt_front_fbo();
+         YABFRONT("retro_run:release-slot");
+         yab_frameslot_release(idx);
+         YABFRONT("retro_run:end");
+         yab_ft_report();
+      }
+      return;
+   }
+
    if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE_UPDATE, &updated) && updated)
    {
-      if (g_vdp_async)
-      {
-         /* Resolution/filter changes touch GL: borrow the shared context from
-          * the VDP thread for the duration (standalone pattern:
-          * retro_arena/main.cpp VdpRevoke() -> MakeCurrent(main) -> ... ->
-          * MakeCurrent(NULL) -> VdpResume()). */
-         VdpRevoke();
-         yk_attach();
-      }
       int prev_resolution_mode = resolution_mode;
       int prev_multitap[2] = {multitap[0],multitap[1]};
       bool prev_service_enabled = service_enabled;
@@ -2910,10 +3489,6 @@ void retro_run(void)
       if(PERCore && (prev_multitap[0] != multitap[0] || prev_multitap[1] != multitap[1]
                      || prev_service_enabled != service_enabled))
          PERCore->Init();
-      if(g_frame_skip == 1)
-         EnableAutoFrameSkip();
-      else
-         DisableAutoFrameSkip();
       if (g_vdp_async)
       {
          yk_detach();
@@ -2921,13 +3496,39 @@ void retro_run(void)
       }
    }
 
-   //YabauseExec(); runs from handle events
-   if(PERCore)
+   if (g_vdp_async && yab_nowait())
+   {
+      /* Order matters: hand the finished picture to the frontend first, then
+       * post this frame, so the worker renders into a slot the frontend is done
+       * with and has a whole frame to do it. */
+      stream_present();
+      vdp2PostStaged();      /* composite of the frame staged at the last vblank */
+   }
+
+   /* Present-loop: keep advancing whole machine frames until one is actually
+    * presented, then return.  A retro_run that produced no new picture only
+    * makes the frontend re-present the previous frame and count it as a frame,
+    * which is why the frontend's fps read as the machine rate instead of the
+    * real picture rate.  A blanked display (TVMD bit15 clear) produces such a
+    * frame; VDP2 frameskip is gone (the frontend paces retro_run).
+    *
+    * No iteration cap: if the machine never presents, it never returns -- the
+    * same wedge would happen inside the frontend's own loop anyway. */
+   for (;;)
+   {
+      if (!PERCore) break;
       PERCore->HandleEvents();
 
-   /* Keep the frontend's SAVE_RAM (.srm) and the live backup RAM in sync.  Runs
-    * on the same thread that just emulated the frame, so no locking is needed. */
-   sram_sync();
+      /* Keep the frontend's SAVE_RAM (.srm) and the live backup RAM in sync.
+       * Runs on the same thread that just emulated the frame, no locking. */
+      sram_sync();
+
+      /* YAB_NOWAIT=1: the render thread is not waited for, so a picture may not
+       * exist yet; run exactly one machine frame per call and let the video
+       * path below send a dupe (the frontend re-presents the last picture). */
+      if (yab_nowait()) break;
+      if (yk.frame_pending || one_frame_rendered) break;   /* a picture exists */
+   }
 
    /* Async renderer only: the VDP thread just marks frames, and the libretro
     * contract wants video_cb (and the frontend's shader chain + swap it
@@ -2937,6 +3538,17 @@ void retro_run(void)
       yk.res_pending = 0;
       YK_TRACE("res_pending begin cur_w=%dx%d now=%p", game_width, game_height,
             (void *)(yk.GetCurrentContext ? yk.GetCurrentContext() : NULL));
+      /* Render-ahead and resolution changes do not mix yet: the resize re-attaches
+       * the mirror's depth/stencil and rebuilds the engine's GL objects, and doing
+       * that while the render thread keeps drawing crashes libmali (measured:
+       * SEGV right after "mirror depth/stencil" in every title that switches
+       * resolution, while the same title on the sync path is fine).  Fall back to
+       * the proven sync path for the rest of this session -- VdpRevoke() then
+       * serialises with the render thread exactly as before. */
+      /* The resolution change itself is safe now that every engine thread binds
+       * its own state pointers; the old "fall back to sync forever" workaround is
+       * no longer needed (it disabled render-ahead for any title that switches
+       * modes, which is nearly all of them). */
       VdpRevoke();
       {
          int attach_ok = yk_attach();
@@ -2950,6 +3562,14 @@ void retro_run(void)
                    yk.mirror_rb_w, yk.mirror_rb_h,
                    (unsigned)yk.front_fbo, (unsigned)yk.front_tex,
                    yk.front_tex_w, yk.front_tex_h);
+         /* yk_attach returns 0 on success (including "already ours") and -1 on
+          * failure; with a failed attach, GL must not be touched at all. */
+         if (attach_ok < 0)
+         {
+            yk.res_pending = 1;   /* retry on the next frame */
+            VdpResume();
+            goto res_done;
+         }
       }
       YK_TRACE("res_pending engine-GL start now=%p (sub=%p)", 
             (void *)(yk.GetCurrentContext ? yk.GetCurrentContext() : NULL), (void *)yk.ctx_sub);
@@ -2975,21 +3595,16 @@ void retro_run(void)
       yk_detach();
       VdpResume();
    }
+res_done:;
+   /* Async picture delivery: at the END of the call normally, at the START
+    * when YAB_NOWAIT is on (see stream_present()). */
    if (g_vdp_async)
    {
-      if (yk.frame_pending)
-      {
-         video_cb(RETRO_HW_FRAME_BUFFER_VALID, current_width, current_height, 0);
-         one_frame_rendered = true;
-      }
-      if (!one_frame_rendered)
-         video_cb(NULL, current_width, current_height, 0);
-      /* The frontend presented in video_cb() and advanced its hw-render ring
-       * slot; adopt the new slot's texture so the VDP thread's NEXT frame lands
-       * in a different slot than the one just presented (YuiRetargetFB applies
-       * it at the top of the next YglRender). */
-      yk_adopt_front_fbo();
-      yk.frame_pending = 0;
+      /* nowait: the picture was already handed over at the START of this call,
+       * so nothing is delivered here (the old `else` below also ran for nowait
+       * and sent a second, dupe video_cb for every call). */
+      if (!yab_nowait())
+         stream_present();
    }
    else
    {

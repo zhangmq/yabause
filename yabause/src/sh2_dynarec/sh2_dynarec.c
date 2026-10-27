@@ -140,7 +140,7 @@ struct ll_entry
   extern int slave_pc; // Virtual PC
   extern void * slave_ip; // Translated PC
   extern u8 restore_candidate[512];
-  extern u8 * Vdp1Ram;
+  extern __thread u8 * Vdp1Ram;
 
   /* registers that may be allocated */
   /* 0-15 gpr */

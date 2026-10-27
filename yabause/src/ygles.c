@@ -34,6 +34,11 @@
 //#define YGLLOG yprintf
 
 extern u8 *Vdp1FrameBuffer[];
+#ifdef YAB_VDP1DBG
+int yab_dbg_v1_quads = 0;   /* triangles submitted to the VDP1 framebuffer */
+int yab_dbg_v1_fbpix = -1;  /* non-black pixels in the VDP1 framebuffer */
+u32 yab_dbg_v1_fbsum = 0;
+#endif
 static int rebuild_frame_buffer = 0;
 
 static int YglIsNeedFrameBuffer();
@@ -1040,6 +1045,254 @@ void YglDrawCpuFramebufferWrite(int target)
   glBindFramebuffer(GL_FRAMEBUFFER, drawFboId);
 }
 
+
+/* ---------------------------------------------------------------------------
+ * VDP1 framebuffer readback to CPU.
+ *
+ * A game reads VDP1 VRAM's framebuffer window (0x05C80000..) through
+ * Vdp1FrameBufferReadWord(), and the only authoritative copy of what VDP1
+ * rasterised is the GL texture.  The synchronous renderer runs the SH-2 on the
+ * GL thread, so it can read the texture directly (that is the old path, kept
+ * unchanged below).  With the async renderer the SH-2 has its own thread with
+ * no EGL context: every GL call there is a no-op, which is exactly how
+ * batmanfr aborted at frame ~2071 (glGenTextures/glGenFramebuffers returned 0,
+ * glCheckFramebufferStatus() returned 0, the defensive abort() fired).
+ *
+ * The core option "yabasanshiro_vdp1_fb_readback" decides what the SH-2 reads:
+ *   enabled  - whenever the render thread finishes rasterising a frame it
+ *              copies that framebuffer into a CPU snapshot
+ *              (YglVdp1PublishCpu from VIDOGLVdp1DrawEnd), and the SH-2 decodes
+ *              the snapshot.  One glReadPixels+PBO map per rendered frame
+ *              (measured ~0.49 ms at 352x224, ~1.7 ms at 704x448).
+ *   disabled - the SH-2 decodes the CPU shadow buffer Vdp1FrameBuffer[], i.e.
+ *              only what the game itself wrote through the CPU.  For a game
+ *              whose frames are GL-rasterised that is normally blank, so a
+ *              screen capture comes back empty -- but nothing issues GL off the
+ *              GL thread and the game keeps running.
+ *
+ * Snapshots are per drawframe (the hardware exposes only the drawing frame
+ * buffer) and double buffered: the render thread fills vdp1_fb_back[df] and
+ * swaps it into vdp1_fb_cpu[df] once complete, so a reader that started earlier
+ * keeps a consistent buffer.  A single read burst is far shorter than a frame,
+ * so the writer cannot lap the reader.
+ * ------------------------------------------------------------------------- */
+
+static int YglVdp1ReadbackInit(void)
+{
+  GLuint error;
+  char *buf;
+  int status;
+
+  if (_Ygl->smallfbo != 0)
+    return 0;
+
+  glGenTextures(1, &_Ygl->smallfbotex);
+  YGLDEBUG("glGenTextures %d\n", _Ygl->smallfbotex);
+  glActiveTexture(GL_TEXTURE0);
+  glBindTexture(GL_TEXTURE_2D, _Ygl->smallfbotex);
+  glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+  glUnmapBuffer(GL_PIXEL_UNPACK_BUFFER);
+  glGetError();
+  buf = malloc(_Ygl->rwidth * _Ygl->rheight * 4);
+  if (buf == NULL)
+    return -1;
+  memset(buf, 0, _Ygl->rwidth * _Ygl->rheight * 4);
+  glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, _Ygl->rwidth, _Ygl->rheight, 0, GL_RGBA, GL_UNSIGNED_BYTE, buf);
+  free(buf);
+  if ((error = glGetError()) != GL_NO_ERROR)
+  {
+    YGLDEBUG("Fail on VIDOGLVdp1ReadFrameBuffer at %d %04X %d %d", __LINE__, error, _Ygl->rwidth, _Ygl->rheight);
+    return -1;
+  }
+  YGLDEBUG("glTexImage2D %d\n", _Ygl->smallfbotex);
+  glGenFramebuffers(1, &_Ygl->smallfbo);
+  YGLDEBUG("glGenFramebuffers %d\n", _Ygl->smallfbo);
+  glBindFramebuffer(GL_FRAMEBUFFER, _Ygl->smallfbo);
+  glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, _Ygl->smallfbotex, 0);
+  status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+  if (status != GL_FRAMEBUFFER_COMPLETE)
+  {
+    YGLLOG("YglRenderVDP1: Framebuffer status = %08X\n", status);
+    glBindFramebuffer(GL_FRAMEBUFFER, _Ygl->default_fbo);
+    glDeleteFramebuffers(1, &_Ygl->smallfbo);
+    _Ygl->smallfbo = 0;
+    glDeleteTextures(1, &_Ygl->smallfbotex);
+    _Ygl->smallfbotex = 0;
+    return -1;
+  }
+
+  glGenBuffers(1, &_Ygl->vdp1pixelBufferID);
+  if ((error = glGetError()) != GL_NO_ERROR)
+  {
+    YGLDEBUG("Fail on VIDOGLVdp1ReadFrameBuffer at %d %04X", __LINE__, error);
+    glBindFramebuffer(GL_FRAMEBUFFER, _Ygl->default_fbo);
+    glDeleteFramebuffers(1, &_Ygl->smallfbo);
+    _Ygl->smallfbo = 0;
+    glDeleteTextures(1, &_Ygl->smallfbotex);
+    _Ygl->smallfbotex = 0;
+    return -1;
+  }
+  YGLDEBUG("glGenBuffers %d\n", _Ygl->vdp1pixelBufferID);
+  if (_Ygl->vdp1pixelBufferID == 0)
+  {
+    YGLLOG("Fail to glGenBuffers %X", glGetError());
+    glBindFramebuffer(GL_FRAMEBUFFER, _Ygl->default_fbo);
+    glDeleteFramebuffers(1, &_Ygl->smallfbo);
+    _Ygl->smallfbo = 0;
+    glDeleteTextures(1, &_Ygl->smallfbotex);
+    _Ygl->smallfbotex = 0;
+    return -1;
+  }
+  glBindBuffer(GL_PIXEL_PACK_BUFFER, _Ygl->vdp1pixelBufferID);
+  glBufferData(GL_PIXEL_PACK_BUFFER, _Ygl->rwidth * _Ygl->rheight * 4, NULL, GL_STATIC_READ);
+  glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+  glBindFramebuffer(GL_FRAMEBUFFER, _Ygl->default_fbo);
+  return 0;
+}
+
+/* Blit the given VDP1 framebuffer into smallfbo, read it into the PBO and map
+ * it.  Returns the mapped RGBA8 pixels (row 0 = bottom) or NULL.  The mapping
+ * stays in _Ygl->pFrameBuffer; the caller decides when to release it. */
+/* Scale the given VDP1 framebuffer into smallfbo, ready to be read back. */
+static void YglVdp1BlitToSmall(int df)
+{
+  int params[4];
+
+  glGetIntegerv(GL_VIEWPORT, params);
+  glViewport(0, 0, _Ygl->rwidth, _Ygl->rheight);
+  glScissor(0, 0, _Ygl->rwidth, _Ygl->rheight);
+  glDisable(GL_SCISSOR_TEST);
+  YglBlitFramebuffer(_Ygl->vdp1FrameBuff[df], _Ygl->smallfbo,
+      (float)_Ygl->rwidth / (float)_Ygl->width,
+      (float)_Ygl->rheight / (float)_Ygl->height);
+  glViewport(params[0], params[1], params[2], params[3]);
+}
+
+static const unsigned char *YglVdp1ReadbackMap(int df)
+{
+  FrameProfileAdd("ReadFrameBuffer start");
+  FRAMELOG("READ FRAME");
+  if (_Ygl->sync != 0)
+  {
+    /* The explicit wait belongs to the old worker hand-off, where the drawing
+     * was submitted by another thread.  In the async per-frame download the
+     * blit/read are ordered after the draws by the GL command stream of the
+     * very same context.  Release the fence either way so it does not leak. */
+    if (!g_vdp_async)
+      glWaitSync(_Ygl->sync, 0, GL_TIMEOUT_IGNORED);
+    glDeleteSync(_Ygl->sync);
+    _Ygl->sync = 0;
+  }
+
+  YglVdp1BlitToSmall(df);
+  glBindFramebuffer(GL_FRAMEBUFFER, _Ygl->smallfbo);
+  glBindBuffer(GL_PIXEL_PACK_BUFFER, _Ygl->vdp1pixelBufferID);
+  glReadPixels(0, 0, _Ygl->rwidth, _Ygl->rheight, GL_RGBA, GL_UNSIGNED_BYTE, 0);
+  _Ygl->pFrameBuffer = (unsigned int *)glMapBufferRange(GL_PIXEL_PACK_BUFFER, 0,
+      _Ygl->rwidth * _Ygl->rheight * 4, GL_MAP_READ_BIT);
+  glBindFramebuffer(GL_FRAMEBUFFER, _Ygl->default_fbo);
+  FrameProfileAdd("ReadFrameBuffer unlock");
+  return (const unsigned char *)_Ygl->pFrameBuffer;
+}
+
+static void YglVdp1ReadbackUnmap(void)
+{
+  if (_Ygl->pFrameBuffer != NULL)
+  {
+    glBindBuffer(GL_PIXEL_PACK_BUFFER, _Ygl->vdp1pixelBufferID);
+    glUnmapBuffer(GL_PIXEL_PACK_BUFFER);
+    glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+    _Ygl->pFrameBuffer = NULL;
+  }
+}
+
+/* Copy the mapped pixels into the per-drawframe snapshot and publish it. */
+static void YglVdp1PublishPixels(int df, const unsigned char *src, size_t bytes)
+{
+  int w = _Ygl->rwidth;
+  int h = _Ygl->rheight;
+
+  if (_Ygl->vdp1_fb_w[df] != w || _Ygl->vdp1_fb_h[df] != h)
+  {
+    free(_Ygl->vdp1_fb_cpu[df]);
+    free(_Ygl->vdp1_fb_back[df]);
+    _Ygl->vdp1_fb_cpu[df] = (unsigned char *)malloc(bytes);
+    _Ygl->vdp1_fb_back[df] = (unsigned char *)malloc(bytes);
+    _Ygl->vdp1_fb_w[df] = w;
+    _Ygl->vdp1_fb_h[df] = h;
+    _Ygl->vdp1_fb_ready[df] = 0;
+    if (_Ygl->vdp1_fb_cpu[df] == NULL || _Ygl->vdp1_fb_back[df] == NULL)
+    {
+      free(_Ygl->vdp1_fb_cpu[df]);
+      free(_Ygl->vdp1_fb_back[df]);
+      _Ygl->vdp1_fb_cpu[df] = NULL;
+      _Ygl->vdp1_fb_back[df] = NULL;
+      return;
+    }
+  }
+
+  memcpy(_Ygl->vdp1_fb_back[df], src, bytes);
+  {
+    unsigned char *tmp = _Ygl->vdp1_fb_cpu[df];
+    _Ygl->vdp1_fb_cpu[df] = _Ygl->vdp1_fb_back[df];
+    _Ygl->vdp1_fb_back[df] = tmp;
+  }
+  _Ygl->vdp1_fb_ready[df] = 1;
+}
+
+/* Render thread: called once per rendered frame, right after the VDP1
+ * framebuffer was drawn.  Copies that framebuffer into the CPU snapshot the
+ * SH-2 decodes.  No-op unless the async renderer and the readback option are
+ * on.  Straightforward on purpose: this is a corner case (one title), so it
+ * reads and maps in one go instead of carrying a deferred pipeline. */
+void YglVdp1PublishCpu(int df)
+{
+  const unsigned char *px;
+  size_t bytes;
+  int w, h;
+
+  if (!g_vdp_async || !yab_vdp1_fb_readback)
+    return;
+  if (df < 0 || df > 1)
+    return;
+  if (YglVdp1ReadbackInit() != 0)
+  {
+    static int warned;
+    if (!warned)
+    {
+      YGLLOG("VDP1 readback: GL objects unavailable, SH-2 will read the CPU shadow\n");
+      warned = 1;
+    }
+    return;
+  }
+
+  w = _Ygl->rwidth;
+  h = _Ygl->rheight;
+  bytes = (size_t)w * (size_t)h * 4;
+
+  px = YglVdp1ReadbackMap(df);
+  if (px == NULL)
+  {
+    YglVdp1ReadbackUnmap();
+    return;
+  }
+  YglVdp1PublishPixels(df, px, bytes);
+  YglVdp1ReadbackUnmap();
+}
+
+/* Emulation thread: the snapshot for this drawframe, or NULL when the option is
+ * off / no frame has been published yet at the current resolution. */
+static const unsigned char *YglVdp1CpuSnapshot(int df)
+{
+  if (df < 0 || df > 1)
+    return NULL;
+  if (!_Ygl->vdp1_fb_ready[df])
+    return NULL;
+  if (_Ygl->vdp1_fb_w[df] != _Ygl->rwidth || _Ygl->vdp1_fb_h[df] != _Ygl->rheight)
+    return NULL;
+  return _Ygl->vdp1_fb_cpu[df];
+}
+
 void VIDOGLVdp1ReadFrameBuffer(u32 type, u32 addr, void *out)
 {
   u32 x = 0;
@@ -1069,7 +1322,40 @@ void VIDOGLVdp1ReadFrameBuffer(u32 type, u32 addr, void *out)
 
   const int Line = y;
   const int Pix = x;
-  if (_Ygl->cpu_framebuffer_write[_Ygl->drawframe] || (Pix >= Vdp1Regs->systemclipX2 || Line >= Vdp1Regs->systemclipY2))
+  /* Pixel source (see the readback helpers above):
+   *  - the CPU shadow, when the game wrote this framebuffer through the CPU or
+   *    the pixel is outside the system clip;
+   *  - async renderer: never GL on this thread, so decode the snapshot the
+   *    render thread publishes while the readback option is on, and fall back
+   *    to the CPU shadow (blank for a GL-drawn frame) when it is off;
+   *  - sync renderer: the GL readback below, on this (the GL) thread. */
+  int cpu_shadow = (_Ygl->cpu_framebuffer_write[_Ygl->drawframe] ||
+                    (Pix >= Vdp1Regs->systemclipX2 || Line >= Vdp1Regs->systemclipY2));
+  const unsigned char *fb = NULL;
+  if (g_vdp_async && !cpu_shadow)
+  {
+    if (yab_vdp1_fb_readback)
+      fb = YglVdp1CpuSnapshot(_Ygl->drawframe);
+    if (fb == NULL)
+    {
+      /* Readback off (or no snapshot yet): the pixels VDP1 rasterised live in
+       * the GPU and are not reachable from this thread.  Return an empty value
+       * instead of the CPU shadow, so "no readback" really means "no pixels" --
+       * the shadow would hand back whatever the game happened to write through
+       * the CPU long ago, which hides the difference under test.  (The
+       * CPU-written / outside-clip case above is not a readback and keeps
+       * reading the shadow.) */
+      switch (type)
+      {
+      case 0: *(u8 *)out = 0; break;
+      case 1: *(u16 *)out = 0; break;
+      case 2: *(u32 *)out = 0; break;
+      default: break;
+      }
+      return;
+    }
+  }
+  if (cpu_shadow)
   {
     switch (type)
     {
@@ -1088,116 +1374,48 @@ void VIDOGLVdp1ReadFrameBuffer(u32 type, u32 addr, void *out)
     return;
   }
 
-  if (_Ygl->smallfbo == 0)
+  int locked = 0;
+  if (!g_vdp_async)
   {
-    GLuint error;
     YabThreadLock(_Ygl->mutex);
-    glGenTextures(1, &_Ygl->smallfbotex);
-    YGLDEBUG("glGenTextures %d\n", _Ygl->smallfbotex);
-    glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, _Ygl->smallfbotex);
-    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
-    glUnmapBuffer(GL_PIXEL_UNPACK_BUFFER);
-    glGetError();
-    char *buf = malloc(_Ygl->rwidth * _Ygl->rheight * 4);
-    memset(buf, 0, _Ygl->rwidth * _Ygl->rheight * 4);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, _Ygl->rwidth, _Ygl->rheight, 0, GL_RGBA, GL_UNSIGNED_BYTE, buf);
-    free(buf);
-    if ((error = glGetError()) != GL_NO_ERROR)
+    if (YglVdp1ReadbackInit() != 0)
     {
-      YGLDEBUG("Fail on VIDOGLVdp1ReadFrameBuffer at %d %04X %d %d", __LINE__, error, _Ygl->rwidth, _Ygl->rheight);
+      YabThreadUnLock(_Ygl->mutex);
+      /* Unchanged defensive behaviour for the synchronous path: without these
+       * objects every pixel would be garbage. */
       abort();
     }
-    YGLDEBUG("glTexImage2D %d\n", _Ygl->smallfbotex);
-    glGenFramebuffers(1, &_Ygl->smallfbo);
-    YGLDEBUG("glGenFramebuffers %d\n", _Ygl->smallfbo);
-    glBindFramebuffer(GL_FRAMEBUFFER, _Ygl->smallfbo);
-    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, _Ygl->smallfbotex, 0);
-    int status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
-    if (status != GL_FRAMEBUFFER_COMPLETE)
-    {
-      YGLLOG("YglRenderVDP1: Framebuffer status = %08X\n", status);
-      abort();
-    }
-    else
-    {
-      // YGLLOG("Framebuffer status OK = %08X\n", status );
-    }
-
-    glGenBuffers(1, &_Ygl->vdp1pixelBufferID);
-    if ((error = glGetError()) != GL_NO_ERROR)
-    {
-      YGLDEBUG("Fail on VIDOGLVdp1ReadFrameBuffer at %d %04X", __LINE__, error);
-      abort();
-    }
-    YGLDEBUG("glGenBuffers %d\n", _Ygl->vdp1pixelBufferID);
-    if (_Ygl->vdp1pixelBufferID == 0)
-    {
-      YGLLOG("Fail to glGenBuffers %X", glGetError());
-      abort();
-    }
-    glBindBuffer(GL_PIXEL_PACK_BUFFER, _Ygl->vdp1pixelBufferID);
-    glBufferData(GL_PIXEL_PACK_BUFFER, _Ygl->rwidth * _Ygl->rheight * 4, NULL, GL_STATIC_READ);
-    glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
-    glBindFramebuffer(GL_FRAMEBUFFER, _Ygl->default_fbo);
     YabThreadUnLock(_Ygl->mutex);
-  }
 
-  while (_Ygl->vpd1_running)
-  {
-    YabThreadYield();
-  }
-
-  YabThreadLock(_Ygl->mutex);
-  if (_Ygl->pFrameBuffer == NULL)
-  {
-    FrameProfileAdd("ReadFrameBuffer start");
-    FRAMELOG("READ FRAME");
-    if (_Ygl->sync != 0)
+    while (_Ygl->vpd1_running)
     {
-      glWaitSync(_Ygl->sync, 0, GL_TIMEOUT_IGNORED);
-      glDeleteSync(_Ygl->sync);
-      _Ygl->sync = 0;
+      YabThreadYield();
     }
 
-#if 0
-    glBindFramebuffer(GL_FRAMEBUFFER, _Ygl->vdp1fbo);
-    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, _Ygl->vdp1FrameBuff[_Ygl->drawframe], 0);
-    glBindFramebuffer(GL_READ_FRAMEBUFFER, _Ygl->vdp1fbo);
-    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, _Ygl->smallfbo);
-    glBlitFramebuffer(0, 0, GlWidth, GlHeight, 0, 0, _Ygl->rwidth, _Ygl->rheight, GL_COLOR_BUFFER_BIT, GL_LINEAR);
-#else
-    int params[4];
-    glGetIntegerv(GL_VIEWPORT, params);
-    glViewport(0, 0, _Ygl->rwidth, _Ygl->rheight);
-    glScissor(0, 0, _Ygl->rwidth, _Ygl->rheight);
-    glDisable(GL_SCISSOR_TEST);
-    YglBlitFramebuffer(_Ygl->vdp1FrameBuff[_Ygl->drawframe], _Ygl->smallfbo, (float)_Ygl->rwidth / (float)_Ygl->width, (float)_Ygl->rheight / (float)_Ygl->height);
-#endif
-    YGLLOG("VIDOGLVdp1ReadFrameBuffer %d %08X\n", _Ygl->drawframe, addr);
-    FrameProfileAdd("ReadFrameBuffer unlock");
-    glBindFramebuffer(GL_FRAMEBUFFER, _Ygl->smallfbo);
-    glBindBuffer(GL_PIXEL_PACK_BUFFER, _Ygl->vdp1pixelBufferID);
-    glReadPixels(0, 0, _Ygl->rwidth, _Ygl->rheight, GL_RGBA, GL_UNSIGNED_BYTE, 0);
-    _Ygl->pFrameBuffer = (unsigned int *)glMapBufferRange(GL_PIXEL_PACK_BUFFER, 0, _Ygl->rwidth * (_Ygl->rheight) * 4, GL_MAP_READ_BIT);
-    glBindFramebuffer(GL_FRAMEBUFFER, _Ygl->default_fbo);
-    glViewport(params[0], params[1], params[2], params[3]);
-
+    YabThreadLock(_Ygl->mutex);
+    locked = 1;
     if (_Ygl->pFrameBuffer == NULL)
     {
-      switch (type)
+      YGLLOG("VIDOGLVdp1ReadFrameBuffer %d %08X\n", _Ygl->drawframe, addr);
+      fb = YglVdp1ReadbackMap(_Ygl->drawframe);
+      if (fb == NULL)
       {
-      case 1:
-        *(u16 *)out = 0x0000;
-        break;
-      case 2:
-        *(u32 *)out = 0x00000000;
-        break;
+        switch (type)
+        {
+        case 1:
+          *(u16 *)out = 0x0000;
+          break;
+        case 2:
+          *(u32 *)out = 0x00000000;
+          break;
+        }
+        YabThreadUnLock(_Ygl->mutex);
+        return;
       }
-      YabThreadUnLock(_Ygl->mutex);
-      return;
+      FrameProfileAdd("ReadFrameBuffer end");
     }
-    FrameProfileAdd("ReadFrameBuffer end");
+    else
+      fb = (const unsigned char *)_Ygl->pFrameBuffer;
   }
 
   int index;
@@ -1218,10 +1436,10 @@ void VIDOGLVdp1ReadFrameBuffer(u32 type, u32 addr, void *out)
     {
     case 1:
     {
-      u8 r = *((u8 *)(_Ygl->pFrameBuffer) + index);
-      u16 g = *((u8 *)(_Ygl->pFrameBuffer) + index + 1);
-      u8 b = *((u8 *)(_Ygl->pFrameBuffer) + index + 2);
-      u16 a = *((u8 *)(_Ygl->pFrameBuffer) + index + 3);
+      u8 r = *((u8 *)(fb) + index);
+      u16 g = *((u8 *)(fb) + index + 1);
+      u8 b = *((u8 *)(fb) + index + 2);
+      u16 a = *((u8 *)(fb) + index + 3);
       if ((a & 0x40) == 0)
       {
         *(u16 *)out = ((r >> 3) & 0x1f) | (((g >> 3) & 0x1f) << 5) | (((b >> 3) & 0x1F) << 10) | 0x8000;
@@ -1247,12 +1465,12 @@ void VIDOGLVdp1ReadFrameBuffer(u32 type, u32 addr, void *out)
     break;
     case 2:
     {
-      u32 r = *((u8 *)(_Ygl->pFrameBuffer) + index);
-      u32 g = *((u8 *)(_Ygl->pFrameBuffer) + index + 1);
-      u32 b = *((u8 *)(_Ygl->pFrameBuffer) + index + 2);
-      u32 r2 = *((u8 *)(_Ygl->pFrameBuffer) + index + 4);
-      u32 g2 = *((u8 *)(_Ygl->pFrameBuffer) + index + 5);
-      u32 b2 = *((u8 *)(_Ygl->pFrameBuffer) + index + 6);
+      u32 r = *((u8 *)(fb) + index);
+      u32 g = *((u8 *)(fb) + index + 1);
+      u32 b = *((u8 *)(fb) + index + 2);
+      u32 r2 = *((u8 *)(fb) + index + 4);
+      u32 g2 = *((u8 *)(fb) + index + 5);
+      u32 b2 = *((u8 *)(fb) + index + 6);
       /*  BBBBBGGGGGRRRRR */
       *(u32 *)out = (((r2 >> 3) & 0x1f) | (((g2 >> 3) & 0x1f) << 5) | (((b2 >> 3) & 0x1F) << 10) | 0x8000) |
                     ((((r >> 3) & 0x1f) | (((g >> 3) & 0x1f) << 5) | (((b >> 3) & 0x1F) << 10) | 0x8000) << 16);
@@ -1263,11 +1481,12 @@ void VIDOGLVdp1ReadFrameBuffer(u32 type, u32 addr, void *out)
   // 8bitmode
   else
   {
-    u16 r = *((u8 *)(_Ygl->pFrameBuffer) + index);
-    u16 r2 = *((u8 *)(_Ygl->pFrameBuffer) + index + 4);
+    u16 r = *((u8 *)(fb) + index);
+    u16 r2 = *((u8 *)(fb) + index + 4);
     *(u16 *)out = (r << 8) | (r2 << 0);
   }
-  YabThreadUnLock(_Ygl->mutex);
+  if (locked)
+    YabThreadUnLock(_Ygl->mutex);
 }
 
 //////////////////////////////////////////////////////////////////////////////
@@ -1730,6 +1949,11 @@ void YglDeInit(void)
       }
       free(_Ygl->levels);
     }
+
+    free(_Ygl->vdp1_fb_cpu[0]);
+    free(_Ygl->vdp1_fb_back[0]);
+    free(_Ygl->vdp1_fb_cpu[1]);
+    free(_Ygl->vdp1_fb_back[1]);
 
     free(_Ygl);
   }
@@ -3332,6 +3556,15 @@ void YglRenderVDP1(void)
   glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, _Ygl->rboid_depth);
   glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_STENCIL_ATTACHMENT, GL_RENDERBUFFER, _Ygl->rboid_stencil);
   status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+#ifdef YAB_VDP1DBG
+  { static int cnt = 0; if ((cnt++ % 10) == 0) {
+      printf("[V4] render fbo_status=%08X w=%d h=%d draw=%d read=%d tex0=%d tex1=%d depth=%d stencil=%d\n",
+             (unsigned)status, _Ygl->width, _Ygl->height,
+             _Ygl->drawframe, _Ygl->readframe,
+             (int)_Ygl->vdp1FrameBuff[0], (int)_Ygl->vdp1FrameBuff[1],
+             (int)_Ygl->rboid_depth, (int)_Ygl->rboid_stencil);
+      fflush(stdout); } }
+#endif
   if (status != GL_FRAMEBUFFER_COMPLETE)
   {
     YGLLOG("YglRenderVDP1: Framebuffer status = %08X\n", status);
@@ -3395,6 +3628,9 @@ void YglRenderVDP1(void)
       {
         glDrawArrays(GL_TRIANGLES, 0, level->prg[j].currentQuad / 2);
       }
+#ifdef YAB_VDP1DBG
+      yab_dbg_v1_quads += level->prg[j].currentQuad / 2;
+#endif
       level->prg[j].currentQuad = 0;
       _Ygl->cpu_framebuffer_write[_Ygl->drawframe] = 0;
     }
@@ -3414,6 +3650,25 @@ void YglRenderVDP1(void)
   }
 
   _Ygl->sync = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+
+#ifdef YAB_VDP1DBG
+  {
+     static unsigned char *fb = NULL;
+     unsigned w = (unsigned)_Ygl->width, h = (unsigned)_Ygl->height;
+     if (w > 0 && h > 0 && w <= 1024 && h <= 1024)
+     {
+        if (!fb) fb = (unsigned char *)malloc(1024 * 1024 * 4);
+        glBindFramebuffer(GL_FRAMEBUFFER, _Ygl->vdp1fbo);
+        glReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, fb);
+        { unsigned i, n = w * h * 4, nz = 0; u32 sum = 0;
+          for (i = 0; i < n; i += 4) {
+             if (fb[i] | fb[i+1] | fb[i+2]) { nz++; sum += fb[i] + fb[i+1] + fb[i+2]; }
+          }
+          yab_dbg_v1_fbpix = (int)nz; yab_dbg_v1_fbsum = sum;
+        }
+     }
+  }
+#endif
 
   glBindFramebuffer(GL_FRAMEBUFFER, _Ygl->default_fbo);
   glEnable(GL_DEPTH_TEST);
@@ -3463,6 +3718,7 @@ void YglSetVdp2Window()
       glStencilMask(0x01);
       glStencilFunc(GL_ALWAYS, 0x01, 0x01);
       glVertexAttribPointer(_Ygl->windowpg.vertexp, 2, GL_INT, GL_FALSE, 0, (GLvoid *)_Ygl->win0v);
+      
       glDrawArrays(GL_TRIANGLE_STRIP, 0, _Ygl->win0_vertexcnt);
     }
 
@@ -3471,6 +3727,7 @@ void YglSetVdp2Window()
       glStencilMask(0x02);
       glStencilFunc(GL_ALWAYS, 0x02, 0x02);
       glVertexAttribPointer(_Ygl->windowpg.vertexp, 2, GL_INT, GL_FALSE, 0, (GLvoid *)_Ygl->win1v);
+      
       glDrawArrays(GL_TRIANGLE_STRIP, 0, _Ygl->win1_vertexcnt);
     }
 
@@ -3843,6 +4100,7 @@ void YglRenderFrameBuffer(int from, int to)
     glUniformMatrix4fv(_Ygl->renderfb.mtxModelView, 1, GL_FALSE, (GLfloat *)result.m);
     glVertexAttribPointer(_Ygl->renderfb.vertexp, 2, GL_INT, GL_FALSE, 0, (GLvoid *)vertices);
     glVertexAttribPointer(_Ygl->renderfb.texcoordp, 2, GL_FLOAT, GL_FALSE, 0, (GLvoid *)texcord);
+    
     glDrawArrays(GL_TRIANGLES, 0, 6);
 
     glDepthFunc(GL_GREATER);
@@ -3884,6 +4142,7 @@ void YglRenderFrameBuffer(int from, int to)
     glUniformMatrix4fv(_Ygl->renderfb.mtxModelView, 1, GL_FALSE, (GLfloat*)result.m);
     glVertexAttribPointer(_Ygl->renderfb.vertexp, 2, GL_INT, GL_FALSE, 0, (GLvoid *)vertices);
     glVertexAttribPointer(_Ygl->renderfb.texcoordp, 2, GL_FLOAT, GL_FALSE, 0, (GLvoid *)texcord);
+    
     glDrawArrays(GL_TRIANGLES, 0, 6);
 
     glDepthFunc(GL_GEQUAL);
@@ -3929,6 +4188,7 @@ void YglRenderFrameBuffer(int from, int to)
   glUniformMatrix4fv(_Ygl->renderfb.mtxModelView, 1, GL_FALSE, (GLfloat *)result.m);
   glVertexAttribPointer(_Ygl->renderfb.vertexp, 2, GL_INT, GL_FALSE, 0, (GLvoid *)vertices);
   glVertexAttribPointer(_Ygl->renderfb.texcoordp, 2, GL_FLOAT, GL_FALSE, 0, (GLvoid *)texcord);
+  
   glDrawArrays(GL_TRIANGLES, 0, 6);
 
 #if 0
@@ -3937,6 +4197,7 @@ void YglRenderFrameBuffer(int from, int to)
      glUniformMatrix4fv(_Ygl->renderfb.mtxModelView, 1, GL_FALSE, (GLfloat*)result.m);
      glVertexAttribPointer(_Ygl->renderfb.vertexp, 2, GL_INT, GL_FALSE, 0, (GLvoid *)vertices);
      glVertexAttribPointer(_Ygl->renderfb.texcoordp, 2, GL_FLOAT, GL_FALSE, 0, (GLvoid *)texcord);
+     
      glDrawArrays(GL_TRIANGLES, 0, 6);
    }
 #endif
@@ -4013,6 +4274,7 @@ void YglRenderFrameBufferShadow()
   glUniformMatrix4fv(_Ygl->renderfb.mtxModelView, 1, GL_FALSE, (GLfloat *)result.m);
   glVertexAttribPointer(_Ygl->renderfb.vertexp, 2, GL_INT, GL_FALSE, 0, (GLvoid *)vertices);
   glVertexAttribPointer(_Ygl->renderfb.texcoordp, 2, GL_FLOAT, GL_FALSE, 0, (GLvoid *)texcord);
+  
   glDrawArrays(GL_TRIANGLES, 0, 6);
 }
 
@@ -4043,7 +4305,6 @@ void YglRender(void)
   int ccwindow = 0;
 
   YGLLOG("YglRender\n");
-
   FrameProfileAdd("YglRender start");
   if ((Vdp2Regs->TVMD & 0x8000) == 0)
   {
@@ -4270,7 +4531,7 @@ void YglRender(void)
           {
             glVertexAttribPointer(level->prg[j].vaid, 4, GL_FLOAT, GL_FALSE, 0, level->prg[j].vertexAttribute);
           }
-          glDrawArrays(GL_TRIANGLES, 0, level->prg[j].currentQuad / 2);
+            glDrawArrays(GL_TRIANGLES, 0, level->prg[j].currentQuad / 2);
 
           if (level->prg[j].bwin0 != 0 || level->prg[j].bwin1 != 0 || (level->prg[j].blendmode != VDP2_CC_NONE && ccwindow))
           {
@@ -4510,6 +4771,7 @@ int YglCleanUpWindow(YglProgram *prg)
       Ygl_setNormalshader(prg);
       glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, (GLvoid *)prg->quads);
       glVertexAttribPointer(1, 4, GL_FLOAT, GL_FALSE, 0, (GLvoid *)prg->textcoords);
+      
       glDrawArrays(GL_TRIANGLES, 0, prg->currentQuad / 2);
       glDepthFunc(GL_GEQUAL);
       Ygl_cleanupNormal(prg);
@@ -5095,6 +5357,9 @@ void YglChangeResolution(int w, int h)
       glDeleteBuffers(1, &_Ygl->vdp1pixelBufferID);
       _Ygl->vdp1pixelBufferID = 0;
       _Ygl->pFrameBuffer = NULL;
+      /* the published snapshots are sized for the old resolution */
+      _Ygl->vdp1_fb_ready[0] = 0;
+      _Ygl->vdp1_fb_ready[1] = 0;
     }
 
     if (_Ygl->tmpfbo != 0)

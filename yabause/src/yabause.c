@@ -144,6 +144,109 @@ static u32 g_scsp_main_mode = 1;
  * vdp2VBlankOUT / VdpResume / VdpRevoke), vdp1.cpp (PTMR direct draw) and
  * libretro.c (shared context, mirror FBO, frame delivery). */
 int g_vdp_async = 1;
+int yab_vdp1_fb_readback = 0;
+
+/* ---------------------------------------------------------------------------
+ * HANGDBG: stage markers + stall watchdog (diagnostic builds only).
+ *
+ * The machine runs on its own thread; when it wedges inside a frame nothing is
+ * published, so the frontend blocks in the slot wait and neither thread reports
+ * anything.  Each thread records the last thing it was doing, and a watchdog
+ * prints that + the machine's handshake state once yabsys.frame_count has been
+ * frozen for a few seconds.
+ * ------------------------------------------------------------------------- */
+#ifdef YAB_HANGDBG
+#include <pthread.h>
+#include <unistd.h>
+#include <inttypes.h>
+extern u64 yab_68k_cycles;
+extern u64 yab_68k_allow;
+extern volatile int yab_68k_throttle;
+extern volatile int yab_68k_keepclock;
+
+volatile const char *yab_dbg_emu_mark = "init";
+volatile const char *yab_dbg_front_mark = "init";
+
+void yab_dbg_mark_emu(const char *s)   { yab_dbg_emu_mark = s; }
+void yab_dbg_mark_front(const char *s) { yab_dbg_front_mark = s; }
+
+static void yab_dbg_print_state(void)
+{
+   int cur = -2, qfree = -2, qready = -2;
+   yab_dbg_slot_state(&cur, &qfree, &qready);
+   printf("[HANG] f=%u line=%d max=%d vblank=%d wait_line=%d stage_emu='%s' stage_front='%s'\n",
+          (unsigned)yabsys.frame_count, yabsys.LineCount, yabsys.MaxLineCount,
+          yabsys.VBlankLineCount, yabsys.wait_line_count,
+          yab_dbg_emu_mark, yab_dbg_front_mark);
+   printf("[HANG] M=%08X S=%08X vdp1 status=%d swap=%d plot=%d edsr=%04X ptmr=%d fbcr=%02X cur_frame=%d\n",
+          MSH2 ? (unsigned)MSH2->regs.PC : 0, SSH2 ? (unsigned)SSH2->regs.PC : 0,
+          Vdp1External.status, Vdp1External.swap_frame_buffer,
+          Vdp1External.frame_change_plot,
+          Vdp1Regs ? (unsigned)Vdp1Regs->EDSR : 0,
+          Vdp1Regs ? (int)Vdp1Regs->PTMR : -1,
+          Vdp1Regs ? (unsigned)Vdp1Regs->FBCR : 0,
+          Vdp1External.current_frame);
+   printf("[HANG] smpc COM=%02X SF=%02X IREG0=%02X OREG0=%02X DDR=%02X,%02X intback=%d\n",
+          SmpcRegs ? (unsigned)SmpcRegs->COMREG : 0,
+          SmpcRegs ? (unsigned)SmpcRegs->SF : 0,
+          SmpcRegs ? (unsigned)SmpcRegs->IREG[0] : 0,
+          SmpcRegs ? (unsigned)SmpcRegs->OREG[0] : 0,
+          SmpcRegs ? (unsigned)SmpcRegs->DDR[0] : 0,
+          SmpcRegs ? (unsigned)SmpcRegs->DDR[1] : 0,
+          SmpcInternalVars ? (int)SmpcInternalVars->intback : -1);
+   printf("[HANG] scu IST=%08X IMS=%08X AIACK=%08X ASR0=%08X ASR1=%08X\n",
+          ScuRegs ? (unsigned)ScuRegs->IST : 0,
+          ScuRegs ? (unsigned)ScuRegs->IMS : 0,
+          ScuRegs ? (unsigned)ScuRegs->AIACK : 0,
+          ScuRegs ? (unsigned)ScuRegs->ASR0 : 0,
+          ScuRegs ? (unsigned)ScuRegs->ASR1 : 0);
+   {
+      int rcv = -2, vdp1 = -2, ev = -2;
+      yab_dbg_vdpq_state(&rcv, &vdp1, &ev);
+      printf("[HANG] vdp queues: rcv=%d vdp1=%d ev=%d (0 = nothing pending)\n",
+             rcv, vdp1, ev);
+   }
+   printf("[HANG] slot cur=%d qfree=%d qready=%d  68k cyc=%" PRIu64 " allow=%" PRIu64
+          " throttle=%d keep=%d\n",
+          cur, qfree, qready, (u64)yab_68k_cycles, (u64)yab_68k_allow,
+          (int)yab_68k_throttle, (int)yab_68k_keepclock);
+   fflush(stdout);
+}
+
+static void *yab_dbg_watchdog(void *arg)
+{
+   unsigned last = 0;
+   int still = 0;
+   (void)arg;
+   for (;;)
+   {
+      usleep(500 * 1000);
+      if (yabsys.frame_count != last)
+      {
+         last = yabsys.frame_count;
+         still = 0;
+         continue;
+      }
+      /* 12 samples = 6 s without a new frame.  Ignore the first frames. */
+      if (++still == 12 && yabsys.frame_count > 120)
+      {
+         printf("[HANG] ---- no frame progress for 6 s ----\n");
+         yab_dbg_print_state();
+      }
+   }
+   return NULL;
+}
+
+void yab_dbg_watchdog_start(void)
+{
+   static int started = 0;
+   pthread_t t;
+   if (started) return;
+   started = 1;
+   if (pthread_create(&t, NULL, yab_dbg_watchdog, NULL) == 0)
+      pthread_detach(t);
+}
+#endif
 
 extern char * getLastShaderError();
 
@@ -170,7 +273,30 @@ void print_usage(const char *program_name) {
 
 //////////////////////////////////////////////////////////////////////////////
 
-void YabauseChangeTiming(int freqtype) {
+/* SH-2 "cycle rate": percentage of the real 28.6/25.5 MHz clock.  The SH-2 gets
+ * DecilineStop cycles per deciline, so scaling that value gives the emulated CPU
+ * proportionally fewer cycles per frame while VDP2 keeps counting lines -- the
+ * same lever MAME's clock slider, Dolphin's "CPU clock override" and PPSSPP's
+ * "CPU clock" expose.  Games with idle time are unaffected (they finish early
+ * either way); CPU-bound ones run slower.  100 = real hardware.
+ * YAB_CPUCLOCK=<pct> is the probe override for headless A/B runs. */
+int yab_cpu_clock_pct = 100;
+int yab_cpu_clock_env = 0;   /* YAB_CPUCLOCK was used: it wins over the option */
+
+static void yab_cpu_clock_init(void) {
+   static int init = 0;
+   if (init) return;
+   init = 1;
+   {
+      const char *e = getenv("YAB_CPUCLOCK");
+      if (e && *e) {
+         int pct = atoi(e);
+         if (pct >= 10 && pct <= 200) { yab_cpu_clock_pct = pct; yab_cpu_clock_env = 1; }
+      }
+   }
+}
+
+static void yab_timing_set(int freqtype, int preserve_counters) {
    // Setup all the variables related to timing
 
    const double freq_base = yabsys.IsPal ? 28437500.0
@@ -180,15 +306,37 @@ void YabauseChangeTiming(int freqtype) {
    const double usec_shifted = 1.0e6 * (1 << YABSYS_TIMING_BITS);
    const double deciline_time = yabsys.IsPal ? 1.0 /  50        / 313 / 10
                                              : 1.0 / (60/1.001) / 263 / 10;
+   const double clock = (double)yab_cpu_clock_pct / 100.0;
 
-   yabsys.DecilineCount = 0;
-   yabsys.LineCount = 0;
+   if (!preserve_counters) {
+      yabsys.DecilineCount = 0;
+      yabsys.LineCount = 0;
+   }
    yabsys.CurSH2FreqType = freqtype;
-   yabsys.DecilineStop = (u32) (freq_shifted * deciline_time + 0.5);
+   yabsys.DecilineStop = (u32) (freq_shifted * deciline_time * clock + 0.5);
    yabsys.SH2CycleFrac = 0;
+   /* The usec scale is the 68k/SCSP side and is not tied to the SH-2 clock. */
    yabsys.DecilineUsec = (u32) (usec_shifted * deciline_time + 0.5);
    yabsys.UsecFrac = 0;
 }
+
+void YabauseChangeTiming(int freqtype) {
+   yab_cpu_clock_init();
+   yab_timing_set(freqtype, 0);
+   if (yab_cpu_clock_env)   /* probe only: keep player logs clean */
+   {
+      printf("[CLK] sh2 clock %d%% -> decilinestop %u\n",
+             yab_cpu_clock_pct, (unsigned)yabsys.DecilineStop);
+      fflush(stdout);
+   }
+}
+
+/* Re-derive the per-line SH-2 budget after yab_cpu_clock_pct changed, without
+ * rewinding the line/field counters (called between frames). */
+void YabauseApplyCpuClock(void) {
+   yab_timing_set(yabsys.CurSH2FreqType, 1);
+}
+
 
 //////////////////////////////////////////////////////////////////////////////
 extern int tweak_backup_file_size;
@@ -780,25 +928,38 @@ static int yab_68k_throttle_mode(void)
    return mode;
 }
 
-/* The lock is on when the core option is enabled, or when the YAB_68KLOCK probe
- * variable is present.  "off"/"no" (and an empty value) disable the probe;
- * any number -- including 0 -- enables the lock with that phase offset. */
+/* The lock is on when the YAB_68KLOCK probe is present (any number -- including
+ * 0 -- sets the phase; "off"/"no" forces it off), when the precise sync mode is
+ * active (async renderer disabled, Saturn), or when the ST-V lead option is
+ * enabled.  The probe wins so an A/B run can still disable or re-phase it. */
 static int yab_68k_lock_on(void)
 {
-   static int init = 0, env_on = 0;
+   static int init = 0, env_on = 0, env_off = 0;
    if (!init)
    {
       const char *e = getenv("YAB_68KLOCK");
       init = 1;
-      if (e && *e && strcmp(e, "off") && strcmp(e, "no")) env_on = 1;
+      if (e && *e)
+      {
+         if (!strcmp(e, "off") || !strcmp(e, "no")) env_off = 1;
+         else env_on = 1;
+      }
    }
+   if (env_off) return 0;
    if (env_on) return 1;
+   /* Precise sync mode: the renderer runs on the emulation thread, so the 68k
+    * must not free-run on wall-clock pacing -- otherwise the same save state
+    * produces different video phases (measured on Sega Rally).  ST-V keeps its
+    * own lead workaround: do not disturb its tuned phase. */
+   if (!g_vdp_async && !yab_stv_mode) return 1;
    return yab_stv_sound_cpu_phase && yab_stv_mode;
 }
 
-/* Phase offset in 68k cycles.  The default is half of the 188160-cycle frame:
- * measured on seabass, only +94080 boots (0 / +47040 / +141120 / +188160 all
- * stay black), i.e. the sound CPU has to lead the SH-2 frame by half a frame. */
+/* Phase offset in 68k cycles.  The ST-V lead workaround uses half of the
+ * 188160-cycle frame: measured on seabass, only +94080 boots (0 / +47040 /
+ * +141120 / +188160 all stay black), i.e. the sound CPU has to lead the SH-2
+ * frame by half a frame.  The precise sync mode uses phase 0; YAB_68KLOCK can
+ * override both for A/B runs. */
 static long yab_68k_lock_off(void)
 {
    static int init = 0; static long off = 94080;
@@ -806,7 +967,12 @@ static long yab_68k_lock_off(void)
    {
       const char *e = getenv("YAB_68KLOCK");
       init = 1;
-      if (e && *e && strcmp(e, "off") && strcmp(e, "no")) off = strtol(e, NULL, 10);
+      if (e && *e)
+      {
+         if (strcmp(e, "off") && strcmp(e, "no")) off = strtol(e, NULL, 10);
+      }
+      else if (!g_vdp_async && !yab_stv_mode)
+         off = 0;
    }
    return off;
 }
@@ -843,6 +1009,7 @@ int YabauseEmulate(void) {
     * switch.  yabsys.LineCount is still maintained because VDP2 needs it. */
    int local_line = 0;
    yabsys.frame_count++;
+   YABEMU("68k-lock");
    /* yabasanshiro_stv_sound_cpu_lead / YAB_68KLOCK: pin the *phase* between
     * the sound CPU (68k) and the SH2s at the frame boundary.
     *
@@ -996,6 +1163,7 @@ int YabauseEmulate(void) {
       }
    }
 yab_68k_lock_done: ;
+   YABEMU("frame-loop");
    #if !(defined(__LIBRETRO__))
    PlayRecorder_proc(yabsys.frame_count);
    #endif
@@ -1084,6 +1252,7 @@ yab_68k_lock_done: ;
 #ifdef YAB_STATICS
       s64 current_cpu_clock = YabauseGetTicks();
 #endif
+      YABEMU("sh2-exec");
       if( sync_shift != 0 ){
         u32 i;
         const u32 div = sync_shift;
@@ -1105,6 +1274,7 @@ yab_68k_lock_done: ;
         if (yabsys.IsSSH2Running)
           SH2Exec(SSH2, sh2cycles);
       }
+      YABEMU("deciline-tick");
 
 #ifdef YAB_STATICS
       cpu_emutime += (YabauseGetTicks() - current_cpu_clock) * 1000000 / yabsys.tickfreq;
@@ -1115,15 +1285,18 @@ yab_68k_lock_done: ;
        if(yabsys.DecilineCount == 9) {
          // HBlankIN
          PROFILE_START("hblankin");
+         YABEMU("hblank-in");
          Vdp2HBlankIN();
          PROFILE_STOP("hblankin");
        }
        else if (yabsys.DecilineCount == 10) {
          // HBlankOUT
          PROFILE_START("hblankout");
+         YABEMU("hblank-out");
          Vdp2HBlankOUT();
          PROFILE_STOP("hblankout");
          PROFILE_START("SCSP");
+         YABEMU("scsp-exec");
          ScspExec();
          PROFILE_STOP("SCSP");
          /* Steady 68k pacing: let the cap grow with the SH-2's progress inside
@@ -1152,15 +1325,13 @@ yab_68k_lock_done: ;
 #endif
             PROFILE_START("vblankin");
             // VBlankIN
+            YABEMU("vblank-in");
             SmpcINTBACKEnd();
             Vdp2VBlankIN();
-            /* Publish the frame's snapshot table HERE, not at frame end: this
-             * runs right after Vdp2VBlankIN() has synchronised with the VDP
-             * worker (the worker blocks on its event queue until the next
-             * frame), so the publish cannot tear a table the worker is reading.
-             * (Doing it at frame end raced: the worker renders VDPEV_VBLANK_OUT
-             * while the main thread memcpy's over the table it is reading.) */
-            Vdp2LinesSwap();
+            /* The sync renderer publishes its per-line table and AC_VRAM inside
+             * Vdp2VBlankIN(), before the composite.  The async renderer copies
+             * the slot's table itself and derives AC_VRAM in
+             * yab_frameslot_bind(), so nothing may be published here. */
 #if defined(ASYNC_SCSP)
             SyncCPUtoSCSP();
 #endif
@@ -1171,18 +1342,30 @@ yab_68k_lock_done: ;
          {
             // VBlankOUT
             PROFILE_START("VDP1/VDP2");
+            YABEMU("vblank-out");
             Vdp2VBlankOUT();
             yabsys.LineCount = 0;
             oneframeexec = 1;
+            /* Async emulation (flycast model): the frame's draw list is complete
+             * here, so hand the slot to the frontend thread, which does all the
+             * GL.  Nothing else in this thread touches GL. */
+            if (g_vdp_async)
+            {
+               YABEMU("publish");
+               yab_frameslot_publish_current((unsigned)yabsys.frame_count, 0, 0);
+               YABEMU("published");
+            }
             PROFILE_STOP("VDP1/VDP2");
 
          }
       }
 
       PROFILE_START("SCU");
+      YABEMU("scu-exec");
       ScuExec(sh2cycles >> 1);
       PROFILE_STOP("SCU");
       PROFILE_START("68K");
+      YABEMU("m68k-sync");
       M68KSync();  // Wait for the previous iteration to finish
       PROFILE_STOP("68K");
 
@@ -1195,9 +1378,11 @@ yab_68k_lock_done: ;
        * microsecond-calibrated ones (its INTBACK is 400 where the old one is
        * 16000), so scale the time fed in by 1/40.  (1/250 -- the "1 unit =
        * 250us" reading -- was far too slow: it silenced the sound CPU.) */
+      YABEMU("smpc-exec");
       SmpcExec(yabsys.UsecFrac >> YABSYS_TIMING_BITS);
       PROFILE_STOP("SMPC");
       PROFILE_START("CDB");
+      YABEMU("cd-exec");
       Cs2Exec(yabsys.UsecFrac >> YABSYS_TIMING_BITS);
       PROFILE_STOP("CDB");
       yabsys.UsecFrac &= YABSYS_TIMING_MASK;
@@ -1289,6 +1474,7 @@ yab_68k_lock_done: ;
    SSH2->onchip.cache.write_count = 0;
 #endif
 
+   YABEMU("frame-end");
    return 0;
 }
 

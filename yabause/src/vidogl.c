@@ -63,6 +63,11 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301  USA
 
 static Vdp2 baseVdp2Regs;
 Vdp2 * fixVdp2Regs = NULL;
+
+/* Defined in vdp2.cpp: the asynchronous renderer walks the VDP1 command list
+ * with a slot-local Vdp1Regs, so the registers it derives there are stored back
+ * into the slot for the emulation thread to merge (see the comment there). */
+extern void yab_frameslot_store_derived(Vdp1 *src);
 //#define PERFRAME_LOG
 #ifdef PERFRAME_LOG
 int fount = 0;
@@ -3531,6 +3536,7 @@ static INLINE void ReadVdp2ColorOffset(Vdp2 * regs, vdp2draw_struct *info, int m
  Rotate Screen drawing
  ------------------------------------------------------------------------------*/
 void Vdp2DrawRotationThread(void * p) {
+  { extern void yab_bind_state_ptrs(void); yab_bind_state_ptrs(); }
 #if RBG_PROFILE
   u64 before;
   u64 now;
@@ -3545,6 +3551,7 @@ void Vdp2DrawRotationThread(void * p) {
   }
 
   while (Vdp2DrawRotationThread_running) {
+    { extern void yab_bind_state_ptrs(void); yab_bind_state_ptrs(); }
     YabThreadLock(g_rotate_mtx);
     if (Vdp2DrawRotationThread_running == 0) {
       break;
@@ -4435,7 +4442,16 @@ int VIDOGLInit(void)
 
   SetSaturnResolution(320, 224);
 
-  g_rgb0.async = 1;
+  /* RBG0 (rotation background) can be built on its own worker thread.  That
+   * thread issues GL and, through yab_bind_state_ptrs(), reads the live /
+   * snapshot VDP2 state rather than the frame slot the frontend is drawing.
+   * The asynchronous renderer keeps all GL on the frontend thread and renders
+   * from a self-contained slot, so the worker breaks both invariants: measured
+   * in Sega Rally's in-game RBG0 sky, the layer was rebuilt from a different
+   * frame every frame and flickered while VDP1 and the non-rotation VDP2
+   * layers were correct.  Keep RBG0 synchronous in that mode (it is also
+   * faster there: 38.1 fps vs 25.8 fps with the worker's handshake). */
+  g_rgb0.async = g_vdp_async ? 0 : 1;
   g_rgb0.rgb_type = 0;
   g_rgb0.vdp2_sync_flg = -1;
   g_rgb0.rotate_mval_h = 1.0;
@@ -4570,6 +4586,7 @@ void VIDOGLVdp1DrawStart(void)
   _Ygl->msb_shadow_count_[_Ygl->drawframe] = 0;
 
   Vdp1DrawCommands(Vdp1Ram, Vdp1Regs, NULL);
+  yab_frameslot_store_derived(Vdp1Regs);
   FrameProfileAdd("Vdp1Command end ");
 
 }
@@ -4580,6 +4597,10 @@ void VIDOGLVdp1DrawEnd(void)
 {
   YglTmPush(YglTM);
   YglRenderVDP1();
+  /* Async renderer + readback option: keep a CPU copy of the frame that was
+   * just rasterised, so the SH-2 never has to issue GL from its own thread.
+   * Must run here, on the GL thread, while the framebuffer texture is complete. */
+  YglVdp1PublishCpu(_Ygl->drawframe);
   _Ygl->vpd1_running = 0;
 }
 
@@ -8391,7 +8412,12 @@ void VIDOGLSetSettingValueMode(int type, int value) {
   
   case VDP_SETTING_RBG_USE_COMPUTESHADER:
 	  _Ygl->rbg_use_compute_shader = value;
-	  if (_Ygl->rbg_use_compute_shader) {
+	  /* Async renderer: never put RBG0 back on its worker thread, whatever
+	   * the compute-shader option says (see VIDOGLInit). */
+	  if (g_vdp_async) {
+		  g_rgb0.async = 0;
+	  }
+	  else if (_Ygl->rbg_use_compute_shader) {
 		  g_rgb0.async = 0;
 	  }
 	  else {
