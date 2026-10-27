@@ -2166,9 +2166,12 @@ bool retro_serialize(void *data, size_t size)
    /* The machine now runs on its own thread: park it so the state we save is a
     * between-frames state, not one being mutated under us. */
    yab_emu_pause();
-   /* The state API works through the thread-local state pointers, so this thread
-    * has to see the machine's buffers, not its own (unbound) copies. */
-   yab_bind_live_state();
+   /* Bind the thread-local state POINTERS only: the state API must read the
+    * machine's buffers, but the full bind also restores Vdp1External from its
+    * init-time snapshot, which zeroes the live VDP1 frame-change handshake
+    * (frame_change_plot / swap_frame_buffer).  Measured: saving a state froze
+    * the picture (machine still running) exactly because of that clobber. */
+   yab_bind_live_ptrs();
    ScspMuteAudio(SCSP_MUTE_SYSTEM);
    error = YabSaveStateBuffer (&buffer, &out_size);
    ScspUnMuteAudio(SCSP_MUTE_SYSTEM);
@@ -2239,8 +2242,10 @@ bool retro_unserialize(const void *data, size_t size)
    /* A state load restores VRAM/registers through the thread-local pointers: bind
     * them to the machine's buffers first, otherwise the restored data lands in
     * this thread's own pointers and the machine keeps running with empty VRAM
-    * (measured: every layer sampled nothing and the picture was black). */
-   yab_bind_live_state();
+    * (measured: every layer sampled nothing and the picture was black).
+    * Pointers only -- the full bind would zero the live VDP1 handshake, the same
+    * way it did on the save path. */
+   yab_bind_live_ptrs();
    ok = apply_state_buffer(data, size) == 0;
    yab_emu_resume();
    return ok;

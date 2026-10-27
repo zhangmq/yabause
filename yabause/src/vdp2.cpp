@@ -64,6 +64,9 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301  USA
 #include <atomic>
 #include "vulkan/VIDVulkanCInterface.h"
 
+void VDP2genVRamCyclePattern(void);
+void Vdp2UpdateAC_VRAM(const Vdp2 *regs);
+
 __thread u8 * Vdp2Ram;
 /* Plain globals holding what the emulation thread bound, so the render thread
  * can bind its own __thread copies to either those or the snapshot. */
@@ -369,6 +372,16 @@ void yab_frameslot_bind(int idx)
    Vdp2ColorRam = s->cram;
    Vdp1Regs = &s->vdp1regs;
    Vdp2Regs = &s->vdp2regs;
+   /* Rebuild this frame's VRAM/pattern bank mapping (AC_VRAM) from the same
+    * point in time the compositor uses for the layer registers: line 0 of this
+    * slot.  AC_VRAM is global and the emulation thread recomputes it at line 1
+    * of every frame -- i.e. AFTER this slot was published, because the frontend
+    * thread only wakes up once the machine has advanced past line 263 into the
+    * next frame.  Reading the live value therefore paired this slot's VRAM with
+    * the NEXT frame's CYCA0/CYCB0, so NBG0 fetched its pattern data from the
+    * wrong banks and the whole layer went black for two frames at every video
+    * frame change (measured: Castlevania SotN's Konami logo). */
+   Vdp2UpdateAC_VRAM(&s->lines[0]);
    /* The VDP1 frame-change bookkeeping (swap_frame_buffer / frame_change_plot /
     * status) decides whether the frame's VDP1 commands are rasterized at all;
     * the machine thread has moved on by the time we draw, so use the snapshot. */
@@ -1278,45 +1291,46 @@ extern "C" void * VdpProc( void *arg ){
   return NULL;
 }
 
-void VDP2genVRamCyclePattern() {
+static void Vdp2ComputeCyclePattern(const Vdp2 *regs, int publish) {
+  u8 ac[4][8];
   int cpu_cycle_a = 0;
   int cpu_cycle_b = 0;
   int i = 0;
 
-  Vdp2External.AC_VRAM[0][0] = (Vdp2Regs->CYCA0L >> 12) & 0x0F;
-  Vdp2External.AC_VRAM[0][1] = (Vdp2Regs->CYCA0L >> 8) & 0x0F;
-  Vdp2External.AC_VRAM[0][2] = (Vdp2Regs->CYCA0L >> 4) & 0x0F;
-  Vdp2External.AC_VRAM[0][3] = (Vdp2Regs->CYCA0L >> 0) & 0x0F;
-  Vdp2External.AC_VRAM[0][4] = (Vdp2Regs->CYCA0U >> 12) & 0x0F;
-  Vdp2External.AC_VRAM[0][5] = (Vdp2Regs->CYCA0U >> 8) & 0x0F;
-  Vdp2External.AC_VRAM[0][6] = (Vdp2Regs->CYCA0U >> 4) & 0x0F;
-  Vdp2External.AC_VRAM[0][7] = (Vdp2Regs->CYCA0U >> 0) & 0x0F;
+  ac[0][0] = (regs->CYCA0L >> 12) & 0x0F;
+  ac[0][1] = (regs->CYCA0L >> 8) & 0x0F;
+  ac[0][2] = (regs->CYCA0L >> 4) & 0x0F;
+  ac[0][3] = (regs->CYCA0L >> 0) & 0x0F;
+  ac[0][4] = (regs->CYCA0U >> 12) & 0x0F;
+  ac[0][5] = (regs->CYCA0U >> 8) & 0x0F;
+  ac[0][6] = (regs->CYCA0U >> 4) & 0x0F;
+  ac[0][7] = (regs->CYCA0U >> 0) & 0x0F;
 
   for (i = 0; i < 8; i++) {
-    if (Vdp2External.AC_VRAM[0][i] >= 0x0E) {
+    if (ac[0][i] >= 0x0E) {
       cpu_cycle_a++;
     }
-    else if (Vdp2External.AC_VRAM[0][i] >= 4 && Vdp2External.AC_VRAM[0][i] <= 7) {
-      if ((Vdp2Regs->BGON & (1 << (Vdp2External.AC_VRAM[0][i] - 4))) == 0) {
+    else if (ac[0][i] >= 4 && ac[0][i] <= 7) {
+      if ((regs->BGON & (1 << (ac[0][i] - 4))) == 0) {
         cpu_cycle_a++;
       }
     }
   }
 
-  if (Vdp2Regs->RAMCTL & 0x100) {
+  if (regs->RAMCTL & 0x100) {
     int fcnt = 0;
-    Vdp2External.AC_VRAM[1][0] = (Vdp2Regs->CYCA1L >> 12) & 0x0F;
-    Vdp2External.AC_VRAM[1][1] = (Vdp2Regs->CYCA1L >> 8) & 0x0F;
-    Vdp2External.AC_VRAM[1][2] = (Vdp2Regs->CYCA1L >> 4) & 0x0F;
-    Vdp2External.AC_VRAM[1][3] = (Vdp2Regs->CYCA1L >> 0) & 0x0F;
-    Vdp2External.AC_VRAM[1][4] = (Vdp2Regs->CYCA1U >> 12) & 0x0F;
-    Vdp2External.AC_VRAM[1][5] = (Vdp2Regs->CYCA1U >> 8) & 0x0F;
-    Vdp2External.AC_VRAM[1][6] = (Vdp2Regs->CYCA1U >> 4) & 0x0F;
-    Vdp2External.AC_VRAM[1][7] = (Vdp2Regs->CYCA1U >> 0) & 0x0F;
+    ac[1][0] = (regs->CYCA1L >> 12) & 0x0F;
+    ac[1][1] = (regs->CYCA1L >> 8) & 0x0F;
+    ac[1][2] = (regs->CYCA1L >> 4) & 0x0F;
+    ac[1][3] = (regs->CYCA1L >> 0) & 0x0F;
+    ac[1][4] = (regs->CYCA1U >> 12) & 0x0F;
+    ac[1][5] = (regs->CYCA1U >> 8) & 0x0F;
+    ac[1][6] = (regs->CYCA1U >> 4) & 0x0F;
+    ac[1][7] = (regs->CYCA1U >> 0) & 0x0F;
 
     for (i = 0; i < 8; i++) {
-      if (Vdp2External.AC_VRAM[0][i] == 0x0E) {
-        if (Vdp2External.AC_VRAM[1][i] != 0x0E) {
+      if (ac[0][i] == 0x0E) {
+        if (ac[1][i] != 0x0E) {
           cpu_cycle_a--;
         }
         else {
@@ -1325,7 +1339,7 @@ void VDP2genVRamCyclePattern() {
           }
         }
       }
-      if (Vdp2External.AC_VRAM[1][i] == 0x0F) {
+      if (ac[1][i] == 0x0F) {
         fcnt++;
       }
     }
@@ -1333,51 +1347,51 @@ void VDP2genVRamCyclePattern() {
     if (cpu_cycle_a < 0)cpu_cycle_a = 0;
   }
   else {
-    Vdp2External.AC_VRAM[1][0] = Vdp2External.AC_VRAM[0][0];
-    Vdp2External.AC_VRAM[1][1] = Vdp2External.AC_VRAM[0][1];
-    Vdp2External.AC_VRAM[1][2] = Vdp2External.AC_VRAM[0][2];
-    Vdp2External.AC_VRAM[1][3] = Vdp2External.AC_VRAM[0][3];
-    Vdp2External.AC_VRAM[1][4] = Vdp2External.AC_VRAM[0][4];
-    Vdp2External.AC_VRAM[1][5] = Vdp2External.AC_VRAM[0][5];
-    Vdp2External.AC_VRAM[1][6] = Vdp2External.AC_VRAM[0][6];
-    Vdp2External.AC_VRAM[1][7] = Vdp2External.AC_VRAM[0][7];
+    ac[1][0] = ac[0][0];
+    ac[1][1] = ac[0][1];
+    ac[1][2] = ac[0][2];
+    ac[1][3] = ac[0][3];
+    ac[1][4] = ac[0][4];
+    ac[1][5] = ac[0][5];
+    ac[1][6] = ac[0][6];
+    ac[1][7] = ac[0][7];
   }
 
-  Vdp2External.AC_VRAM[2][0] = (Vdp2Regs->CYCB0L >> 12) & 0x0F;
-  Vdp2External.AC_VRAM[2][1] = (Vdp2Regs->CYCB0L >> 8) & 0x0F;
-  Vdp2External.AC_VRAM[2][2] = (Vdp2Regs->CYCB0L >> 4) & 0x0F;
-  Vdp2External.AC_VRAM[2][3] = (Vdp2Regs->CYCB0L >> 0) & 0x0F;
-  Vdp2External.AC_VRAM[2][4] = (Vdp2Regs->CYCB0U >> 12) & 0x0F;
-  Vdp2External.AC_VRAM[2][5] = (Vdp2Regs->CYCB0U >> 8) & 0x0F;
-  Vdp2External.AC_VRAM[2][6] = (Vdp2Regs->CYCB0U >> 4) & 0x0F;
-  Vdp2External.AC_VRAM[2][7] = (Vdp2Regs->CYCB0U >> 0) & 0x0F;
+  ac[2][0] = (regs->CYCB0L >> 12) & 0x0F;
+  ac[2][1] = (regs->CYCB0L >> 8) & 0x0F;
+  ac[2][2] = (regs->CYCB0L >> 4) & 0x0F;
+  ac[2][3] = (regs->CYCB0L >> 0) & 0x0F;
+  ac[2][4] = (regs->CYCB0U >> 12) & 0x0F;
+  ac[2][5] = (regs->CYCB0U >> 8) & 0x0F;
+  ac[2][6] = (regs->CYCB0U >> 4) & 0x0F;
+  ac[2][7] = (regs->CYCB0U >> 0) & 0x0F;
 
   for (i = 0; i < 8; i++) {
-    if (Vdp2External.AC_VRAM[2][i] >= 0x0E) {
+    if (ac[2][i] >= 0x0E) {
       cpu_cycle_b++;
     }
-    else if (Vdp2External.AC_VRAM[2][i] >= 4 && Vdp2External.AC_VRAM[2][i] <= 7) {
-      if ((Vdp2Regs->BGON & (1 << (Vdp2External.AC_VRAM[2][i] - 4))) == 0) {
+    else if (ac[2][i] >= 4 && ac[2][i] <= 7) {
+      if ((regs->BGON & (1 << (ac[2][i] - 4))) == 0) {
         cpu_cycle_b++;
       }
     }
   }
 
 
-  if (Vdp2Regs->RAMCTL & 0x200) {
+  if (regs->RAMCTL & 0x200) {
     int fcnt = 0;
-    Vdp2External.AC_VRAM[3][0] = (Vdp2Regs->CYCB1L >> 12) & 0x0F;
-    Vdp2External.AC_VRAM[3][1] = (Vdp2Regs->CYCB1L >> 8) & 0x0F;
-    Vdp2External.AC_VRAM[3][2] = (Vdp2Regs->CYCB1L >> 4) & 0x0F;
-    Vdp2External.AC_VRAM[3][3] = (Vdp2Regs->CYCB1L >> 0) & 0x0F;
-    Vdp2External.AC_VRAM[3][4] = (Vdp2Regs->CYCB1U >> 12) & 0x0F;
-    Vdp2External.AC_VRAM[3][5] = (Vdp2Regs->CYCB1U >> 8) & 0x0F;
-    Vdp2External.AC_VRAM[3][6] = (Vdp2Regs->CYCB1U >> 4) & 0x0F;
-    Vdp2External.AC_VRAM[3][7] = (Vdp2Regs->CYCB1U >> 0) & 0x0F;
+    ac[3][0] = (regs->CYCB1L >> 12) & 0x0F;
+    ac[3][1] = (regs->CYCB1L >> 8) & 0x0F;
+    ac[3][2] = (regs->CYCB1L >> 4) & 0x0F;
+    ac[3][3] = (regs->CYCB1L >> 0) & 0x0F;
+    ac[3][4] = (regs->CYCB1U >> 12) & 0x0F;
+    ac[3][5] = (regs->CYCB1U >> 8) & 0x0F;
+    ac[3][6] = (regs->CYCB1U >> 4) & 0x0F;
+    ac[3][7] = (regs->CYCB1U >> 0) & 0x0F;
 
     for (i = 0; i < 8; i++) {
-      if (Vdp2External.AC_VRAM[2][i] == 0x0E) {
-        if (Vdp2External.AC_VRAM[3][i] != 0x0E) {
+      if (ac[2][i] == 0x0E) {
+        if (ac[3][i] != 0x0E) {
           cpu_cycle_b--;
         }
         else {
@@ -1386,7 +1400,7 @@ void VDP2genVRamCyclePattern() {
           }
         }
       }
-      if (Vdp2External.AC_VRAM[3][i] == 0x0F) {
+      if (ac[3][i] == 0x0F) {
         fcnt++;
       }
     }
@@ -1394,15 +1408,17 @@ void VDP2genVRamCyclePattern() {
     if (cpu_cycle_b < 0)cpu_cycle_b = 0;
   }
   else {
-    Vdp2External.AC_VRAM[3][0] = Vdp2External.AC_VRAM[2][0];
-    Vdp2External.AC_VRAM[3][1] = Vdp2External.AC_VRAM[2][1];
-    Vdp2External.AC_VRAM[3][2] = Vdp2External.AC_VRAM[2][2];
-    Vdp2External.AC_VRAM[3][3] = Vdp2External.AC_VRAM[2][3];
-    Vdp2External.AC_VRAM[3][4] = Vdp2External.AC_VRAM[2][4];
-    Vdp2External.AC_VRAM[3][5] = Vdp2External.AC_VRAM[2][5];
-    Vdp2External.AC_VRAM[3][6] = Vdp2External.AC_VRAM[2][6];
-    Vdp2External.AC_VRAM[3][7] = Vdp2External.AC_VRAM[2][7];
+    ac[3][0] = ac[2][0];
+    ac[3][1] = ac[2][1];
+    ac[3][2] = ac[2][2];
+    ac[3][3] = ac[2][3];
+    ac[3][4] = ac[2][4];
+    ac[3][5] = ac[2][5];
+    ac[3][6] = ac[2][6];
+    ac[3][7] = ac[2][7];
   }
+
+  if (publish) memcpy(Vdp2External.AC_VRAM, ac, sizeof(ac));
 
   if (cpu_cycle_a == 0) {
     Vdp2External.cpu_cycle_a = 100;
@@ -1423,6 +1439,25 @@ void VDP2genVRamCyclePattern() {
   else {
     Vdp2External.cpu_cycle_b = 80;
   }
+}
+
+
+void VDP2genVRamCyclePattern(void)
+{
+   /* The emulation thread would clobber the mapping the renderer is using for
+    * the slot it is drawing (it reaches this at line 1 of the NEXT frame, i.e.
+    * a few hundred microseconds after the publish), so in async mode only the
+    * renderer publishes the mapping -- from the slot's own registers. */
+   Vdp2ComputeCyclePattern(Vdp2Regs, g_vdp_async ? 0 : 1);
+}
+
+/* Rebuild AC_VRAM from one specific register snapshot.  The renderer passes
+ * line 0 of the slot (the same snapshot the compositor uses for the layer
+ * registers); the emulation thread keeps calling VDP2genVRamCyclePattern().
+ */
+void Vdp2UpdateAC_VRAM(const Vdp2 *regs)
+{
+   Vdp2ComputeCyclePattern(regs, 1);
 }
 
 // 0 .. 60Hz, 1 .. no limit, 2 .. 2x(120Hz)
