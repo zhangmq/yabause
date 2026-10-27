@@ -96,7 +96,6 @@ static int g_sh2coretype = 3;
 static int g_sh2coretype = SH2CORE_INTERPRETER;
 #endif
 
-static int g_frame_skip = 1;
 /* Async renderer (core option "yabasanshiro_async_rendering").  _opt is the
  * option's intent, refreshed by check_variables(); the real g_vdp_async is
  * latched from it in retro_load_game(), because the GL context and the VDP
@@ -1873,16 +1872,6 @@ void check_variables(void)
          hle_bios_force = true;
    }
 
-   var.key = "yabasanshiro_frameskip";
-   var.value = NULL;
-   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
-   {
-      if (strcmp(var.value, "enabled") == 0)
-         g_frame_skip = 1;
-      else if (strcmp(var.value, "disabled") == 0)
-         g_frame_skip = 0;
-   }
-
    var.key = "yabasanshiro_rbg_resolution_mode";
    var.value = NULL;
    if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
@@ -2014,13 +2003,6 @@ void check_variables(void)
          polygon_mode = CPU_TESSERATION;
    }
 #endif
-
-   { extern int yab_render_ahead;
-     var.key = "yabasanshiro_render_ahead";
-     var.value = NULL;
-     if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
-        yab_render_ahead = (strcmp(var.value, "enabled") == 0);
-   }
 
    var.key = "yabasanshiro_async_rendering";
    var.value = NULL;
@@ -2596,7 +2578,7 @@ bool retro_load_game_common()
    yinit.m68kcoretype              = M68KCORE_C68K;
 #endif
    yinit.mpegpath                  = NULL;
-   yinit.frameskip                 = g_frame_skip;
+   yinit.frameskip                 = 0;   /* Auto Frameskip option removed (see frameSkipAndLimit) */
    yinit.rbg_resolution_mode       = g_rbg_resolution_mode;
    yinit.rbg_use_compute_shader    = g_rbg_use_compute_shader;
    yinit.usethreads                = 0;
@@ -3271,10 +3253,6 @@ void retro_run(void)
          if(PERCore && (prev_multitap[0] != multitap[0] || prev_multitap[1] != multitap[1]
                         || prev_service_enabled != service_enabled))
             PERCore->Init();
-         if(g_frame_skip == 1)
-            EnableAutoFrameSkip();
-         else
-            DisableAutoFrameSkip();
          yab_emu_resume();
       }
 
@@ -3316,10 +3294,6 @@ void retro_run(void)
       if(PERCore && (prev_multitap[0] != multitap[0] || prev_multitap[1] != multitap[1]
                      || prev_service_enabled != service_enabled))
          PERCore->Init();
-      if(g_frame_skip == 1)
-         EnableAutoFrameSkip();
-      else
-         DisableAutoFrameSkip();
       if (g_vdp_async)
       {
          yk_detach();
@@ -3340,8 +3314,8 @@ void retro_run(void)
     * presented, then return.  A retro_run that produced no new picture only
     * makes the frontend re-present the previous frame and count it as a frame,
     * which is why the frontend's fps read as the machine rate instead of the
-    * real picture rate.  Two things produce such a frame: the VDP2 frameskip
-    * (drawing replaced by VIDDummy) and a blanked display (TVMD bit15 clear).
+    * real picture rate.  A blanked display (TVMD bit15 clear) produces such a
+    * frame; VDP2 frameskip is gone (the frontend paces retro_run).
     *
     * No iteration cap: if the machine never presents, it never returns -- the
     * same wedge would happen inside the frontend's own loop anyway. */

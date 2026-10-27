@@ -107,19 +107,20 @@ extern "C" void yab_vdp1_generation_bump(void)
    yab_vdp1_reg_gen++;
 }
 
-/* Async renderer, no per-frame wait (core option "yabasanshiro_render_ahead",
- * default enabled; env YAB_NOWAIT=0 forces the old synchronous handshake for
- * on-device A/B).  The emulation thread runs ahead of
- * the render thread instead of blocking on it every vblank.  A frame whose
- * picture is still being drawn is simply dropped (the frontend re-presents the
- * previous one), which is what a real frameskip looks like. */
+/* The renderer is asynchronous and the emulation thread never blocks on it
+ * (the frame-slot queue only bounds how far it may run ahead), so there is no
+ * "render ahead" switch any more: the old core option was removed.  A frame
+ * whose picture is still being drawn is simply dropped (the frontend re-presents
+ * the previous one), which is what a real frameskip looks like.
+ *
+ * YAB_NOWAIT=0 is a debug-only escape hatch that still selects the old
+ * synchronous handshake paths for A/B runs; it is not reachable from the
+ * frontend and will be deleted together with the remaining VdpProc/frame
+ * package code. */
 volatile int vdp_worker_busy = 0;
 volatile int yab_pic_pending = 0;     /* a finished picture the frontend has not presented */
 volatile int vdp_posted_frame = 0;    /* frame number handed to the worker */
 volatile int vdp_composed_frame = 0;  /* frame the worker is composing */
-/* Set from the core option "yabasanshiro_render_ahead" (see check_variables),
- * default ON: the renderer is asynchronous, the emulation thread does not block
- * on it every frame.  YAB_NOWAIT=0 is a debug-only escape hatch. */
 int yab_render_ahead = 1;
 
 /* Raised (never cleared) when a game changes resolution: see yab_nowait(). */
@@ -1494,42 +1495,18 @@ void VDP2SetFrameLimit(int mode) {
 
 void frameSkipAndLimit() {
 #if defined(__LIBRETRO__)
-  /* libretro: the frontend paces retro_run, so the core must neither sleep nor
-   * spin here -- doing both made every frame pay the core-side limiter as well,
-   * and its one-second accumulator was only clamped on the positive side, so
-   * once the game ran slower than the nominal rate it went negative and the
-   * sleep grew every frame (measured: a 13 s stretch at 1.1 fps inside
-   * YabNanosleep(), VdpProc -> frameSkipAndLimit).
+  /* libretro: the frontend paces retro_run, so the core must neither sleep,
+   * spin nor skip drawing here.  The Auto Frameskip option was removed after
+   * measuring that arming a skip only swaps the VDP2 draw functions for
+   * VIDDummy: the machine still advances, the frame is left half-updated
+   * (VDP2 background only) and the presented sequence starts to depend on the
+   * host's wall clock -- which is exactly what the precise sync mode must not
+   * do.  The async slot renderer handles backpressure by dropping/duplicating
+   * pictures through its queue.
    *
-   * The *frameskip decision* is kept: yabasanshiro_frameskip is wired to
-   * autoframeskipenab, and this is the only place that arms skipnextframe.
-   * Skipping here skips only the drawing (VIDDummy), the machine still advances
-   * one frame -- that is what keeps a title from losing speed when the
-   * renderer cannot keep up.  Removing it silently disabled the core option.
-   */
-  /* With the asynchronous renderer frameskip has no value and only hurts:
-   * the emulation no longer waits for the picture, so the pipeline already
-   * drops/duplicates pictures when the renderer falls behind, while skipping
-   * here swaps the video core's draw functions for VIDDummy and leaves the
-   * frame's layers half-updated (measured symptom: a picture with the VDP2
-   * background only).  So: never arm a skip while the renderer is async. */
-  if (yab_nowait())
-  {
-     skipnextframe = 0;
-     framestoskip = 0;
-     return;
-  }
-  if (FrameAdvanceVariable == 0 && autoframeskipenab)
-  {
-     curticks = YabauseGetTicks();
-     diffticks = curticks - lastticks;
-     if (diffticks > (s64)(yabsys.OneFrameTime >> frameLimitShift))
-     {
-        skipnextframe = 1;
-        framestoskip = 1;
-     }
-     lastticks = curticks;
-  }
+   * Keep the counters cleared for the machine-side consumer. */
+  skipnextframe = 0;
+  framestoskip = 0;
   return;
 #else
   if (FrameAdvanceVariable == 0 && enableFrameLimit )
