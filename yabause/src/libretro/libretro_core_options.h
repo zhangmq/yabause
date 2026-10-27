@@ -70,6 +70,20 @@ struct retro_core_option_v2_definition option_defs_us[] = {
       "enabled"
    },
 {
+      "yabasanshiro_frameskip",
+      "Auto Frameskip",
+      NULL,
+      "Skip drawing (not emulation) when one frame takes longer than 1/60 s: the machine still runs every VBlank, so game speed and timers are unaffected, only the picture repeats. The factor follows the measured draw time.",
+      NULL,
+      "video",
+      {
+         { "disabled", NULL },
+         { "auto",     NULL },
+         { NULL, NULL },
+      },
+      "disabled"
+   },
+{
       "yabasanshiro_vdp1_fb_readback",
       "VDP1 Framebuffer Readback",
       NULL,

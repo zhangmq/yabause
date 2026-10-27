@@ -101,6 +101,10 @@ static int g_sh2coretype = SH2CORE_INTERPRETER;
  * latched from it in retro_load_game(), because the GL context and the VDP
  * worker are created once per machine boot (context_reset -> YabauseInit). */
 static int g_vdp_async_opt = 1;
+/* Auto Frameskip (core option "yabasanshiro_frameskip"): 0 = off, 1 = auto.
+ * Declared here because check_variables() (below) reads it; the skip logic
+ * lives next to the async frame-slot code. */
+static int g_frameskip = 0;
 static int g_rbg_resolution_mode = 0;
 static int g_rbg_use_compute_shader = 1;
 static int addon_cart_type = CART_DRAM32MBIT;
@@ -2021,6 +2025,14 @@ void check_variables(void)
          g_vdp_async_opt = 0;
    }
 
+   /* Auto Frameskip: skip drawing, never emulation.  See yab_render_skip(). */
+   var.key = "yabasanshiro_frameskip";
+   var.value = NULL;
+   g_frameskip = 0;
+   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+      if (strcmp(var.value, "auto") == 0 || strcmp(var.value, "enabled") == 0)
+         g_frameskip = 1;
+
    /* VDP1 framebuffer readback.  Off by default: most titles never read the
       framebuffer, and the async renderer then pays nothing.  When off the pixel
       read returns 0 (no buffer is kept); when on the render thread copies the
@@ -3081,6 +3093,112 @@ static volatile int yab_emu_running = 0;
 static volatile int yab_emu_paused = 0;
 static volatile int yab_emu_parked = 1;
 
+/* YAB_FT=<n>: debug-only per-frame cost split, off unless set.
+ *
+ * When the host cannot emulate 59.94 VBlanks per second the game runs slow, and
+ * the only questions that matter are "which stage is the ceiling" and "how much
+ * of the frame is fixed overhead".  The async path has two independent stages
+ * that overlap -- the machine thread's frame (PERCore->HandleEvents) and the
+ * frontend thread's slot render (yab_render_slot) -- so the frame rate is
+ * max(machine, render) plus the queue handover, not their sum.  This probe
+ * prints the average of both (plus how long the frontend waited for a slot,
+ * i.e. the backpressure) over <n> frames, so a slow title can be attributed
+ * instead of guessed at. */
+static u64 yab_ft_machine_ns = 0, yab_ft_render_ns = 0, yab_ft_wait_ns = 0;
+static int yab_ft_frames = 0, yab_ft_every = -1;
+static u64 yab_ft_now(void)
+{
+   struct timespec ts;
+   clock_gettime(CLOCK_MONOTONIC, &ts);
+   return (u64)ts.tv_sec * 1000000000ull + (u64)ts.tv_nsec;
+}
+static int yab_ft_on(void)
+{
+   if (yab_ft_every < 0)
+   {
+      const char *e = getenv("YAB_FT");
+      yab_ft_every = 0;
+      if (e && *e) { yab_ft_every = atoi(e); if (yab_ft_every <= 0) yab_ft_every = 60; }
+   }
+   return yab_ft_every;
+}
+static void yab_ft_report(void)
+{
+   int n = yab_ft_on();
+   if (!n) return;
+   if (++yab_ft_frames < n) return;
+   printf("[FT] n=%d machine=%.2fms render=%.2fms wait=%.2fms\n",
+          n,
+          (double)yab_ft_machine_ns / (double)n / 1e6,
+          (double)yab_ft_render_ns  / (double)n / 1e6,
+          (double)yab_ft_wait_ns    / (double)n / 1e6);
+   fflush(stdout);
+   yab_ft_machine_ns = yab_ft_render_ns = yab_ft_wait_ns = 0;
+   yab_ft_frames = 0;
+}
+
+/* Auto Frameskip (core option yabasanshiro_frameskip = disabled | auto), the
+ * async-path successor of the old VIDDummy frameskip.
+ *
+ * It skips the *draw*, never the emulation: the machine still publishes one slot
+ * per VBlank and retro_run still consumes one per call, so the game keeps running
+ * on the 59.94 Hz axis and its timers are untouched.  A skipped frame hands the
+ * slot straight back without calling video_cb at all (no duplicate!), so the
+ * frontend's present counter shows the real picture rate.
+ *
+ * How much to draw: a picture is only worth drawing while one draw still fits in
+ * the frame the emulation actually achieves, and that frame is
+ * max(machine frame time, 1/60 s) -- not 1/60 s alone.  When the machine is the
+ * slower side (it is on this device) cutting the draw budget down to 16.7 ms
+ * throws pictures away for nothing, so:
+ *     ratio = min(1, max(machine_ms, 16.7) / draw_ms)
+ * and a ratio accumulator draws when it crosses 1, which spreads the skips
+ * evenly instead of bunching them.  Both costs are measured, so the ratio
+ * follows the scene.  YAB_RENDER_SKIP=<n> forces a fixed every-n-th cadence. */
+static double yab_machine_ms_ema = 0.0;  /* one machine frame, exponential average */
+static double yab_render_ms_ema  = 0.0;  /* one draw, exponential average */
+static double yab_draw_ratio = 1.0;      /* draws per emulated frame */
+static double yab_draw_acc = 0.0;
+static int yab_skip_calls = 0;
+static int yab_skip_env = -2;            /* YAB_RENDER_SKIP override */
+static int yab_render_skip(void)
+{
+   if (yab_skip_env == -2)
+   {
+      const char *e = getenv("YAB_RENDER_SKIP");
+      yab_skip_env = (e && *e) ? atoi(e) : -1;
+   }
+
+   if (yab_skip_env >= 1)                 /* probe: fixed every-n-th cadence */
+   {
+      static int i = 0;
+      if (++i >= yab_skip_env) i = 0;
+      return i != 0;
+   }
+   if (!g_frameskip) return 0;
+
+   if (yab_skip_calls++ >= 30)
+   {
+      double period = (yab_machine_ms_ema > 16.7) ? yab_machine_ms_ema : 16.7;
+      double ratio  = (yab_render_ms_ema > 0.0) ? period / yab_render_ms_ema : 1.0;
+      yab_skip_calls = 0;
+      if (ratio > 1.0) ratio = 1.0;
+      if (ratio < 0.2) ratio = 0.2;       /* never fewer than 1 draw in 5 */
+      if (ratio != yab_draw_ratio)
+      {
+         printf("[FS] machine=%.2fms draw=%.2fms -> %.2f draws/frame (1 of %.2f)\n",
+                yab_machine_ms_ema, yab_render_ms_ema, ratio,
+                ratio > 0.0 ? 1.0 / ratio : 0.0);
+         fflush(stdout);
+      }
+      yab_draw_ratio = ratio;
+   }
+
+   yab_draw_acc += yab_draw_ratio;
+   if (yab_draw_acc >= 1.0) { yab_draw_acc -= 1.0; return 0; }   /* draw */
+   return 1;                                                     /* skip */
+}
+
 static void *yab_emu_main(void *arg)
 {
    (void)arg;
@@ -3124,8 +3242,25 @@ static void *yab_emu_main(void *arg)
        * a title screen with no VDP1 layer at all. */
       yab_bind_live_ptrs();
       YABEMU("emu:handle-events");
-      if (PERCore)
-         PERCore->HandleEvents();          /* one machine frame */
+      if (yab_ft_on() || g_frameskip)
+      {
+         /* Also feeds the auto-frameskip ratio: the picture is only worth
+          * drawing while a draw fits in the frame the machine actually
+          * achieves. */
+         u64 _t0 = yab_ft_now();
+         if (PERCore) PERCore->HandleEvents();       /* one machine frame */
+         {
+            u64 _dt = yab_ft_now() - _t0;
+            double ms = (double)_dt / 1e6;
+            yab_machine_ms_ema = (yab_machine_ms_ema <= 0.0)
+                                   ? ms
+                                   : yab_machine_ms_ema + 0.1 * (ms - yab_machine_ms_ema);
+            if (yab_ft_on())
+               __atomic_add_fetch(&yab_ft_machine_ns, _dt, __ATOMIC_RELAXED);
+         }
+      }
+      else if (PERCore)
+         PERCore->HandleEvents();                    /* one machine frame */
       YABEMU("emu:after-events");
       yab_frameslot_set_current(-1);
       sram_sync();
@@ -3259,9 +3394,38 @@ void retro_run(void)
       {
          int idx;
          YABFRONT("retro_run:wait-slot");
-         idx = yab_frameslot_wait();
+         if (yab_ft_on())
+         {
+            u64 _t0 = yab_ft_now();
+            idx = yab_frameslot_wait();
+            __atomic_add_fetch(&yab_ft_wait_ns, yab_ft_now() - _t0, __ATOMIC_RELAXED);
+         }
+         else
+            idx = yab_frameslot_wait();
+         /* Auto Frameskip: skip the draw, keep the emulation.  No video_cb at
+          * all -- a duplicate would make the frontend's counter (and the user's
+          * eye) read the machine rate instead of the real picture rate. */
+         if (yab_render_skip())
+         {
+            YABFRONT("retro_run:skip-slot");
+            yab_frameslot_release(idx);
+            yab_ft_report();
+            return;
+         }
          YABFRONT("retro_run:render-slot");
-         yab_render_slot(idx);       /* GL + YuiSwapBuffers -> video_cb */
+         {
+            u64 _t0 = yab_ft_now();
+            yab_render_slot(idx);    /* GL + YuiSwapBuffers -> video_cb */
+            {
+               u64 _dt = yab_ft_now() - _t0;
+               double ms = (double)_dt / 1e6;
+               yab_render_ms_ema = (yab_render_ms_ema <= 0.0)
+                                     ? ms
+                                     : yab_render_ms_ema + 0.1 * (ms - yab_render_ms_ema);
+               if (yab_ft_on())
+                  __atomic_add_fetch(&yab_ft_render_ns, _dt, __ATOMIC_RELAXED);
+            }
+         }
          if (!one_frame_rendered)
             /* Display off for this frame (Vdp2DrawEnd returns before YglRender,
              * so nothing presents): hand the frontend a duplicate so it keeps
@@ -3275,6 +3439,7 @@ void retro_run(void)
          YABFRONT("retro_run:release-slot");
          yab_frameslot_release(idx);
          YABFRONT("retro_run:end");
+         yab_ft_report();
       }
       return;
    }
