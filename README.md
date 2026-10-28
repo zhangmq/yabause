@@ -94,7 +94,7 @@ takes effect on the **next launch** of a game ("Core restart required").
   Yabause. Slower, but the emulated machine no longer depends on host scheduling.
 
 **A black screen while the emulator still reports a healthy frame rate was an ST-V bus race, not a
-renderer problem.** Some Titan titles booted black at a steady 60 fps with the async renderer and
+renderer problem.** Some Titan titles booted black at a steady frame rate with the async renderer and
 never with the inline one, which made the renderer look guilty; the actual cause was the SCU DMA
 writing SoundRam while the SH-2 still owned the bus, so the CPU read back half-uploaded data
 (`7d8552b5`, ported from MAME's bus arbitration). With that fixed the async renderer boots those
@@ -247,41 +247,12 @@ per-core configuration directory from the part before the first `_` (and segfaul
   only `glFinish()`es and marks the frame, so the frontend keeps its own context for its shader
   chain and swap.
 
-## Measured
+## Performance
 
-Anbernic RGSP (Allwinner H700, Mali-G31), build `v2.5.1 cfcba53f` (2026-09-20), hardware render
-through the offscreen `lrheadless` harness
-(pbuffer, same hw-render contract and option defaults as minarch-gl), CPU governor pinned to
-`performance` (1512 MHz on all four cores), **2400-frame windows**, frameskip disabled. Every row is
-the *same core* with only the **Async Renderer** option changed, so this is the cost of that switch
-and not a build-to-build comparison; the windows are no-input (attract/demo) runs, so read them as a
-rendering/threading benchmark rather than a gameplay one:
+Performance numbers are intentionally not published while the async renderer and the VDP1
+readback path are still being changed.  Final figures will only be documented once the
+implementation is frozen.
 
-| Title | `enabled` (async) | | `disabled` (inline) | | inline is |
-|---|---|---|---|---|---|
-| | fps | emulation thread | fps | emulation thread | |
-| cotton2 (ST-V) | **56.2** | 0.71 cores | 46.4 | 0.90 cores | **−17.4 %** |
-| Daytona USA | **47.1** | 0.77 cores | 43.8 | 0.91 cores | **−7.0 %** |
-| Golden Axe - The Duel | **60.6** | 0.50 cores | 54.9 | 0.80 cores | **−9.4 %** |
-
-Whole-process CPU is essentially unchanged between the two modes (1.46 / 1.53 / 1.33 cores with the
-worker vs 1.39 / 1.56 / 1.24 without): the async renderer does not do less work, it moves the
-rendering off the emulation thread's critical path. That thread is the one that matters — it is the
-one that has to fit inside a frame — and it drops by 0.14–0.30 cores.
-
-**These figures supersede the 4000-frame numbers this section used to carry** (Golden Axe 50.3 → 60.2,
-Daytona USA 33.6 → 40.4, quoted as "~+20 %"): re-measured on the same commit pair with the governor
-pinned, the async side reaches 56–61 fps and the inline side 44–55 fps, so the inline path costs
-7–17 % depending on the title. The old Daytona absolutes in particular are not reproducible. Treat
-the table above as the reference; it was taken on `e10904b6`.
-
-Known costs of the async path: the worker performs one `glFinish()` per frame (a whole-pipeline drain
-on the render thread, so the frame is complete in the shared texture before the frontend samples it
-from its own context — this is *not* the frontend's ring fence, which is a
-`glFenceSync`/`glClientWaitSync` pair guarding a slot against being overwritten while the GPU still
-reads it, and which measured as never blocking), and the presentation path adds a normalise pass in
-the frontend. The larger cost is behavioural: the emulated machine's timing then depends on host
-scheduling, which is what the *Async Renderer* option exists to turn off (see above).
 
 ## Upstream, credits and license
 

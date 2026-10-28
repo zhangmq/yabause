@@ -3297,6 +3297,7 @@ static void yab_emu_start(void)
 {
    if (yab_emu_running) return;
    yab_frameslot_init();
+   YglVdp1ReadbackResume();
    yab_emu_paused = 0;
    yab_emu_parked = 0;
    yab_emu_running = 1;
@@ -3311,6 +3312,8 @@ static void yab_emu_stop(void)
    if (!yab_emu_running) return;
    yab_emu_running = 0;
    yab_emu_paused = 0;
+   /* A blocked readback wait must not keep the thread from joining. */
+   YglVdp1ReadbackAbort();
    pthread_join(yab_emu_tid, NULL);
    yab_emu_parked = 1;
 }
@@ -3322,6 +3325,10 @@ static void yab_emu_pause(void)
    int spins = 0;
    if (!yab_emu_running) return;
    yab_emu_paused = 1;
+   /* The machine may be blocked in a VDP1 readback wait (the frontend is the
+    * only thread that can service it, and it is about to park the machine), so
+    * wake it instead of waiting for its timeout. */
+   YglVdp1ReadbackAbort();
    /* Bounded: if the machine cannot reach its safe point (it may be inside a
     * long call), carry on after ~300 ms rather than blocking the frontend for
     * ever.  A resize that races one frame is recoverable; a frozen frontend is
@@ -3331,6 +3338,7 @@ static void yab_emu_pause(void)
 
 static void yab_emu_resume(void)
 {
+   YglVdp1ReadbackResume();
    yab_emu_paused = 0;
 }
 
@@ -3418,14 +3426,29 @@ void retro_run(void)
       {
          int idx;
          YABFRONT("retro_run:wait-slot");
-         if (yab_ft_on())
+         /* A pending VDP1 readback request has the SH-2 blocked until the GL
+          * thread downloads the completed framebuffer.  Try it first (handles
+          * requests that arrived while the frontend was outside retro_run),
+          * then keep servicing tokens until a real slot comes out of the
+          * queue.  The GL context is current here, so the download is legal. */
+         YglVdp1ServiceReadback();
+         for (;;)
          {
-            u64 _t0 = yab_ft_now();
-            idx = yab_frameslot_wait();
-            __atomic_add_fetch(&yab_ft_wait_ns, yab_ft_now() - _t0, __ATOMIC_RELAXED);
+            if (yab_ft_on())
+            {
+               u64 _t0 = yab_ft_now();
+               idx = yab_frameslot_wait();
+               __atomic_add_fetch(&yab_ft_wait_ns, yab_ft_now() - _t0, __ATOMIC_RELAXED);
+            }
+            else
+               idx = yab_frameslot_wait();
+            if (idx == YAB_SLOT_READBACK_TOKEN)
+            {
+               YglVdp1ServiceReadback();
+               continue;
+            }
+            break;
          }
-         else
-            idx = yab_frameslot_wait();
          /* Auto Frameskip: skip the draw, keep the emulation, and hand the
           * frontend a duplicate picture (video_cb(NULL)) so its per-present
           * accounting still ticks every emulated frame.  The frontend is

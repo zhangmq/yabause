@@ -319,7 +319,6 @@ void yab_frameslot_publish(int idx, unsigned frame_no, int width, int height)
    s->frame_no = frame_no;
    s->width = width;
    s->height = height;
-   { static int n = 0; if ((n++ % 60) == 0) { printf("[SLOT] pub f=%u idx=%d\n", frame_no, idx); fflush(stdout); } }
 #ifdef YAB_HANGDBG
    YABEMU("publish-queue-add");
 #endif
@@ -476,9 +475,6 @@ void yab_render_slot(int idx)
    yab_frameslot_bind(idx);
    yab_frameslot_lines(idx, &lines);
    if (lines) memcpy(Vdp2Lines, lines, sizeof(Vdp2Lines));
-   { static int n = 0; if ((n++ % 30) == 0)
-       { printf("[SLOTD] idx=%d TVMD=%04X BGON=%04X f=%u\n", idx, Vdp2Regs->TVMD, Vdp2Regs->BGON,
-                yab_slots[idx] ? yab_slots[idx]->frame_no : 0); fflush(stdout); } }
    /* The PTMR direct draws of this frame are rasterized inside vdp2VBlankOUT,
     * at the same point the synchronous path draws them (after Vdp2DrawStart and
     * the erase) -- doing it earlier meant the erase wiped the polygons. */
@@ -520,6 +516,24 @@ void yab_frameslot_mark_direct_draw(void)
 unsigned yab_frameslot_frame_no(int idx)
 {
    return (idx >= 0 && idx < YAB_SLOT_COUNT && yab_slots[idx]) ? yab_slots[idx]->frame_no : 0;
+}
+
+/* Frame number of the slot the frontend is currently rendering (readback
+ * measurement probe: lets the renderer record which machine frame it just
+ * finished, so the emulation -> render lag is measurable). */
+extern "C" unsigned yab_frameslot_render_frame(void)
+{
+   return yab_frameslot_frame_no(yab_render_slot_idx);
+}
+
+/* Emulation thread: wake the frontend out of yab_frameslot_wait() so it can
+ * service a pending VDP1 readback request on the GL thread.  Non-blocking: a
+ * full queue just means the service at the top of retro_run will see the
+ * request.  The token is not a slot, so it never holds/returns a slot. */
+extern "C" int yab_frameslot_post_readback(void)
+{
+   if (yab_slot_ready_q == NULL) return 0;
+   return YabTryAddEventQueue(yab_slot_ready_q, YAB_SLOT_READBACK_TOKEN);
 }
 
 volatile unsigned yab_drop_busy = 0, yab_drop_pending = 0, yab_post_ok = 0;

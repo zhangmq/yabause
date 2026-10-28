@@ -19,6 +19,9 @@
 
 #include <stdlib.h>
 #include <math.h>
+#include <time.h>
+#include <pthread.h>
+#include <errno.h>
 #include "ygl.h"
 #include "yui.h"
 #include "vidshared.h"
@@ -34,6 +37,9 @@
 //#define YGLLOG yprintf
 
 extern u8 *Vdp1FrameBuffer[];
+/* Defined with the readback state below; used by the framebuffer writers to
+ * invalidate a pending/on-demand readback snapshot. */
+static void yab_vdp1_fb_wrote(int df);
 #ifdef YAB_VDP1DBG
 int yab_dbg_v1_quads = 0;   /* triangles submitted to the VDP1 framebuffer */
 int yab_dbg_v1_fbpix = -1;  /* non-black pixels in the VDP1 framebuffer */
@@ -1041,6 +1047,7 @@ void YglDrawCpuFramebufferWrite(int target)
     YglWindowFramebuffer(_Ygl->smallfbotex, _Ygl->vdp1fbo, _Ygl->rwidth, _Ygl->rheight, _Ygl->rwidth, _Ygl->rheight);
     _Ygl->bWriteCpuFrameBuffer = 1;
     glViewport(params[0], params[1], params[2], params[3]);
+    yab_vdp1_fb_wrote(target);
   }
   glBindFramebuffer(GL_FRAMEBUFFER, drawFboId);
 }
@@ -1076,6 +1083,288 @@ void YglDrawCpuFramebufferWrite(int target)
  * keeps a consistent buffer.  A single read burst is far shorter than a frame,
  * so the writer cannot lap the reader.
  * ------------------------------------------------------------------------- */
+
+/* ---------------------------------------------------------------------------
+ * Readback measurement probes (temporary; data for the on-demand design).
+ *
+ *   YAB_RBF=1     one summary per emulated frame that had framebuffer reads:
+ *                 count, line range, address range, distinct rows, type/CPU,
+ *                 and the renderer state at the first/last read (frame, serial,
+ *                 drawframe) so the emulation -> render lag is measurable.
+ *   YAB_RBTIME=1  split the per-frame publish into fence / blit / readPixels /
+ *                 map.  The fence wait is a probe-only extra: it tells how much
+ *                 of the stall is the VDP1 pass still running at DrawEnd.
+ *
+ * Both are inert (one getenv each) unless the variable is set.  They only add
+ * counters/logging; nothing here changes the rendered picture.
+ * ------------------------------------------------------------------------- */
+extern unsigned yab_frameslot_render_frame(void);
+
+static unsigned long long yab_rb_now_ns(void)
+{
+   struct timespec ts;
+   clock_gettime(CLOCK_MONOTONIC, &ts);
+   return (unsigned long long)ts.tv_sec * 1000000000ull + (unsigned long long)ts.tv_nsec;
+}
+
+static volatile unsigned yab_rb_rendered_serial = 0;
+static volatile unsigned yab_rb_rendered_frame = 0;
+static volatile int yab_rb_rendered_df = -1;
+static volatile unsigned long long yab_rb_rendered_ns = 0;
+/* Texture write serial of the last completed render (see yab_vdp1_fb_wserial). */
+static volatile unsigned yab_rb_rendered_wserial = 0;
+
+static struct {
+   int init, on, time_on;
+   unsigned frame;
+   unsigned reads;
+   int first_line, last_line;
+   u32 min_addr, max_addr;
+   unsigned first_pc, last_pc;
+   unsigned first_serial, last_serial;
+   unsigned first_rend_frame, last_rend_frame;
+   int first_df, last_df;
+   unsigned long long first_ns, first_rend_ns;
+   unsigned long long frame_ns;   /* wall time of this frame (FPS check) */
+   unsigned char rows[32];
+   int row_min, row_max, row_count;
+   int t_byte, t_word, t_long;
+   int cpu_m, cpu_s;
+   int serial_changed;
+   int prev_had;
+   unsigned last_read_frame;
+   int have_last;
+} yab_rbp;
+
+static void yab_rb_init(void)
+{
+   if (yab_rbp.init) return;
+   yab_rbp.init = 1;
+   yab_rbp.on = getenv("YAB_RBF") ? 1 : 0;
+   yab_rbp.time_on = getenv("YAB_RBTIME") ? 1 : 0;
+   if (yab_rbp.on || yab_rbp.time_on) {
+      printf("[RBP] armed rbf=%d time=%d\n", yab_rbp.on, yab_rbp.time_on);
+      fflush(stdout);
+   }
+}
+
+static void yab_rb_flush(void)
+{
+   long long lagf_first, lagf_last;
+   double lagms_first;
+   if (yab_rbp.reads == 0) return;
+   lagf_first = (long long)yab_rbp.frame - (long long)yab_rbp.first_rend_frame;
+   lagf_last  = (long long)yab_rbp.frame - (long long)yab_rbp.last_rend_frame;
+   lagms_first = ((double)yab_rbp.first_ns - (double)yab_rbp.first_rend_ns) / 1e6;
+   printf("[RBF] f=%u reads=%u fms=%.2f lines=%d..%d addr=%05X..%05X rows=%d..%d/%d "
+          "types=%d/%d/%d cpu=M%d/S%d rend_f=%u..%u serial=%u..%u df=%d..%d "
+          "lagf=%lld/%lld lagms=%.2f serial_changed=%d prev_had=%d\n",
+          yab_rbp.frame, yab_rbp.reads, (double)yab_rbp.frame_ns / 1e6,
+          yab_rbp.first_line, yab_rbp.last_line,
+          (unsigned)yab_rbp.min_addr, (unsigned)yab_rbp.max_addr,
+          yab_rbp.row_min, yab_rbp.row_max, yab_rbp.row_count,
+          yab_rbp.t_byte, yab_rbp.t_word, yab_rbp.t_long,
+          yab_rbp.cpu_m, yab_rbp.cpu_s,
+          yab_rbp.first_rend_frame, yab_rbp.last_rend_frame,
+          yab_rbp.first_serial, yab_rbp.last_serial,
+          yab_rbp.first_df, yab_rbp.last_df,
+          lagf_first, lagf_last, lagms_first,
+          yab_rbp.serial_changed, yab_rbp.prev_had);
+   fflush(stdout);
+   yab_rbp.last_read_frame = yab_rbp.frame;
+   yab_rbp.have_last = 1;
+   yab_rbp.reads = 0;
+   memset(yab_rbp.rows, 0, sizeof(yab_rbp.rows));
+   yab_rbp.row_min = 999;
+   yab_rbp.row_max = -1;
+   yab_rbp.row_count = 0;
+   yab_rbp.t_byte = yab_rbp.t_word = yab_rbp.t_long = 0;
+   yab_rbp.cpu_m = yab_rbp.cpu_s = 0;
+   yab_rbp.serial_changed = 0;
+   yab_rbp.prev_had = 0;
+}
+
+static int yab_rb_row(u32 addr)
+{
+   int tvmode = (Vdp1Regs->TVMR & 0x7);
+   switch (tvmode) {
+   case 0: case 2: case 4: return (int)((addr >> 10) & 0x1FF);
+   case 1: return (int)((addr >> 10) & 0x3FF);
+   case 3: return (int)((addr >> 9) & 0x1FF);
+   default: return 0;
+   }
+}
+
+static void yab_rb_note_read(int type, u32 addr)
+{
+   int row, slave;
+   yab_rb_init();
+   if (!yab_rbp.on) return;
+   if (yab_rbp.reads != 0 && yab_rbp.frame != yabsys.frame_count)
+      yab_rb_flush();
+   if (yab_rbp.reads == 0) {
+      yab_rbp.frame = yabsys.frame_count;
+      yab_rbp.first_ns = yab_rb_now_ns();
+      yab_rbp.first_serial = yab_rb_rendered_serial;
+      yab_rbp.last_serial = yab_rb_rendered_serial;
+      yab_rbp.first_rend_frame = yab_rb_rendered_frame;
+      yab_rbp.last_rend_frame = yab_rb_rendered_frame;
+      yab_rbp.first_df = yab_rb_rendered_df;
+      yab_rbp.last_df = yab_rb_rendered_df;
+      yab_rbp.first_rend_ns = yab_rb_rendered_ns;
+      yab_rbp.prev_had = (yab_rbp.have_last &&
+                          yab_rbp.last_read_frame + 1 == yabsys.frame_count);
+      yab_rbp.first_line = yab_rbp.last_line = (int)yabsys.LineCount;
+      yab_rbp.min_addr = yab_rbp.max_addr = addr;
+      yab_rbp.first_pc = yab_rbp.last_pc = (unsigned)(CurrentSH2 ? CurrentSH2->regs.PC : 0);
+      yab_rbp.row_min = 999;
+      yab_rbp.row_max = -1;
+      yab_rbp.row_count = 0;
+   }
+   yab_rbp.reads++;
+   yab_rbp.last_line = (int)yabsys.LineCount;
+   if (addr < yab_rbp.min_addr) yab_rbp.min_addr = addr;
+   if (addr > yab_rbp.max_addr) yab_rbp.max_addr = addr;
+   yab_rbp.last_pc = (unsigned)(CurrentSH2 ? CurrentSH2->regs.PC : 0);
+   yab_rbp.last_serial = yab_rb_rendered_serial;
+   yab_rbp.last_rend_frame = yab_rb_rendered_frame;
+   yab_rbp.last_df = yab_rb_rendered_df;
+   if (yab_rbp.last_serial != yab_rbp.first_serial) yab_rbp.serial_changed = 1;
+   switch (type) {
+   case 0: yab_rbp.t_byte++; break;
+   case 1: yab_rbp.t_word++; break;
+   case 2: yab_rbp.t_long++; break;
+   default: break;
+   }
+   slave = (CurrentSH2 && CurrentSH2->isslave) ? 1 : 0;
+   if (slave) yab_rbp.cpu_s++; else yab_rbp.cpu_m++;
+   row = yab_rb_row(addr);
+   if (row >= 0 && row < 256) {
+      unsigned char mask = (unsigned char)(1u << (row & 7));
+      if ((yab_rbp.rows[row >> 3] & mask) == 0) {
+         yab_rbp.rows[row >> 3] |= mask;
+         yab_rbp.row_count++;
+      }
+      if (row < yab_rbp.row_min) yab_rbp.row_min = row;
+      if (row > yab_rbp.row_max) yab_rbp.row_max = row;
+   }
+}
+
+/* Emulation thread, once per frame (called from the frame-end probe hook). */
+void YglVdp1ReadbackProbeFrameEnd(void)
+{
+   static unsigned long long prev_ns = 0, win_ns = 0;
+   static unsigned win_frame = 0, win_reads = 0;
+   unsigned long long now;
+   unsigned cur_reads;
+
+   yab_rb_init();
+   if (!yab_rbp.on) return;
+   now = yab_rb_now_ns();
+   cur_reads = yab_rbp.reads;
+   win_reads += cur_reads;
+   if (cur_reads > 0)
+   {
+      yab_rbp.frame_ns = prev_ns ? (now - prev_ns) : 0;
+      yab_rb_flush();
+   }
+   prev_ns = now;
+   if (win_ns == 0) { win_ns = now; win_frame = yabsys.frame_count; return; }
+   if ((unsigned)(yabsys.frame_count - win_frame) >= 10)
+   {
+      unsigned df = (unsigned)(yabsys.frame_count - win_frame);
+      double ms = (double)(now - win_ns) / 1e6;
+      printf("[FPS] f=%u..%u n=%u ms=%.1f fps=%.2f reads=%u\n",
+             win_frame, (unsigned)yabsys.frame_count, df, ms,
+             ms > 0.0 ? (double)df * 1000.0 / ms : 0.0, win_reads);
+      fflush(stdout);
+      win_ns = now;
+      win_frame = yabsys.frame_count;
+      win_reads = 0;
+   }
+}
+
+/* Publish timing, filled by YglVdp1ReadbackMap on the render thread. */
+static unsigned long long yab_rbt_ns[5];
+static int yab_rbt_valid = 0;
+
+/* ---------------------------------------------------------------------------
+ * On-demand readback state (async renderer + "yabasanshiro_vdp1_fb_readback").
+ *
+ * The renderer no longer downloads every frame.  It only records which frame
+ * (drawframe + serial + texture write serial) it finished last; the SH-2 asks
+ * for a CPU copy on its first real read of that rendered frame, waits for the
+ * GL thread to service it, and then decodes the snapshot.  A burst of reads
+ * (batmanfr reads ~4500 words per frame for ~19 consecutive frames) costs one
+ * service per *rendered* frame: the snapshot's serial is the render serial.
+ *
+ * The service deliberately reads the texture of the *last completed* render,
+ * not the one being drawn: its VDP1 pass is already done, so the download is
+ * blit + glReadPixels + map (~1.4 ms measured) instead of waiting for the
+ * in-flight VDP1 pass (~5-8 ms at DrawEnd).  The per-df write serial catches
+ * the case where that texture was already erased/redrawn by a later frame.
+ *
+ * All shared state is guarded by rb_mtx.  The reader waits on rb_cond with a
+ * hard timeout; YglVdp1ReadbackAbort() wakes it when the machine is paused or
+ * stopped, so a missing/parked GL thread can never wedge the emulation.
+ * ------------------------------------------------------------------------- */
+extern int yab_frameslot_post_readback(void);
+
+static pthread_once_t rb_once = PTHREAD_ONCE_INIT;
+static pthread_mutex_t rb_mtx;
+static pthread_cond_t rb_cond;
+
+static int rb_req_pending;
+static unsigned rb_req_id;
+static unsigned rb_req_done_id;
+static int rb_req_ok;
+static unsigned rb_req_serial;
+static int rb_req_df;
+static unsigned rb_req_wserial;
+static unsigned long long rb_req_ns;
+static unsigned rb_pub_serial;
+static int rb_pub_df = -1;
+static int rb_abort;
+static unsigned rb_services, rb_timeouts, rb_fallbacks, rb_prefetches;
+
+/* Read-triggered prefetch window (see YglVdp1PublishCpu): once the SH-2 has
+ * read the framebuffer, keep downloading the just-finished frame on the render
+ * thread for a few frames, so the reads hit the snapshot instead of blocking
+ * the machine for the GPU queue.  It self-expires when the reads stop. */
+#define RB_PREFETCH_WINDOW 4u
+static volatile unsigned rb_last_read_frame = (unsigned)-1;
+
+/* Per-drawframe texture write counter.  Bumped whenever something writes that
+ * framebuffer texture (VDP1 erase, VDP1 draws, CPU-write merge), so a service
+ * can tell whether the texture it was asked for still holds that frame. */
+static volatile unsigned yab_vdp1_fb_wserial[2];
+
+static void yab_vdp1_fb_wrote(int df)
+{
+   if (df >= 0 && df < 2) yab_vdp1_fb_wserial[df]++;
+}
+
+static void rb_state_init_once(void)
+{
+   pthread_mutex_init(&rb_mtx, NULL);
+   pthread_cond_init(&rb_cond, NULL);
+}
+
+static void rb_state_init(void)
+{
+   pthread_once(&rb_once, rb_state_init_once);
+}
+
+/* Service a pending readback request on the GL thread.  Returns 1 when a
+ * snapshot was published, 0 when there was nothing to do.  Safe to call from
+ * the frontend thread at any point where the core's GL context is current. */
+int YglVdp1ServiceReadback(void);
+
+/* Wake a reader blocked in the readback wait (pause / stop / teardown). */
+void YglVdp1ReadbackAbort(void);
+void YglVdp1ReadbackResume(void);
+/* Drop the published snapshot and any pending request (resolution change). */
+void YglVdp1ReadbackReset(void);
 
 static int YglVdp1ReadbackInit(void)
 {
@@ -1170,27 +1459,39 @@ static void YglVdp1BlitToSmall(int df)
 
 static const unsigned char *YglVdp1ReadbackMap(int df)
 {
+  unsigned long long t0, t1, t2, t3, t4;
   FrameProfileAdd("ReadFrameBuffer start");
   FRAMELOG("READ FRAME");
+  t0 = yab_rb_now_ns();
   if (_Ygl->sync != 0)
   {
-    /* The explicit wait belongs to the old worker hand-off, where the drawing
-     * was submitted by another thread.  In the async per-frame download the
-     * blit/read are ordered after the draws by the GL command stream of the
-     * very same context.  Release the fence either way so it does not leak. */
+    /* The explicit wait belongs to the synchronous renderer, where the read is
+     * issued on the drawing thread and the fence marks the VDP1 draws.  The
+     * async service reads the *completed* frame (its pass is already done), so
+     * there is no fence to wait on; release the old one if present. */
     if (!g_vdp_async)
       glWaitSync(_Ygl->sync, 0, GL_TIMEOUT_IGNORED);
     glDeleteSync(_Ygl->sync);
     _Ygl->sync = 0;
   }
+  t1 = yab_rb_now_ns();
 
   YglVdp1BlitToSmall(df);
+  t2 = yab_rb_now_ns();
   glBindFramebuffer(GL_FRAMEBUFFER, _Ygl->smallfbo);
   glBindBuffer(GL_PIXEL_PACK_BUFFER, _Ygl->vdp1pixelBufferID);
   glReadPixels(0, 0, _Ygl->rwidth, _Ygl->rheight, GL_RGBA, GL_UNSIGNED_BYTE, 0);
+  t3 = yab_rb_now_ns();
   _Ygl->pFrameBuffer = (unsigned int *)glMapBufferRange(GL_PIXEL_PACK_BUFFER, 0,
       _Ygl->rwidth * _Ygl->rheight * 4, GL_MAP_READ_BIT);
+  t4 = yab_rb_now_ns();
   glBindFramebuffer(GL_FRAMEBUFFER, _Ygl->default_fbo);
+  yab_rbt_ns[0] = t1 - t0;   /* fence */
+  yab_rbt_ns[1] = t2 - t1;   /* blit */
+  yab_rbt_ns[2] = t3 - t2;   /* glReadPixels */
+  yab_rbt_ns[3] = t4 - t3;   /* map */
+  yab_rbt_ns[4] = t4 - t0;   /* total */
+  yab_rbt_valid = 1;
   FrameProfileAdd("ReadFrameBuffer unlock");
   return (const unsigned char *)_Ygl->pFrameBuffer;
 }
@@ -1245,39 +1546,232 @@ static void YglVdp1PublishPixels(int df, const unsigned char *src, size_t bytes)
  * SH-2 decodes.  No-op unless the async renderer and the readback option are
  * on.  Straightforward on purpose: this is a corner case (one title), so it
  * reads and maps in one go instead of carrying a deferred pipeline. */
-void YglVdp1PublishCpu(int df)
+/* GL thread: serve the pending readback request (state block above).  Reads the
+ * texture of the last completed render, so its VDP1 pass is already done; the
+ * only wait left is the blit + PBO transfer (~1.4 ms measured on the device).
+ * Returns 1 when a snapshot was published. */
+int YglVdp1ServiceReadback(void)
 {
+  unsigned id, req_serial, req_wserial;
+  int req_df, df, ok = 0, fallback = 0;
+  unsigned served_serial = 0;
+  int served_df = -1;
   const unsigned char *px;
   size_t bytes;
-  int w, h;
+  GLint saved_fbo = 0;
+  unsigned long long t0 = 0;
 
-  if (!g_vdp_async || !yab_vdp1_fb_readback)
-    return;
-  if (df < 0 || df > 1)
-    return;
-  if (YglVdp1ReadbackInit() != 0)
+  rb_state_init();
+  pthread_mutex_lock(&rb_mtx);
+  if (!rb_req_pending)
   {
-    static int warned;
-    if (!warned)
-    {
-      YGLLOG("VDP1 readback: GL objects unavailable, SH-2 will read the CPU shadow\n");
-      warned = 1;
-    }
-    return;
+     pthread_mutex_unlock(&rb_mtx);
+     return 0;
+  }
+  id = rb_req_id;
+  req_serial = rb_req_serial;
+  req_df = rb_req_df;
+  req_wserial = rb_req_wserial;
+  t0 = rb_req_ns;
+  pthread_mutex_unlock(&rb_mtx);
+
+  df = req_df;
+  if (df < 0 || df > 1 || yab_vdp1_fb_wserial[df] != req_wserial)
+  {
+     /* That texture was erased/redrawn after the frame the reader saw (or the
+      * request did not name one): serve the latest completed render instead.
+      * Double buffering means the previous frame's texture is still intact. */
+     df = yab_rb_rendered_df;
+     fallback = 1;
+     if (df < 0 || df > 1 || yab_vdp1_fb_wserial[df] != yab_rb_rendered_wserial)
+     {
+        fallback = 0;
+        df = -1;
+     }
   }
 
-  w = _Ygl->rwidth;
-  h = _Ygl->rheight;
-  bytes = (size_t)w * (size_t)h * 4;
-
-  px = YglVdp1ReadbackMap(df);
-  if (px == NULL)
+  if (df >= 0 && g_vdp_async && yab_vdp1_fb_readback)
   {
-    YglVdp1ReadbackUnmap();
-    return;
+     if (YglVdp1ReadbackInit() == 0)
+     {
+        glGetIntegerv(GL_FRAMEBUFFER_BINDING, &saved_fbo);
+        bytes = (size_t)_Ygl->rwidth * (size_t)_Ygl->rheight * 4;
+        px = YglVdp1ReadbackMap(df);
+        if (px != NULL)
+        {
+           YglVdp1PublishPixels(df, px, bytes);
+           YglVdp1ReadbackUnmap();
+           ok = 1;
+        }
+        else
+           YglVdp1ReadbackUnmap();
+        glBindFramebuffer(GL_FRAMEBUFFER, (GLuint)saved_fbo);
+     }
+     else
+     {
+        static int warned;
+        if (!warned)
+        {
+           YGLLOG("VDP1 readback: GL objects unavailable, SH-2 reads 0\n");
+           warned = 1;
+        }
+     }
   }
-  YglVdp1PublishPixels(df, px, bytes);
-  YglVdp1ReadbackUnmap();
+
+  pthread_mutex_lock(&rb_mtx);
+  rb_services++;
+  rb_req_ok = ok ? 1 : 0;
+  if (ok)
+  {
+     served_serial = fallback ? yab_rb_rendered_serial : req_serial;
+     served_df = df;
+     rb_pub_serial = served_serial;
+     rb_pub_df = df;
+     if (fallback) rb_fallbacks++;
+  }
+  if (rb_req_id == id)
+     rb_req_pending = 0;
+  rb_req_done_id = id;
+  pthread_cond_broadcast(&rb_cond);
+  pthread_mutex_unlock(&rb_mtx);
+
+  if (yab_rbp.time_on && yab_rbt_valid)
+  {
+     printf("[RBSVC] f=%u target=%u/%d served=%u/%d wait=%.2f "
+            "blit=%.2f readpx=%.2f map=%.2f total=%.2fms ok=%d fb=%d\n",
+            (unsigned)yabsys.frame_count, req_serial, req_df,
+            served_serial, served_df,
+            t0 ? (double)(yab_rb_now_ns() - t0) / 1e6 : 0.0,
+            (double)yab_rbt_ns[1] / 1e6, (double)yab_rbt_ns[2] / 1e6,
+            (double)yab_rbt_ns[3] / 1e6, (double)yab_rbt_ns[4] / 1e6,
+            ok, fallback);
+     fflush(stdout);
+  }
+  return ok;
+}
+
+void YglVdp1ReadbackAbort(void)
+{
+  rb_state_init();
+  pthread_mutex_lock(&rb_mtx);
+  rb_abort = 1;
+  pthread_cond_broadcast(&rb_cond);
+  pthread_mutex_unlock(&rb_mtx);
+}
+
+void YglVdp1ReadbackResume(void)
+{
+  rb_state_init();
+  pthread_mutex_lock(&rb_mtx);
+  rb_abort = 0;
+  pthread_mutex_unlock(&rb_mtx);
+}
+
+void YglVdp1ReadbackReset(void)
+{
+  rb_state_init();
+  pthread_mutex_lock(&rb_mtx);
+  rb_req_pending = 0;
+  rb_req_id++;
+  rb_req_done_id = rb_req_id;
+  rb_req_ok = 0;
+  rb_pub_serial = 0;
+  rb_pub_df = -1;
+  pthread_cond_broadcast(&rb_cond);
+  pthread_mutex_unlock(&rb_mtx);
+}
+
+void YglVdp1PublishCpu(int df)
+{
+  unsigned serial;
+
+  /* Record which frame the renderer just completed (drawframe + texture write
+   * serial + machine frame) so the SH-2's next read can ask for exactly that
+   * texture.  See the on-demand state block above. */
+  yab_rb_init();
+  rb_state_init();
+  pthread_mutex_lock(&rb_mtx);
+  serial = ++yab_rb_rendered_serial;
+  yab_rb_rendered_df = df;
+  yab_rb_rendered_frame = yab_frameslot_render_frame();
+  yab_rb_rendered_ns = yab_rb_now_ns();
+  yab_rb_rendered_wserial =
+      (df >= 0 && df < 2) ? yab_vdp1_fb_wserial[df] : 0;
+  pthread_mutex_unlock(&rb_mtx);
+
+  /* Probe (YAB_RBF): service/timeout counters, so a non-reading title visibly
+   * stays at zero services (the readback option's zero-cost criterion). */
+  if (yab_rbp.on && (yabsys.frame_count % 600u) == 0)
+  {
+     printf("[RBC] f=%u services=%u timeouts=%u fallbacks=%u prefetch=%u pub=%u/%d\n",
+            (unsigned)yabsys.frame_count, rb_services, rb_timeouts,
+            rb_fallbacks, rb_prefetches, rb_pub_serial, rb_pub_df);
+     fflush(stdout);
+  }
+
+  /* Prewarm the on-demand path on the first rendered frame.  The shader blit
+   * compiles its program on first use (measured ~18 ms on the device), which
+   * made the first read frames miss their wait budget; do it here, at startup,
+   * while nobody is reading.  Only allocates the small FBO/PBO and compiles
+   * one program: no per-frame cost afterwards. */
+  if (g_vdp_async && yab_vdp1_fb_readback)
+  {
+     static int prewarmed = 0;
+     if (!prewarmed)
+     {
+        prewarmed = 1;
+        if (YglVdp1ReadbackInit() == 0)
+        {
+           GLint saved_fbo = 0;
+           glGetIntegerv(GL_FRAMEBUFFER_BINDING, &saved_fbo);
+           YglVdp1BlitToSmall(df);
+           glBindFramebuffer(GL_FRAMEBUFFER, (GLuint)saved_fbo);
+        }
+     }
+  }
+
+  /* Read-triggered prefetch (hot window).  The SH-2 read path stamps
+   * rb_last_read_frame; for a few frames after any read, download the frame
+   * that was just rasterised here, on the render thread.  Its wait for the
+   * GPU queue is absorbed by the vsync slack (the old per-frame publish did
+   * the same and still held 60 fps), while the SH-2 reads hit the snapshot
+   * instead of blocking for 6-32 ms.  Without reads this is a no-op, so a
+   * non-reading title still pays nothing.  Self-expires when reads stop. */
+  if (g_vdp_async && yab_vdp1_fb_readback && df >= 0 && df < 2 &&
+      rb_last_read_frame != (unsigned)-1 &&
+      (unsigned)(yabsys.frame_count - rb_last_read_frame) <= RB_PREFETCH_WINDOW)
+  {
+     if (YglVdp1ReadbackInit() == 0)
+     {
+        GLint saved_fbo = 0;
+        const unsigned char *px;
+        size_t bytes = (size_t)_Ygl->rwidth * (size_t)_Ygl->rheight * 4;
+        glGetIntegerv(GL_FRAMEBUFFER_BINDING, &saved_fbo);
+        px = YglVdp1ReadbackMap(df);
+        if (px != NULL)
+        {
+           YglVdp1PublishPixels(df, px, bytes);
+           YglVdp1ReadbackUnmap();
+           pthread_mutex_lock(&rb_mtx);
+           rb_pub_serial = serial;
+           rb_pub_df = df;
+           if (rb_req_pending && rb_req_serial <= serial)
+           {
+              /* A read that arrived while this frame was being drawn: the
+               * snapshot is at least as new as its target, so satisfy it. */
+              rb_req_done_id = rb_req_id;
+              rb_req_ok = 1;
+              rb_req_pending = 0;
+           }
+           rb_prefetches++;
+           pthread_cond_broadcast(&rb_cond);
+           pthread_mutex_unlock(&rb_mtx);
+        }
+        else
+           YglVdp1ReadbackUnmap();
+        glBindFramebuffer(GL_FRAMEBUFFER, (GLuint)saved_fbo);
+     }
+  }
 }
 
 /* Emulation thread: the snapshot for this drawframe, or NULL when the option is
@@ -1293,8 +1787,88 @@ static const unsigned char *YglVdp1CpuSnapshot(int df)
   return _Ygl->vdp1_fb_cpu[df];
 }
 
+/* Emulation thread: the snapshot for the last completed render, publishing it
+ * on demand if this rendered frame has not been downloaded yet.  This is where
+ * the SH-2 blocks: the frontend wakes on the request token, downloads the
+ * completed framebuffer (blit+readPixels+map), publishes it and signals.
+ *
+ * Returns NULL when there is nothing rendered yet, the option is off, or the
+ * service failed/timed out without any usable snapshot.  The timeout is a hard
+ * safety net (pause/stop/teardown); the normal case waits for one service. */
+static const unsigned char *YglVdp1SnapshotOnDemand(void)
+{
+  const unsigned char *fb = NULL;
+  unsigned id, req_serial, req_wserial;
+  int req_df;
+  const int timeout_ms = 50;
+  struct timespec deadline;
+
+  if (!yab_vdp1_fb_readback)
+    return NULL;
+  rb_state_init();
+
+  pthread_mutex_lock(&rb_mtx);
+  req_serial = yab_rb_rendered_serial;
+  req_df = yab_rb_rendered_df;
+  req_wserial = yab_rb_rendered_wserial;
+  if (req_serial == 0 || req_df < 0 || req_df > 1)
+  {
+     pthread_mutex_unlock(&rb_mtx);
+     return NULL;   /* no frame has been rendered yet: no GPU pixels */
+  }
+  /* Already downloaded for exactly this rendered frame? */
+  if (rb_pub_serial == req_serial && rb_pub_df == req_df)
+  {
+     fb = YglVdp1CpuSnapshot(req_df);
+     pthread_mutex_unlock(&rb_mtx);
+     return fb;
+  }
+
+  id = ++rb_req_id;
+  rb_req_pending = 1;
+  rb_req_serial = req_serial;
+  rb_req_df = req_df;
+  rb_req_wserial = req_wserial;
+  rb_req_ns = yab_rb_now_ns();
+  rb_req_ok = 0;
+  /* Wake the frontend out of yab_frameslot_wait().  Non-blocking: if the queue
+   * is full the service at the top of retro_run picks the request up. */
+  yab_frameslot_post_readback();
+
+  clock_gettime(CLOCK_REALTIME, &deadline);
+  deadline.tv_sec += timeout_ms / 1000;
+  deadline.tv_nsec += (long)(timeout_ms % 1000) * 1000000L;
+  if (deadline.tv_nsec >= 1000000000L)
+  {
+     deadline.tv_sec++;
+     deadline.tv_nsec -= 1000000000L;
+  }
+  while (!rb_abort && rb_req_done_id != id)
+  {
+     if (pthread_cond_timedwait(&rb_cond, &rb_mtx, &deadline) == ETIMEDOUT)
+        break;
+  }
+
+  if (rb_abort || rb_req_done_id != id || !rb_req_ok)
+  {
+     rb_timeouts++;
+     /* Fall back to whatever was published before (better than zeros: the
+      * effect would otherwise draw nothing).  The next read retries. */
+     if (rb_pub_df >= 0)
+        fb = YglVdp1CpuSnapshot(rb_pub_df);
+     if (fb == NULL && rb_pub_df != req_df)
+        fb = YglVdp1CpuSnapshot(req_df);
+     pthread_mutex_unlock(&rb_mtx);
+     return fb;
+  }
+  fb = YglVdp1CpuSnapshot(rb_pub_df);
+  pthread_mutex_unlock(&rb_mtx);
+  return fb;
+}
+
 void VIDOGLVdp1ReadFrameBuffer(u32 type, u32 addr, void *out)
 {
+  yab_rb_note_read((int)type, addr);
   u32 x = 0;
   u32 y = 0;
   int tvmode = (Vdp1Regs->TVMR & 0x7);
@@ -1335,7 +1909,13 @@ void VIDOGLVdp1ReadFrameBuffer(u32 type, u32 addr, void *out)
   if (g_vdp_async && !cpu_shadow)
   {
     if (yab_vdp1_fb_readback)
-      fb = YglVdp1CpuSnapshot(_Ygl->drawframe);
+    {
+      /* Stamp the read for the render thread's read-triggered prefetch: after
+       * the first read it keeps the completed frame downloaded for a few
+       * frames, so the machine does not block on the GPU queue per frame. */
+      rb_last_read_frame = yabsys.frame_count;
+      fb = YglVdp1SnapshotOnDemand();
+    }
     if (fb == NULL)
     {
       /* Readback off (or no snapshot yet): the pixels VDP1 rasterised live in
@@ -3482,6 +4062,7 @@ void YglEraseWriteVDP1(void) {
   glClearColor((color & 0x1F) / 31.0f, ((color >> 5) & 0x1F) / 31.0f, ((color >> 10) & 0x1F) / 31.0f, alpha / 255.0f);
   glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
   FRAMELOG("YglEraseWriteVDP1xx: clear %d\n", _Ygl->readframe);
+  yab_vdp1_fb_wrote(_Ygl->readframe);
 
   if (_Ygl->bWriteCpuFrameBuffer)
   {
@@ -3649,7 +4230,15 @@ void YglRenderVDP1(void)
     _Ygl->sync = 0;
   }
 
-  _Ygl->sync = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+  /* The fence belongs to the synchronous renderer, which reads the texture on
+   * the drawing thread.  The async renderer never waits on it and no longer
+   * publishes every frame; creating one per frame would just leak a GLsync. */
+  if (!g_vdp_async)
+    _Ygl->sync = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+
+  /* This drawframe's content changed: a readback request that named it before
+   * this point must not be served from this texture any more. */
+  yab_vdp1_fb_wrote(_Ygl->drawframe);
 
 #ifdef YAB_VDP1DBG
   {
@@ -5360,6 +5949,8 @@ void YglChangeResolution(int w, int h)
       /* the published snapshots are sized for the old resolution */
       _Ygl->vdp1_fb_ready[0] = 0;
       _Ygl->vdp1_fb_ready[1] = 0;
+      /* drop any pending request and force the next read to be serviced */
+      YglVdp1ReadbackReset();
     }
 
     if (_Ygl->tmpfbo != 0)
