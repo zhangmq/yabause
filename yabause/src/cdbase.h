@@ -78,6 +78,13 @@ typedef struct
 
 extern CDInterface DummyCD;
 
+/* Read the Saturn IP.BIN region field (offset 0x40, 16 bytes) from a disc
+ * image without initialising the CD block.  Used by retro_load_game() to pick
+ * the video standard before the frontend asks for av_info/region.
+ * Supported: .chd (CD), .iso, .bin and .cue (first FILE/track).  Returns 0 on
+ * success (region is NUL-terminated), -1 otherwise. */
+int ISOCDReadRegionCode(const char *image_path, char *region, size_t region_size);
+
 extern CDInterface ISOCD;
 
 extern CDInterface ArchCD;

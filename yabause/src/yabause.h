@@ -201,6 +201,15 @@ typedef struct
 
 extern yabsys_struct yabsys;
 
+/* One video frame in the units the CPU/SCSP timing code uses.  The SCSP clock
+ * is 11.2896 MHz, so a frame is 225792 68k cycles at 50 Hz (PAL) and 188160 at
+ * 60 Hz (NTSC).  Keep this as the single source: the 68k lockstep, the async
+ * SCSP thread's frame wall-clock and the per-line budget all derive from it.
+ * The 68k core is 11.2896 MHz in both standards (yabause.c clock constants). */
+#define YAB_FRAME_HZ      (yabsys.IsPal ? 50 : 60)
+#define YAB_FRAME_CYCLES  (yabsys.IsPal ? 225792 : 188160)
+#define YAB_FRAME_NS      (yabsys.IsPal ? 20000000L : 16666666L)
+
 int YabauseEmulate(void);
 
 extern u32 saved_scsp_cycles;

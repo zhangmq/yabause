@@ -56,6 +56,21 @@ struct retro_core_option_v2_definition option_defs_us[] = {
       "opengl"
    },
 {
+      "yabasanshiro_videoformattype",
+      "Video Format",
+      NULL,
+      "Auto reads the disc region (E/A/L = PAL 50 fps/313 lines, J/U/T/K/B = NTSC 60 fps/263 lines; unreadable defaults to NTSC). Force NTSC to play a PAL game at 60. ST-V is always NTSC. Core restart required.",
+      NULL,
+      "video",
+      {
+         { "auto", "Auto" },
+         { "NTSC", NULL },
+         { "PAL",  NULL },
+         { NULL, NULL },
+      },
+      "auto"
+   },
+{
       "yabasanshiro_async_rendering",
       "Async Renderer",
       NULL,
@@ -73,7 +88,7 @@ struct retro_core_option_v2_definition option_defs_us[] = {
       "yabasanshiro_frameskip",
       "Auto Frameskip",
       NULL,
-      "Skip drawing (not emulation) when one frame takes longer than 1/60 s: the machine still runs every VBlank, so game speed and timers are unaffected, only the picture repeats. The factor follows the measured draw time.",
+      "Skip drawing (not emulation) when one draw does not fit the frame budget (1/60 s NTSC, 1/50 s PAL): the machine still runs every VBlank, so game speed and timers are unaffected, only the picture repeats. The factor follows the measured draw time.",
       NULL,
       "video",
       {

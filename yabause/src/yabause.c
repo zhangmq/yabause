@@ -959,14 +959,16 @@ static int yab_68k_lock_on(void)
  * 188160-cycle frame: measured on seabass, only +94080 boots (0 / +47040 /
  * +141120 / +188160 all stay black), i.e. the sound CPU has to lead the SH-2
  * frame by half a frame.  The precise sync mode uses phase 0; YAB_68KLOCK can
- * override both for A/B runs. */
+ * override both for A/B runs.  The half-frame default is derived from the
+ * active video standard (ST-V is always NTSC; PAL = 112896). */
 static long yab_68k_lock_off(void)
 {
-   static int init = 0; static long off = 94080;
+   static int init = 0; static long off;
    if (!init)
    {
       const char *e = getenv("YAB_68KLOCK");
       init = 1;
+      off = YAB_FRAME_CYCLES / 2;
       if (e && *e)
       {
          if (strcmp(e, "off") && strcmp(e, "no")) off = strtol(e, NULL, 10);
@@ -1065,7 +1067,7 @@ int YabauseEmulate(void) {
       }
       {
          long off = (long)yab_68k_lock_off();
-         u64 want = base68 + (u64)(yabsys.frame_count - basef) * 188160ull;
+         u64 want = base68 + (u64)(yabsys.frame_count - basef) * (u64)YAB_FRAME_CYCLES;
          int spins = 0;
          if (off >= 0) want += (u64)off;
          else          want -= (u64)(-off);
@@ -1078,7 +1080,7 @@ int YabauseEmulate(void) {
           * the sound thread. */
          {
             u64 d = (yab_68k_cycles > want) ? (yab_68k_cycles - want) : (want - yab_68k_cycles);
-            if (d > 2ull * 188160ull)
+            if (d > 2ull * (u64)YAB_FRAME_CYCLES)
             {
                base68 = yab_68k_cycles; basef = yabsys.frame_count;
                want = base68;
@@ -1137,7 +1139,7 @@ int YabauseEmulate(void) {
              *                 cap in step with the SH-2;
              *   sync       -> no slack and no per-scanline publish. */
             extern volatile int yab_68k_keepclock;
-            u64 slack = (thr_mode >= 1 && thr_mode <= 2) ? 188160ull : 0ull;
+            u64 slack = (thr_mode >= 1 && thr_mode <= 2) ? (u64)YAB_FRAME_CYCLES : 0ull;
             yab_68k_keepclock = (thr_mode == 2);
             /* steady: no frame of slack, the per-scanline publish below grows
              * the cap in step with the SH-2 instead. */
@@ -1312,7 +1314,7 @@ yab_68k_lock_done: ;
          {
             unsigned mlc = yabsys.MaxLineCount ? yabsys.MaxLineCount : 263;
             __atomic_store_n(&yab_68k_allow,
-                             yab_68k_line_want + (u64)local_line * 188160ull / (u64)mlc,
+                             yab_68k_line_want + (u64)local_line * (u64)YAB_FRAME_CYCLES / (u64)mlc,
                              __ATOMIC_RELEASE);
             yab_68k_kick();
          }
@@ -1323,7 +1325,7 @@ yab_68k_lock_done: ;
          if (local_line == yabsys.VBlankLineCount) {
 
 #if defined(ASYNC_SCSP)
-            setM68kCounter((u64)(44100 * 256 / 60) << SCSP_FRACTIONAL_BITS);
+            setM68kCounter((u64)YAB_FRAME_CYCLES << SCSP_FRACTIONAL_BITS);
 #endif
             PROFILE_START("vblankin");
             // VBlankIN
