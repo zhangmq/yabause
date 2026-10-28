@@ -106,6 +106,24 @@ There is no build-time switch left: `make platform=arm64 YAB_SYNC=1` no longer c
 (the defines it removes no longer gate code). For A/B runs the environment variable
 `YAB_VDP_SYNC=1` forces the inline path.
 
+### Video format (PAL / NTSC)
+
+The core option **Video Format** (`yabasanshiro_videoformattype`, category *Video*, default `auto`)
+selects the emulated Saturn video standard:
+
+* `auto` reads the disc's IP.BIN region field when the game is loaded: `E`/`A`/`L` -> PAL
+  (50 fps, 313 lines, 882 audio samples/frame), `J`/`U`/`T`/`K`/`B` -> NTSC (60 fps, 263 lines,
+  735 samples/frame). A multi-region disc follows its first area code, exactly like the engine's
+  `Cs2GetIP()` autodetect. An unreadable or unknown header falls back to NTSC.
+* `NTSC` forces 60 fps -- this is how a PAL game can be played at 60 if desired.
+* `PAL` forces 50 fps.
+
+ST-V is NTSC-only hardware, so the option is ignored for Titan ROMs. The choice is latched in
+`retro_load_game()` before the frontend reads `retro_get_system_av_info()` and before `SND_init()`,
+so it takes effect on the next game launch (the option says "Core restart required"). The RGSP
+panel has no 50 Hz mode (it runs at 59.57 Hz), so 50 fps content necessarily judders on screen;
+this is a display/pacing limitation, not a core-side frame-rate regression.
+
 ## Sega Titan Video (ST-V)
 
 Ported from the **`kronos` branch of [`libretro/yabause`](https://github.com/libretro/yabause/tree/kronos)**

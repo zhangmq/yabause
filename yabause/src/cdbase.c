@@ -1852,6 +1852,195 @@ int checkCHD(const char *filename ) {
 
 }
 
+/* --- early IP.BIN probe (libretro video format auto-detection) -------------
+ * These helpers intentionally do not touch the global CD state: they open the
+ * image, read only the first sector's 16-byte region field, and close it.  The
+ * real CD block is initialised later by Cs2Init(), as before. */
+
+static int iso_read_region_from_file(const char *path, char *region, size_t region_size)
+{
+   FILE *fp;
+   unsigned char buf[2352];
+   size_t n;
+   int dataoff = 0;
+   int i;
+
+   if (region_size < 17)
+      return -1;
+   fp = fopen(path, "rb");
+   if (!fp)
+      return -1;
+   n = fread(buf, 1, sizeof(buf), fp);
+   fclose(fp);
+   if (n < 0x50)
+      return -1;
+
+   /* A raw 2352-byte sector starts with the 12-byte sync pattern; the mode byte
+      is at offset 15.  A 2048-byte ISO has no sync and starts at user data. */
+   if (n >= 16 && buf[0] == 0x00 && buf[11] == 0x00)
+   {
+      int sync = 1;
+      for (i = 1; i <= 10; i++)
+         if (buf[i] != 0xFF) { sync = 0; break; }
+      if (sync)
+         dataoff = (buf[15] == 2) ? 24 : 16;
+   }
+   if (n < (size_t)dataoff + 0x40 + 16)
+      return -1;
+   memcpy(region, buf + dataoff + 0x40, 16);
+   region[16] = '\0';
+   return 0;
+}
+
+static int iso_cue_first_file(const char *cue_path, char *bin_path, size_t bin_path_size)
+{
+   FILE *fp;
+   char line[1024];
+   char file[1024] = "";
+   const char *slash;
+
+   fp = fopen(cue_path, "r");
+   if (!fp)
+      return -1;
+   while (fgets(line, sizeof(line), fp))
+   {
+      char *p = line;
+      while (*p == ' ' || *p == '\t') p++;
+      if (strncmp(p, "FILE", 4) == 0 && (p[4] == ' ' || p[4] == '\t'))
+      {
+         p += 5;
+         while (*p == ' ' || *p == '\t') p++;
+         if (*p == '"')
+         {
+            char *q;
+            p++;
+            q = strchr(p, '"');
+            if (!q)
+               continue;
+            *q = '\0';
+            snprintf(file, sizeof(file), "%s", p);
+         }
+         else if (sscanf(p, "%1023s", file) != 1)
+            continue;
+         break;
+      }
+   }
+   fclose(fp);
+   if (!file[0])
+      return -1;
+
+   if (file[0] == '/')
+      snprintf(bin_path, bin_path_size, "%s", file);
+   else
+   {
+      slash = strrchr(cue_path, '/');
+      if (slash)
+         snprintf(bin_path, bin_path_size, "%.*s/%s",
+                  (int)(slash - cue_path), cue_path, file);
+      else
+         snprintf(bin_path, bin_path_size, "%s", file);
+   }
+   return 0;
+}
+
+static int iso_read_region_from_chd(const char *path, char *region, size_t region_size)
+{
+   chd_file *chd = NULL;
+   const chd_header *hdr;
+   char meta[512];
+   UINT32 resultlen = 0, resulttag = 0;
+   UINT8 resultflags = 0;
+   int trk = 0, frames = 0, pregap = 0, postgap = 0;
+   char type[64] = "", subtype[64] = "", pgtype[64] = "", pgsub[64] = "";
+   unsigned char *hunk = NULL;
+   int dataoff = -1;
+   chd_error err;
+
+   if (region_size < 17)
+      return -1;
+   err = chd_open(path, CHD_OPEN_READ, NULL, &chd);
+   if (err != CHDERR_NONE)
+      return -1;
+   hdr = chd_get_header(chd);
+   if (!hdr)
+      goto fail;
+   memset(meta, 0, sizeof(meta));
+   err = chd_get_metadata(chd, 0, 0, meta, sizeof(meta),
+                          &resultlen, &resulttag, &resultflags);
+   if (err != CHDERR_NONE)
+      goto fail;
+
+   if (resulttag == CDROM_TRACK_METADATA2_TAG)
+      sscanf(meta, CDROM_TRACK_METADATA2_FORMAT, &trk, type, subtype,
+             &frames, &pregap, pgtype, pgsub, &postgap);
+   else if (resulttag == CDROM_TRACK_METADATA_TAG)
+      sscanf(meta, CDROM_TRACK_METADATA_FORMAT, &trk, type, subtype, &frames);
+   else
+      goto fail;
+
+   (void)trk; (void)frames; (void)pregap; (void)postgap;
+   (void)subtype; (void)pgtype; (void)pgsub;
+
+   if (!strcmp(type, "MODE1") || !strcmp(type, "MODE1/2048") ||
+       !strcmp(type, "MODE2_FORM1") || !strcmp(type, "MODE2/2048"))
+      dataoff = 0;
+   else if (!strcmp(type, "MODE1_RAW") || !strcmp(type, "MODE1/2352"))
+      dataoff = 16;
+   else if (!strcmp(type, "MODE2_RAW") || !strcmp(type, "MODE2/2352"))
+      dataoff = 24;
+   else if (!strcmp(type, "MODE2") || !strcmp(type, "MODE2/2336") ||
+            !strcmp(type, "MODE2_FORM_MIX"))
+      dataoff = 8;
+   else
+      goto fail;
+
+   if (hdr->hunkbytes < (UINT32)dataoff + 0x40 + 16)
+      goto fail;
+   hunk = (unsigned char *)malloc(hdr->hunkbytes);
+   if (!hunk)
+      goto fail;
+   err = chd_read(chd, 0, hunk);
+   if (err != CHDERR_NONE)
+      goto fail;
+
+   memcpy(region, hunk + dataoff + 0x40, 16);
+   region[16] = '\0';
+   free(hunk);
+   chd_close(chd);
+   return 0;
+
+fail:
+   if (hunk)
+      free(hunk);
+   chd_close(chd);
+   return -1;
+}
+
+int ISOCDReadRegionCode(const char *image_path, char *region, size_t region_size)
+{
+   const char *ext;
+   char binpath[1024];
+
+   if (!image_path || !region || region_size < 17)
+      return -1;
+   ext = strrchr(image_path, '.');
+   if (ext && !stricmp(ext, ".cue"))
+   {
+      if (iso_cue_first_file(image_path, binpath, sizeof(binpath)) != 0)
+         return -1;
+      return iso_read_region_from_file(binpath, region, region_size);
+   }
+   if (ext && !stricmp(ext, ".chd"))
+      return iso_read_region_from_chd(image_path, region, region_size);
+   if (ext && (!stricmp(ext, ".iso") || !stricmp(ext, ".bin")))
+      return iso_read_region_from_file(image_path, region, region_size);
+
+   /* No/unknown extension: follow the same detection order as ISOCDInit(). */
+   if (checkCHD(image_path) == 0)
+      return iso_read_region_from_chd(image_path, region, region_size);
+   return iso_read_region_from_file(image_path, region, region_size);
+}
+
 static int LoadCHD(const char *chd_filename, FILE *iso_file)
 {
   int trak_number;

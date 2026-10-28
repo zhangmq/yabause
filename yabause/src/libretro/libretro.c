@@ -101,6 +101,15 @@ static int g_sh2coretype = SH2CORE_INTERPRETER;
  * latched from it in retro_load_game(), because the GL context and the VDP
  * worker are created once per machine boot (context_reset -> YabauseInit). */
 static int g_vdp_async_opt = 1;
+/* Video standard (core option "yabasanshiro_videoformattype"): _opt is what
+ * the option/env asks for (-1 = auto), _pending is the value latched for this
+ * content in retro_load_game() before the frontend asks for av_info/region.
+ * auto reads the Saturn disc's IP.BIN region field (E/A/L = PAL, J/U/T/K/B =
+ * NTSC, anything unreadable = NTSC).  ST-V is NTSC-only hardware, so its
+ * pending value is always NTSC. */
+#define YAB_VIDEOFORMAT_AUTO (-1)
+static int g_videoformat_opt = YAB_VIDEOFORMAT_AUTO;
+static int g_videoformat_pending = -1;
 /* Auto Frameskip (core option "yabasanshiro_frameskip"): 0 = off, 1 = auto.
  * Declared here because check_variables() (below) reads it; the skip logic
  * lives next to the async frame-slot code. */
@@ -536,8 +545,11 @@ static u32 soundbufsize;
 static s16 *sound_buf;
 
 static int SNDLIBRETROInit(void) {
-    int vertfreq = (yabsys.IsPal == 1 ? 50 : 60);
+    /* yabsys.IsPal is not set yet: YabauseSetVideoFormat() runs after ScspInit()
+       inside YabauseInit().  Use the format latched by retro_load_game(). */
+    int vertfreq = (g_videoformat_pending == VIDEOFORMATTYPE_PAL) ? 50 : 60;
     soundlen = (SAMPLERATE * 100 + (vertfreq >> 1)) / vertfreq;
+    log_cb(RETRO_LOG_INFO, "SNDLIBRETROInit: %d Hz -> scratch buffer %u samples\n", vertfreq, soundlen);
     soundbufsize = (soundlen<<2 * sizeof(s16));
     if ((sound_buf = (s16 *)malloc(soundbufsize)) == NULL)
         return -1;
@@ -555,6 +567,7 @@ static int SNDLIBRETROReset(void) { return 0; }
 static int SNDLIBRETROChangeVideoFormat(int vertfreq)
 {
     soundlen = (SAMPLERATE * 100 + (vertfreq >> 1)) / vertfreq;
+    log_cb(RETRO_LOG_INFO, "SNDLIBRETROChangeVideoFormat: %d Hz -> scratch buffer %u samples\n", vertfreq, soundlen);
     soundbufsize = (soundlen<<2 * sizeof(s16));
     if (sound_buf)
         free(sound_buf);
@@ -594,6 +607,13 @@ static void sdlConvert32uto16s(int32_t *srcL, int32_t *srcR, int16_t *dst, size_
 
 static void SNDLIBRETROUpdateAudio(u32 *leftchanbuffer, u32 *rightchanbuffer, u32 num_samples)
 {
+   static u32 logged_samples = 0;
+   if (num_samples != logged_samples)
+   {
+      logged_samples = num_samples;
+      log_cb(RETRO_LOG_INFO, "SNDLIBRETROUpdateAudio: %u samples/frame (%d Hz)\n",
+             num_samples, g_videoformat_pending == VIDEOFORMATTYPE_PAL ? 50 : 60);
+   }
    sdlConvert32uto16s((int32_t*)leftchanbuffer, (int32_t*)rightchanbuffer, sound_buf, num_samples);
    audio_batch_cb(sound_buf, num_samples);
 
@@ -1713,6 +1733,8 @@ static void context_reset(void)
    {
       first_ctx_reset = 0;
       YabauseInit(&yinit);
+      log_cb(RETRO_LOG_INFO, "Video format after YabauseInit: engine IsPal=%d (pending=%d)\n",
+             yabsys.IsPal, g_videoformat_pending);
       renderer_running = true;
       retro_set_resolution();
       OSDChangeCore(OSDCORE_DUMMY);
@@ -1854,6 +1876,33 @@ void check_variables(void)
          else if (!strcmp(e, "jp")) stv_favorite_region = STV_REGION_JP;
          else if (!strcmp(e, "tw")) stv_favorite_region = STV_REGION_TW;
          else if (!strcmp(e, "eu")) stv_favorite_region = STV_REGION_EU;
+      }
+   }
+
+   /* Video standard: auto (default) reads the disc IP.BIN region at load;
+    * NTSC/PAL force one standard.  ST-V is handled separately and is always
+    * NTSC.  NTSC remains the unreadable-disc fallback, so existing content
+    * keeps working; "play PAL at 60" is the explicit NTSC choice. */
+   var.key = "yabasanshiro_videoformattype";
+   var.value = NULL;
+   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+   {
+      if (strcmp(var.value, "PAL") == 0)
+         g_videoformat_opt = VIDEOFORMATTYPE_PAL;
+      else if (strcmp(var.value, "NTSC") == 0)
+         g_videoformat_opt = VIDEOFORMATTYPE_NTSC;
+      else if (strcmp(var.value, "auto") == 0)
+         g_videoformat_opt = YAB_VIDEOFORMAT_AUTO;
+   }
+   /* Probe override, same pattern as YAB_STV_REGION: lets an on-device A/B
+      test both formats without editing the per-core cfg. */
+   {
+      const char *e = getenv("YAB_VIDEOFORMAT");
+      if (e && *e)
+      {
+         if (!strcasecmp(e, "pal"))       g_videoformat_opt = VIDEOFORMATTYPE_PAL;
+         else if (!strcasecmp(e, "ntsc")) g_videoformat_opt = VIDEOFORMATTYPE_NTSC;
+         else if (!strcasecmp(e, "auto")) g_videoformat_opt = YAB_VIDEOFORMAT_AUTO;
       }
    }
 
@@ -2081,14 +2130,20 @@ void retro_get_system_av_info(struct retro_system_av_info *info)
       initial_resolution_mode = resolution_mode;
    }
 
-   info->timing.fps            = (retro_get_region() == RETRO_REGION_NTSC) ? 60.0f : 50.0f;
-   info->timing.sample_rate    = SAMPLERATE;
-   info->geometry.base_width   = game_width;
-   info->geometry.base_height  = game_height;
-   // No need to go above 8x what is needed by Hi-Res games, we disallow 16x for Hi-Res games
-   info->geometry.max_width    = 704 * (initial_resolution_mode == max_resolution_mode ? max_resolution_mode/2 : initial_resolution_mode);
-   info->geometry.max_height   = 512 * (initial_resolution_mode == max_resolution_mode ? max_resolution_mode/2 : initial_resolution_mode);
-   info->geometry.aspect_ratio = (retro_get_region() == RETRO_REGION_NTSC) ? 4.0 / 3.0 : 5.0 / 4.0;
+   {
+      int pal = (retro_get_region() == RETRO_REGION_PAL);
+      info->timing.fps = pal ? 50.0f : 60.0f;
+      info->timing.sample_rate    = SAMPLERATE;
+      info->geometry.base_width   = game_width;
+      info->geometry.base_height  = game_height;
+      // No need to go above 8x what is needed by Hi-Res games, we disallow 16x for Hi-Res games
+      info->geometry.max_width    = 704 * (initial_resolution_mode == max_resolution_mode ? max_resolution_mode/2 : initial_resolution_mode);
+      info->geometry.max_height   = 512 * (initial_resolution_mode == max_resolution_mode ? max_resolution_mode/2 : initial_resolution_mode);
+      /* Native 4:3 for both standards: Kronos/Yabause/Beetle all document
+       * PAL as 4:3, and the old 5:4 branch was copied from the reference core
+       * without a pixel check. */
+      info->geometry.aspect_ratio = 4.0 / 3.0;
+   }
    /* Screen rotation, following the RetroArch convention the way flycast does it
       (shell/libretro/libretro.cpp: setRotation() + setGameGeometry()): the core
       leaves the framebuffer alone and asks the frontend to turn it.
@@ -2587,6 +2642,49 @@ static void disk_register(void)
             (void *)&disk_cb);
 }
 
+/* AUTO video format: read the Saturn IP.BIN region field from the first disc
+ * image.  The field is a list of allowed area codes; the emulated SMPC uses the
+ * first one (Cs2GetIP()), so we do the same:
+ *   E = Europe, A = Asia PAL, L = Latin America   -> PAL
+ *   J = Japan, U = USA, T = Taiwan, K = Korea, B = Brazil -> NTSC
+ * A multi-region "JUE" disc therefore starts with J and follows the Japanese
+ * (NTSC) path, exactly like Cs2GetIP()'s autodetect.
+ * Anything unreadable or unknown defaults to NTSC; no BIOS-region guess (the
+ * US/EU mpr-17933 image is dual-region and cannot decide this). */
+static int saturn_disc_video_format(const char *path, char *region_out,
+                                    size_t region_out_size, const char **source)
+{
+   char region[17];
+   int i;
+
+   region[0] = '\0';
+   if (ISOCDReadRegionCode(path, region, sizeof(region)) != 0)
+   {
+      if (region_out && region_out_size)
+         region_out[0] = '\0';
+      *source = "disc header unreadable";
+      return VIDEOFORMATTYPE_NTSC;
+   }
+
+   for (i = 15; i >= 0 && (region[i] == ' ' || region[i] == '\0'); i--)
+      region[i] = '\0';
+   if (region_out && region_out_size)
+      snprintf(region_out, region_out_size, "%s", region);
+
+   switch (region[0])
+   {
+      case 'E': case 'A': case 'L':
+         *source = "disc header PAL";
+         return VIDEOFORMATTYPE_PAL;
+      case 'J': case 'U': case 'T': case 'K': case 'B':
+         *source = "disc header NTSC";
+         return VIDEOFORMATTYPE_NTSC;
+      default:
+         *source = "disc header unknown region";
+         return VIDEOFORMATTYPE_NTSC;
+   }
+}
+
 bool retro_load_game_common()
 {
    enum retro_pixel_format fmt = RETRO_PIXEL_FORMAT_XRGB8888;
@@ -2634,7 +2732,8 @@ bool retro_load_game_common()
    yinit.use_new_scsp              = 0;
    yinit.scsp_sync_count_per_frame = 1;
    yinit.scsp_main_mode            = 1;
-   yinit.videoformattype           = VIDEOFORMATTYPE_NTSC;
+   yinit.videoformattype           = (g_videoformat_pending == VIDEOFORMATTYPE_PAL)
+                                       ? VIDEOFORMATTYPE_PAL : VIDEOFORMATTYPE_NTSC;
    yinit.video_filter_type         = 0;
 
    return true;
@@ -2681,6 +2780,39 @@ bool retro_load_game(const struct retro_game_info *info)
                    "%s: no ST-V romset in the game list matched this zip -- "
                    "trying it as a Saturn CD image\n", info->path);
       }
+   }
+
+   /* Latch the video standard for this content before retro_load_game returns.
+    * minarch calls retro_get_system_av_info() (Core_updateAVInfo) immediately
+    * after load_game and initializes SND from core.fps, so deciding this in
+    * context_reset/YabauseInit would be too late (see .notes/PAL-50FPS*.md).
+    * ST-V hardware has no PAL mode: force NTSC and say so if the option asked
+    * for PAL.  auto reads the disc IP.BIN region; unreadable defaults to NTSC. */
+   {
+      const char *source = "option";
+      char region[17] = "";
+
+      if (stv_mode)
+      {
+         g_videoformat_pending = VIDEOFORMATTYPE_NTSC;
+         source = "ST-V";
+         if (g_videoformat_opt == VIDEOFORMATTYPE_PAL)
+            log_cb(RETRO_LOG_WARN, "ST-V is NTSC only; PAL video format ignored\n");
+      }
+      else if (g_videoformat_opt != YAB_VIDEOFORMAT_AUTO)
+      {
+         g_videoformat_pending = g_videoformat_opt;
+         source = (g_videoformat_opt == VIDEOFORMATTYPE_PAL) ? "option PAL" : "option NTSC";
+      }
+      else
+      {
+         g_videoformat_pending =
+            saturn_disc_video_format(full_path, region, sizeof(region), &source);
+      }
+
+      log_cb(RETRO_LOG_INFO, "Video format: %s (source=%s, region='%s', stv=%d)\n",
+             g_videoformat_pending == VIDEOFORMATTYPE_PAL ? "PAL 50Hz/313" : "NTSC 60Hz/263",
+             source, region, stv_mode ? 1 : 0);
    }
 
    snprintf(bios_path, sizeof(bios_path), "%s%csaturn_bios.bin", g_system_dir, slash);
@@ -3025,7 +3157,13 @@ void retro_unload_game(void)
 
 unsigned retro_get_region(void)
 {
-   return RETRO_REGION_NTSC;
+   /* Before load_game(), fall back to the engine state (0 = NTSC).  After it,
+    * the latched format is authoritative: minarch's chooseSyncRef() uses this
+    * return value to decide whether the core FPS is the pacing reference. */
+   if (g_videoformat_pending >= 0)
+      return (g_videoformat_pending == VIDEOFORMATTYPE_PAL)
+                ? RETRO_REGION_PAL : RETRO_REGION_NTSC;
+   return yabsys.IsPal ? RETRO_REGION_PAL : RETRO_REGION_NTSC;
 }
 
 unsigned retro_api_version(void)
@@ -3164,10 +3302,11 @@ static void yab_ft_report(void)
  *
  * How much to draw: a picture is only worth drawing while one draw still fits in
  * the frame the emulation actually achieves, and that frame is
- * max(machine frame time, 1/60 s) -- not 1/60 s alone.  When the machine is the
- * slower side (it is on this device) cutting the draw budget down to 16.7 ms
- * throws pictures away for nothing, so:
- *     ratio = min(1, max(machine_ms, 16.7) / draw_ms)
+ * max(machine frame time, 1/fps), where 1/fps is the selected video standard
+ * (16.7 ms NTSC, 20 ms PAL).  When the machine is the slower side (it is on this
+ * device) cutting the draw budget down to 16.7 ms throws pictures away for
+ * nothing, so:
+ *     ratio = min(1, max(machine_ms, 1000/fps) / draw_ms)
  * and a ratio accumulator draws when it crosses 1, which spreads the skips
  * evenly instead of bunching them.  Both costs are measured, so the ratio
  * follows the scene.  YAB_RENDER_SKIP=<n> forces a fixed every-n-th cadence. */
@@ -3203,7 +3342,8 @@ static int yab_render_skip(void)
 
    if (yab_skip_calls++ >= 30)
    {
-      double period = (yab_machine_ms_ema > 16.7) ? yab_machine_ms_ema : 16.7;
+      double min_period = 1000.0 / (double)YAB_FRAME_HZ;
+      double period = (yab_machine_ms_ema > min_period) ? yab_machine_ms_ema : min_period;
       double ratio  = (yab_render_ms_ema > 0.0) ? period / yab_render_ms_ema : 1.0;
       yab_skip_calls = 0;
       if (ratio > 1.0) ratio = 1.0;

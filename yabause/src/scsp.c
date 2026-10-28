@@ -5559,7 +5559,7 @@ void ScspAsynMainCpuTime( void * p ){
   int frame_count = 0;
   int i;
   int frame_div = g_scsp_sync_count_per_frame;
-  int framecnt = 188160 / frame_div; // 11289600/60
+  int framecnt = YAB_FRAME_CYCLES / frame_div;
   int hzcheck = 0;
 
 #if defined(ARCH_IS_LINUX)
@@ -5574,7 +5574,7 @@ void ScspAsynMainCpuTime( void * p ){
   u64 pre_m68k_cycle = 0;
   u64 m68k_inc = 0;
   
-  framecnt = 188160; // 11289600/60
+  framecnt = YAB_FRAME_CYCLES;
 
   //YabWaitEventQueue(q_scsp_frame_start);
   now = 0;
@@ -5688,7 +5688,7 @@ void ScspAsynMainRealtime(void * p) {
   int frame_count = 0;
   int i;
   int frame_div = g_scsp_sync_count_per_frame;
-  int framecnt = 188160 / frame_div; // 11289600/60
+  int framecnt = YAB_FRAME_CYCLES / frame_div;
   int hzcheck = 0;
 
 #if defined(ARCH_IS_LINUX)
@@ -5731,7 +5731,7 @@ void ScspAsynMainRealtime(void * p) {
   char * pCurrentGame = Cs2GetCurrentGmaecode();
   if (!strcmp(pCurrentGame, "T-1811G") && frame_div < 4) {
     frame_div = 4; 
-    framecnt = 188160 / frame_div;
+    framecnt = YAB_FRAME_CYCLES / frame_div;
     LOG("Thunder Force V is detected. Force frame_div to 4");
   }
 
@@ -5810,7 +5810,7 @@ void ScspAsynMainRealtime(void * p) {
       scsp_update_timer(1);
     }
 
-    // Sync 1/4 Frame(60Hz)
+    // Sync one frame (60 Hz NTSC / 50 Hz PAL)
     frame += samplecnt;
     if (frame >= framecnt) {
       frame = frame - framecnt;
@@ -5843,7 +5843,7 @@ void ScspAsynMainRealtime(void * p) {
         else {
           difftime = (now + (LLONG_MAX - before)) * 1000000000L / yabsys.tickfreq;
         }
-        sleeptime = ((16666666L / frame_div) - difftime);
+        sleeptime = ((YAB_FRAME_NS / frame_div) - difftime);
         if(initsleeptime==0){
           initsleeptime = sleeptime; 
           initnow = now; 
