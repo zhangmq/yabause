@@ -2050,9 +2050,9 @@ void check_variables(void)
    }
 
    /* VDP1 framebuffer readback.  Off by default: most titles never read the
-      framebuffer, and the async renderer then pays nothing.  When off the pixel
-      read returns 0 (no buffer is kept); when on the render thread copies the
-      frame it just rasterised to CPU, at one glReadPixels+PBO map per frame. */
+      framebuffer.  When on, the async renderer records the completed drawframe
+      and downloads it on demand, plus a short prefetch window after a read;
+      when off, the pixel read returns 0. */
    var.key = "yabasanshiro_vdp1_fb_readback";
    var.value = NULL;
    if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)

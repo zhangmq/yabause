@@ -6,7 +6,7 @@ pinned at [`a40dace1`](https://github.com/sydarn/yabause/commit/a40dace1)
 (devmiyax `B2_1_11`, standalone 1.11.0 lineage). Branch **`h700`** is the only maintained
 branch here; upstream development on this line has stopped. The **Sega Titan Video (ST-V)**
 support was developed on a `stv` branch and merged into `h700` in `aa20951b` (2026-10-02); that
-branch was then deleted from the remote and is kept locally only.
+branch was then deleted from the remote.
 
 It targets low-end ARM handhelds — verified on the **Anbernic RGSP**
 (Allwinner H700, 4× Cortex-A53, Mali-G31 / libmali, glibc 2.35) with the NextUI/minarch-gl
@@ -16,22 +16,25 @@ frontend — and is loaded as `yabasanshiro_libretro.so`. It plays **Sega Saturn
 
 ## What this branch adds
 
-**Make the abandoned port work, and make it fast** (`a40dace1..h700`):
+**Make the abandoned port work** (`a40dace1..h700`):
 
 * `0be6fb9e` — make the libretro port in this pin build again: libchdr wiring, `vdp1`/`vdp2`
   compiled as C++, a GLES compatibility header, `YabNanosleep`, …
 * `258a192a` — **run the async VDP thread through a core-owned shared EGL context**:
   `eglCreateContext(share = frontend context)`, and the engine draws through a mirror FBO whose
   colour attachment is the frontend's texture. VDP rendering moves to a worker thread while
-  `video_cb()` stays on the frontend's thread. Without it the port is synchronous and pinned to
-  one CPU core; with it the emulation thread drops from 0.80–0.91 to 0.50–0.77 cores, and turning it
-  off costs 7–17 % of the frame rate depending on the game (see *Measured*).
+  `video_cb()` stays on the frontend's thread. Without it the port is synchronous and the frontend's
+  thread does the rendering; with it the rendering work leaves that thread.
 * `b2bb246e` — hand the frontend's GL context back after borrowing the shared one (SDL tracks
   "which context is current" per thread in TLS; bypassing it left the frontend without a context).
 * **Renderer mode is a runtime setting** (see below): both renderers are compiled in and the core
   option *Async Renderer* picks one per boot, instead of a `YAB_SYNC=1` rebuild. The async path is
-  faster (7-17% in the *Measured* table) and is the default; the inline path keeps the emulated
-  machine off the host scheduler entirely, which is occasionally useful when bisecting.
+  the default; the inline path keeps the emulated machine off the host scheduler entirely, which is
+  occasionally useful when bisecting.
+* `9cceb4e3` — **VDP1 framebuffer readback is on demand** (core option *VDP1 Framebuffer
+  Readback*, default `disabled`): the async renderer records the completed drawframe and downloads
+  it only when the SH-2 actually reads; a short read-triggered prefetch avoids blocking per frame.
+  Titles that never read are unaffected; `batmanfr` keeps it off.
 
 **GL / correctness on this driver** (textures are shared between the two contexts, FBOs are not):
 
@@ -43,8 +46,8 @@ frontend — and is loaded as `yabasanshiro_libretro.so`. It plays **Sega Saturn
   colour attachment every frame (a frontend may recreate its FBO under the same name).
 * `caf6c0f2` — size that attachment to the **render area**, not to the frontend's power-of-two
   texture. A framebuffer is as large as the intersection of its attachments and the engine's
-  per-frame clear is not scissored, so this removes a 4 MB depth+stencil clear per frame: the
-  depth/stencil work is now free (back to the pre-fix frame rate).
+  per-frame clear is not scissored, so sizing it to the render area avoids a full-size
+  depth+stencil clear every frame.
 * `26364f71` — resolve the ES 3.1 entry points (`glBindImageTexture`/`glDispatchCompute`/
   `glMemoryBarrier`) that the RBG compute path calls; without them Virtua Fighter 2's hi-res title
   screen crashed the core about 9 s in (`PC=0`).
@@ -76,10 +79,9 @@ frontend — and is loaded as `yabasanshiro_libretro.so`. It plays **Sega Saturn
 
 **SCSP threading** (`68821ac4`, `8fd15b47`, `b000abc0`) — the async sound CPU thread used
 `ctime()` as a `struct timespec *`, so its timed wait returned `EINVAL` immediately and the thread
-span at ~1.09 cores; fixing the clock source restored the on-demand synchronisation path
-(Golden Axe: 2.57 → 1.87 cores, +2 % frames). The pending main-CPU interrupt word is atomic now.
-An optional realtime priority switch exists (`YAB_SCSP_RT_PRIO`/`YAB_SCSP_RT_NICE`, off by default:
-it measured neutral on this device).
+spun; fixing the clock source restored the on-demand synchronisation path. The pending main-CPU
+interrupt word is atomic now. An optional realtime priority switch exists
+(`YAB_SCSP_RT_PRIO`/`YAB_SCSP_RT_NICE`, off by default).
 
 ### Renderer mode is a runtime setting
 
@@ -89,25 +91,16 @@ loaded -- the GL context and the render worker are created once per machine boot
 takes effect on the **next launch** of a game ("Core restart required").
 
 * `enabled` (default) -- VDP1/VDP2 rendering runs on its own thread through the core-owned shared
-  context described above. The fastest configuration, and what this fork is about.
+  context described above. The default configuration, and what this fork is about.
 * `disabled` -- the frame loop draws inline with the frontend's context, exactly like upstream
-  Yabause. Slower, but the emulated machine no longer depends on host scheduling.
+  Yabause. Synchronous: the emulated machine no longer depends on host scheduling.
 
-**A black screen while the emulator still reports a healthy frame rate was an ST-V bus race, not a
-renderer problem.** Some Titan titles booted black at a steady frame rate with the async renderer and
-never with the inline one, which made the renderer look guilty; the actual cause was the SCU DMA
-writing SoundRam while the SH-2 still owned the bus, so the CPU read back half-uploaded data
-(`7d8552b5`, ported from MAME's bus arbitration). With that fixed the async renderer boots those
-titles like the inline one, and switching renderers is no longer a workaround for anything.
-
-Measured on the RGSP (2400-frame windows, governor pinned at `performance`/1512000, frameskip
-disabled, build `v2.5.1 cfcba53f`, 2026-09-20) -- same core, only the option differs:
-
-| Title | `enabled` (async) | `disabled` (inline) |
-|---|---|---|
-| cotton2 (ST-V) | 56.2 | 46.4 |
-| Daytona USA | 47.1 | 43.8 |
-| Golden Axe - The Duel | 60.6 | 54.9 |
+**A black screen while the emulator still presents frames was an ST-V bus race, not a
+renderer problem.** Some Titan titles booted black with the async renderer and never with the inline
+one, which made the renderer look guilty; the actual cause was the SCU DMA writing SoundRam while
+the SH-2 still owned the bus, so the CPU read back half-uploaded data (`7d8552b5`, ported from
+MAME's bus arbitration). With that fixed the async renderer boots those titles like the inline one,
+and switching renderers is no longer a workaround for anything.
 
 There is no build-time switch left: `make platform=arm64 YAB_SYNC=1` no longer changes anything
 (the defines it removes no longer gate code). For A/B runs the environment variable
@@ -153,14 +146,12 @@ register file; and romset matching that prefers the exact zip name over the last
   no Weapon C. Set `JP` for that one.
 * `yabasanshiro_stv_sound_cpu_lead` = `off` (default) / `half_frame` — **experimental, temporary**.
   Holds the 68k sound CPU half a frame ahead of the SH-2 frame. `Sea Bass Fishing V0.001` only
-  cold-boots with it (22 of 25 attempts on this device with the original test build; re-measured
-  with a time series on the daily config: 4 of 6 first tries, 6 of 6 after one relaunch). It is an
-  empirical workaround, not a timing model, it costs a few percent of frame rate, and it will be
+  cold-boots with it. It is an empirical workaround, not a timing model, and it will be
   **removed once the boot is fixed properly** — the intended use meanwhile is: enable it for the
   boot, save a state, turn it off (or load that state with it off). Everything else about the boot
   stays a known limitation of the emulator, not a feature.
 
-Two deliberate differences from Kronos, both measured:
+Two deliberate differences from Kronos:
 
 * **The backup-RAM card layout stays the classic yabause one** (`header[32]` = `FF 'B' FF 'a' …`,
   card byte N at offset `2N+1`). Kronos' dense layout made every `<rom>.sav` written by an earlier
@@ -194,9 +185,9 @@ re-exposed a latent bug: `bupfilename` was assigned only on the `extend_backup` 
 `extend_backup = 0` the ST-V credit fix needs, `YabauseDeInit()` called `T123Save(..., NULL)` and
 the core never persisted its card at all — only the frontend's per-ROM `.sav` carried it.
 
-The probes and recorders that the porting effort needed (SMPC/IOGA loggers, black-box recorders,
-per-frame stat dumps, the `autopress.txt` hook) were removed in `09b9f8b8`: the shipping core runs
-no test instrumentation.
+The old probe/recorder infrastructure from the porting effort (SMPC/IOGA loggers, black-box
+recorders, per-frame stat dumps, the `autopress.txt` hook) was removed. The diagnostics that remain
+are environment-gated and off by default.
 
 ## Building
 
