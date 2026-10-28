@@ -115,7 +115,7 @@ struct retro_core_option_v2_definition option_defs_us[] = {
       "yabasanshiro_vdp1_fb_readback",
       "VDP1 Framebuffer Readback",
       NULL,
-      "Let the SH-2 read back the VDP1 framebuffer, used by some games for screen transitions. Async Renderer: download it to CPU every frame (small constant cost). Off: the SH-2 gets an empty value (no GPU pixels, no shadow).",
+      "Let the SH-2 read back the VDP1 framebuffer, used by some games for screen transitions. The async renderer records each completed frame and downloads it only when the SH-2 reads it (plus a short prefetch window). Off: the SH-2 gets an empty value.",
       NULL,
       "video",
       {
