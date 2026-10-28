@@ -986,6 +986,8 @@ static int yab_68k_lock_until(void)
    return n;
 }
 
+extern void YglVdp1ReadbackProbeFrameEnd(void);
+
 int YabauseEmulate(void) {
    int oneframeexec = 0;
    /* Where is the machine stuck?  The dynarec only syncs regs.PC at block
@@ -1424,6 +1426,9 @@ yab_68k_lock_done: ;
       PROFILE_STOP("Total Emulation");
    }
    M68KSync();
+   /* Readback probe: flush the per-frame [RBF]/[FPS] summary at the frame
+    * boundary; inert unless YAB_RBF is set. */
+   YglVdp1ReadbackProbeFrameEnd();
 
 #ifdef YAB_WANT_SSF
 

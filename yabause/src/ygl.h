@@ -775,9 +775,19 @@ int YglBlitFXAA(u32 sourceTexture, float w, float h);
 int YglWindowFramebuffer(u32 srcTexture, u32 targetFbo, float w, float h, float ww, float hh);
 
 void YglRenderVDP1(void);
-/* Render thread: publish a CPU copy of the just-rasterised VDP1 framebuffer
+/* Render thread: record the frame that was just rasterised; the CPU copy is
+   downloaded on demand when the SH-2 reads the framebuffer
    (async renderer + "yabasanshiro_vdp1_fb_readback" only). */
 void YglVdp1PublishCpu(int df);
+
+/* On-demand readback (frontend/GL thread): service a pending SH-2 request.
+   Returns 1 when a snapshot was published. */
+int  YglVdp1ServiceReadback(void);
+/* Wake a reader blocked in the readback wait (pause/stop) and re-arm it. */
+void YglVdp1ReadbackAbort(void);
+void YglVdp1ReadbackResume(void);
+/* Drop the published snapshot and any pending request (resolution change). */
+void YglVdp1ReadbackReset(void);
 
 u32 * YglGetLineColorPointer();
 void YglSetLineColor(u32 * pbuf, int size);

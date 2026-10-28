@@ -174,9 +174,10 @@ extern "C" u16 FASTCALL Vdp1FrameBufferReadWord(u32 addr) {
    addr &= 0x3FFFF;
    if (VIDCore->Vdp1ReadFrameBuffer ){
      u16 val;
-     VdpLockVram();
+     /* Not under VdpLockVram(): the async readback service waits for the GL
+      * thread, and vdp2VBlankOUT() holds that mutex for the whole draw phase.
+      * The call reads the CPU-side snapshot, not Vdp1Ram. */
      VIDCore->Vdp1ReadFrameBuffer(1, addr, &val);
-     VdpUnLockVram();
      return val;
    } 
    return T1ReadWord(Vdp1FrameBuffer[Vdp1External.current_frame], addr);
@@ -188,9 +189,8 @@ extern "C" u32 FASTCALL Vdp1FrameBufferReadLong(u32 addr) {
    addr &= 0x3FFFF;
    if (VIDCore->Vdp1ReadFrameBuffer ){
      u32 val;
-     VdpLockVram();
+     /* See Vdp1FrameBufferReadWord(): do not hold vrammutex across the wait. */
      VIDCore->Vdp1ReadFrameBuffer(2, addr, &val);
-     VdpUnLockVram();
      return val;
    }
    return T1ReadLong(Vdp1FrameBuffer[Vdp1External.current_frame], addr);

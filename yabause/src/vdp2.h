@@ -439,6 +439,11 @@ void  yab_frameslot_lines(int idx, Vdp2 **out_lines);
 unsigned yab_frameslot_frame_no(int idx);
 void  yab_frameslot_set_current(int idx);
 int   yab_frameslot_publish_current(unsigned frame_no, int w, int h);
+/* Readback wake-up: posted into the slot-ready queue so the frontend leaves
+ * yab_frameslot_wait() and services the request on the GL thread.  The value
+ * must stay outside the slot range 0..YAB_SLOT_COUNT-1. */
+#define YAB_SLOT_READBACK_TOKEN (-2)
+int   yab_frameslot_post_readback(void);
 void  yab_render_slot(int idx);
 void  yab_bind_live_state(void);
 void  yab_bind_live_ptrs(void);
